@@ -55,27 +55,43 @@ func loadPreview(target string) tea.Cmd {
 
 // Model is the top-level Bubble Tea model.
 type Model struct {
-	workspaces []claude.Workspace
-	items      []TreeItem
-	cursor     int
-	preview    viewport.Model
-	previewFor string
-	width      int
-	height     int
-	err        error
-	loaded     bool
-	pendingD   bool
+	workspaces         []claude.Workspace
+	items              []TreeItem
+	cursor             int
+	preview            viewport.Model
+	previewFor         string
+	lastPreviewContent string // raw content for dedup
+	width              int
+	height             int
+	err                error
+	loaded             bool
+	statusLoaded       bool // true once first full status detection completes
+	pendingD           bool
 }
 
 // NewModel creates the initial model.
+// Uses the fast path (no status detection) so the UI is ready on the first frame.
+// Full status detection happens on the first async tick.
 func NewModel() Model {
-	return Model{
+	m := Model{
 		preview: viewport.New(40, 20),
 	}
+	panes, err := claude.ListClaudePanesBasic()
+	m.loaded = true
+	if err != nil {
+		m.err = err
+	} else {
+		m.workspaces = claude.GroupByWorkspace(panes)
+		m.items = FlattenTree(m.workspaces)
+		m.cursor = FirstPane(m.items)
+	}
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadPanes, previewTickCmd(), panesTickCmd())
+	// Don't schedule ticks here — completion handlers start the tick chains,
+	// ensuring the next tick only fires after the previous work completes.
+	return tea.Batch(loadPanes, m.previewCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -91,38 +107,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loaded = true
 		if msg.err != nil {
 			m.err = msg.err
-			return m, nil
+			return m, panesTickCmd() // keep ticking even on error
 		}
 		m.err = nil
-		firstLoad := len(m.workspaces) == 0
+		firstStatus := !m.statusLoaded
+		m.statusLoaded = true
 		m.workspaces = claude.GroupByWorkspace(msg.panes)
 		m.items = FlattenTree(m.workspaces)
-		if firstLoad {
+		if firstStatus {
 			m.cursor = FirstAttentionPane(m.items, m.workspaces)
 		} else if m.cursor >= len(m.items) || m.items[m.cursor].Kind != KindPane {
 			m.cursor = FirstPane(m.items)
 		}
-		// Load preview for current selection
+		// Schedule next panes tick after completion (backpressure).
+		cmds := []tea.Cmd{panesTickCmd()}
 		if cmd := m.previewCmd(); cmd != nil {
-			return m, cmd
+			cmds = append(cmds, cmd)
 		}
-		return m, nil
+		return m, tea.Batch(cmds...)
 
 	case previewLoadedMsg:
 		m.previewFor = msg.target
-		m.preview.SetContent(strings.TrimRight(msg.content, "\n"))
-		m.preview.GotoBottom()
-		return m, nil
+		content := strings.TrimRight(msg.content, "\n")
+		// Skip re-render when content hasn't changed.
+		if content != m.lastPreviewContent {
+			m.lastPreviewContent = content
+			m.preview.SetContent(content)
+			m.preview.GotoBottom()
+		}
+		// Schedule next preview tick after completion (backpressure).
+		return m, previewTickCmd()
 
 	case previewTickMsg:
-		m.previewFor = "" // force preview refresh
+		// Fire preview load. Next tick scheduled from previewLoadedMsg.
+		m.previewFor = "" // force refresh
 		if cmd := m.previewCmd(); cmd != nil {
-			return m, tea.Batch(cmd, previewTickCmd())
+			return m, cmd
 		}
+		// No active pane to preview — keep ticking.
 		return m, previewTickCmd()
 
 	case panesTickMsg:
-		return m, tea.Batch(loadPanes, panesTickCmd())
+		// Fire pane load. Next tick scheduled from panesLoadedMsg.
+		return m, loadPanes
 
 	case paneKilledMsg:
 		if msg.err != nil {
@@ -176,8 +203,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
-	if m.width == 0 {
-		return "Loading..."
+	if m.width == 0 || !m.loaded {
+		return ""
 	}
 
 	if m.err != nil {

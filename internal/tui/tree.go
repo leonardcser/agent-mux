@@ -82,8 +82,36 @@ func RenderTreeItem(item TreeItem, workspaces []claude.Workspace, selected bool,
 	switch item.Kind {
 	case KindWorkspace:
 		ws := workspaces[item.WorkspaceIndex]
-		name := truncate(ws.ShortPath, width-2)
+		avail := width - 2 // 1 leading space + 1 trailing minimum
+		name := ws.ShortPath
+		branch := ws.GitBranch
+
+		if branch != "" {
+			// " name branch " — space between name and branch = 1
+			needed := len(name) + 1 + len(branch)
+			if needed > avail {
+				// Step 1: truncate the branch name
+				branchAvail := avail - len(name) - 1
+				if branchAvail >= 4 { // room for at least "x..."
+					branch = truncate(branch, branchAvail)
+				} else {
+					// Step 2: drop branch entirely, show only name
+					branch = ""
+				}
+			}
+			if branch == "" {
+				name = truncate(name, avail)
+			}
+		} else {
+			name = truncate(name, avail)
+		}
+
 		text := " " + name
+		if branch != "" {
+			pad := max(width-len(text)-len(branch)-1, 0)
+			text += strings.Repeat(" ", pad)
+			return workspaceStyle.Render(text) + branchStyle.Render(branch) + branchStyle.Render(" ")
+		}
 		text += strings.Repeat(" ", max(width-len(text), 0))
 		return workspaceStyle.Render(text)
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -13,14 +14,35 @@ type historyEntry struct {
 	Project   string `json:"project"`
 }
 
+var historyCache struct {
+	sync.Mutex
+	modTime time.Time
+	data    map[string]time.Time
+}
+
 // LastActiveByProject reads ~/.claude/history.jsonl and returns
 // a map of project path -> last activity time.
+// Results are cached and only re-read when the file's mtime changes.
 func LastActiveByProject() map[string]time.Time {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil
 	}
-	f, err := os.Open(filepath.Join(home, ".claude", "history.jsonl"))
+	path := filepath.Join(home, ".claude", "history.jsonl")
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+
+	historyCache.Lock()
+	defer historyCache.Unlock()
+
+	if historyCache.data != nil && info.ModTime().Equal(historyCache.modTime) {
+		return historyCache.data
+	}
+
+	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
@@ -42,5 +64,8 @@ func LastActiveByProject() map[string]time.Time {
 			result[entry.Project] = t
 		}
 	}
+
+	historyCache.modTime = info.ModTime()
+	historyCache.data = result
 	return result
 }

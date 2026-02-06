@@ -33,6 +33,7 @@ type ClaudePane struct {
 type Workspace struct {
 	Path      string
 	ShortPath string
+	GitBranch string
 	Panes     []ClaudePane
 }
 
@@ -56,6 +57,7 @@ func GroupByWorkspace(panes []ClaudePane) []Workspace {
 		workspaces = append(workspaces, Workspace{
 			Path:      path,
 			ShortPath: short,
+			GitBranch: gitBranch(path),
 			Panes:     ps,
 		})
 	}
@@ -64,4 +66,23 @@ func GroupByWorkspace(panes []ClaudePane) []Workspace {
 		return workspaces[i].Path < workspaces[j].Path
 	})
 	return workspaces
+}
+
+// gitBranch returns the current git branch by reading .git/HEAD directly,
+// avoiding a process spawn. Returns "" if not a git repo or on any error.
+func gitBranch(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, ".git", "HEAD"))
+	if err != nil {
+		return ""
+	}
+	ref := strings.TrimSpace(string(data))
+	// Normal branch: "ref: refs/heads/main"
+	if branch, ok := strings.CutPrefix(ref, "ref: refs/heads/"); ok {
+		return branch
+	}
+	// Detached HEAD — return short sha
+	if len(ref) >= 8 {
+		return ref[:8]
+	}
+	return ref
 }

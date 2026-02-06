@@ -13,6 +13,9 @@ var (
 			Foreground(lipgloss.Color("15")).
 			Bold(true)
 
+	branchStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("2"))
+
 	paneItemStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8"))
 

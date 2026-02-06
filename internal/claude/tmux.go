@@ -5,19 +5,52 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
-// ListClaudePanes returns all tmux panes currently running claude.
-func ListClaudePanes() ([]ClaudePane, error) {
-	out, err := exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}").Output()
-	if err != nil {
-		return nil, fmt.Errorf("tmux list-panes: %w", err)
+// processTable holds a snapshot of the system process tree built from a single
+// ps call, replacing per-pane pgrep invocations with in-memory lookups.
+type processTable struct {
+	children map[int][]int  // ppid -> child pids
+	comm     map[int]string // pid -> command basename
+}
+
+// loadProcessTable snapshots the process tree via a single ps call.
+func loadProcessTable() processTable {
+	pt := processTable{
+		children: make(map[int][]int),
+		comm:     make(map[int]string),
 	}
+	out, err := exec.Command("ps", "-eo", "pid,ppid,comm").Output()
+	if err != nil {
+		return pt
+	}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		ppid, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		pt.children[ppid] = append(pt.children[ppid], pid)
+		pt.comm[pid] = fields[2]
+	}
+	return pt
+}
 
-	history := LastActiveByProject()
+// rawPane holds parsed tmux pane info before status detection.
+type rawPane struct {
+	target, session, window, pane, path string
+	pid                                 int
+}
 
-	var panes []ClaudePane
+// parseTmuxPanes parses tmux list-panes output into rawPane structs.
+func parseTmuxPanes(out []byte) []rawPane {
+	var raw []rawPane
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
@@ -32,48 +65,134 @@ func ListClaudePanes() ([]ClaudePane, error) {
 		}
 		pid, _ := strconv.Atoi(pidStr)
 		session, window, pane := parseTarget(target)
-		panes = append(panes, ClaudePane{
-			Target:     target,
-			Session:    session,
-			Window:     window,
-			Pane:       pane,
-			Path:       path,
-			PID:        pid,
-			Status:     detectStatus(pid, target),
-			LastActive: history[path],
-		})
+		raw = append(raw, rawPane{target, session, window, pane, path, pid})
+	}
+	return raw
+}
+
+// listTmuxPanes runs tmux list-panes and returns raw output.
+func listTmuxPanes() ([]byte, error) {
+	return exec.Command("tmux", "list-panes", "-a", "-F",
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}").Output()
+}
+
+// ListClaudePanesBasic returns panes with StatusIdle (no status detection).
+// Used for instant initial display before async status detection kicks in.
+func ListClaudePanesBasic() ([]ClaudePane, error) {
+	// Run tmux list-panes and history read in parallel.
+	var (
+		tmuxOut []byte
+		tmuxErr error
+		history map[string]time.Time
+	)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		tmuxOut, tmuxErr = listTmuxPanes()
+	}()
+	go func() {
+		defer wg.Done()
+		history = LastActiveByProject()
+	}()
+	wg.Wait()
+
+	if tmuxErr != nil {
+		return nil, fmt.Errorf("tmux list-panes: %w", tmuxErr)
+	}
+
+	raw := parseTmuxPanes(tmuxOut)
+	panes := make([]ClaudePane, len(raw))
+	for i, r := range raw {
+		panes[i] = ClaudePane{
+			Target:     r.target,
+			Session:    r.session,
+			Window:     r.window,
+			Pane:       r.pane,
+			Path:       r.path,
+			PID:        r.pid,
+			Status:     StatusIdle,
+			LastActive: history[r.path],
+		}
+	}
+	return panes, nil
+}
+
+// ListClaudePanes returns all tmux panes currently running claude with full
+// status detection. Runs tmux list-panes, history read, and process table
+// snapshot in parallel, then detects per-pane attention status concurrently.
+func ListClaudePanes() ([]ClaudePane, error) {
+	// Run tmux list-panes, history read, and process table snapshot in parallel.
+	var (
+		tmuxOut []byte
+		tmuxErr error
+		history map[string]time.Time
+		pt      processTable
+	)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		tmuxOut, tmuxErr = listTmuxPanes()
+	}()
+	go func() {
+		defer wg.Done()
+		history = LastActiveByProject()
+	}()
+	go func() {
+		defer wg.Done()
+		pt = loadProcessTable()
+	}()
+	wg.Wait()
+
+	if tmuxErr != nil {
+		return nil, fmt.Errorf("tmux list-panes: %w", tmuxErr)
+	}
+
+	raw := parseTmuxPanes(tmuxOut)
+
+	// Detect status sequentially. needsAttention calls tmux capture-pane,
+	// and tmux serializes these internally via a server lock — concurrent
+	// calls just contend on that lock. Sequential avoids the overhead.
+	// isClaudeBusy is a pure in-memory lookup via the process table.
+	panes := make([]ClaudePane, len(raw))
+	for i, r := range raw {
+		panes[i] = ClaudePane{
+			Target:     r.target,
+			Session:    r.session,
+			Window:     r.window,
+			Pane:       r.pane,
+			Path:       r.path,
+			PID:        r.pid,
+			Status:     detectStatus(r.pid, r.target, &pt),
+			LastActive: history[r.path],
+		}
 	}
 	return panes, nil
 }
 
 // detectStatus determines whether Claude needs attention, is busy, or is idle.
-func detectStatus(shellPID int, target string) PaneStatus {
+func detectStatus(shellPID int, target string, pt *processTable) PaneStatus {
 	if needsAttention(target) {
 		return StatusNeedsAttention
 	}
-	if isClaudeBusy(shellPID) {
+	if isClaudeBusy(shellPID, pt) {
 		return StatusBusy
 	}
 	return StatusIdle
 }
 
 // isClaudeBusy checks if Claude is actively working by looking for caffeinate
-// child processes. Claude Code spawns caffeinate while processing (thinking,
-// streaming, running tools) and kills it when idle.
-func isClaudeBusy(shellPID int) bool {
-	// Find the claude process (direct child of the shell)
-	out, err := exec.Command("pgrep", "-P", strconv.Itoa(shellPID)).Output()
-	if err != nil {
-		return false
-	}
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		childPID := strings.TrimSpace(line)
-		if childPID == "" {
-			continue
-		}
-		// Check if this child has a caffeinate subprocess
-		if err := exec.Command("pgrep", "-P", childPID, "caffeinate").Run(); err == nil {
-			return true
+// in the process tree. Uses the pre-loaded process table for pure in-memory
+// lookups instead of spawning pgrep processes.
+func isClaudeBusy(shellPID int, pt *processTable) bool {
+	for _, childPID := range pt.children[shellPID] {
+		for _, grandchildPID := range pt.children[childPID] {
+			comm := pt.comm[grandchildPID]
+			// Match basename — comm may be a full path like /usr/bin/caffeinate.
+			if comm == "caffeinate" || strings.HasSuffix(comm, "/caffeinate") {
+				return true
+			}
 		}
 	}
 	return false
@@ -115,8 +234,28 @@ func needsAttention(target string) bool {
 		"Feel free to ask",
 		"Is there anything else",
 		"What else can I help",
+		"Want me to go ahead",
+		"Shall I",
+		"Do you want me to",
+		"Ready to proceed",
 	} {
 		if strings.Contains(content, pattern) {
+			return true
+		}
+	}
+	// Check if any of the last non-empty lines ends with a question mark.
+	// This catches ad-hoc questions Claude asks that don't match explicit patterns.
+	// We scan 15 lines back because the Claude CLI renders several UI elements
+	// (separator, prompt, cost info) between the question and the bottom of the pane.
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	checked := 0
+	for i := len(lines) - 1; i >= 0 && checked < 15; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		checked++
+		if strings.HasSuffix(line, "?") {
 			return true
 		}
 	}
