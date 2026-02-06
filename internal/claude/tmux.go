@@ -255,7 +255,7 @@ func needsAttention(target string) bool {
 			continue
 		}
 		checked++
-		if strings.HasSuffix(line, "?") {
+		if strings.HasSuffix(line, "?") && !strings.HasPrefix(line, "❯") {
 			return true
 		}
 	}
