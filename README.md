@@ -35,9 +35,12 @@ bind j run-shell "tmux neww agent-mux"
 
 ### Keys
 
-| Key         | Action            |
-| ----------- | ----------------- |
-| `j` / `k`   | Navigate up/down  |
-| `enter`     | Switch to session |
-| `dd`        | Kill session      |
-| `q` / `esc` | Quit              |
+| Key              | Action               |
+| ---------------- | -------------------- |
+| `j` / `k`        | Navigate up/down     |
+| `[count]j` / `k` | Move N sessions      |
+| `gg`             | Go to first session  |
+| `G`              | Go to last session   |
+| `enter`          | Switch to session    |
+| `dd`             | Kill session         |
+| `q` / `esc`      | Quit                 |

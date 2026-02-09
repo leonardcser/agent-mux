@@ -67,6 +67,8 @@ type Model struct {
 	loaded             bool
 	statusLoaded       bool // true once first full status detection completes
 	pendingD           bool
+	pendingG           bool
+	count              int // vim-style numeric prefix
 }
 
 // NewModel creates the initial model.
@@ -161,34 +163,69 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		key := msg.String()
 
+		// Accumulate numeric prefix (vim count).
+		if len(key) == 1 && key[0] >= '0' && key[0] <= '9' {
+			// Don't allow leading zeros as a count (0 is not a motion here).
+			if m.count > 0 || key[0] != '0' {
+				m.count = m.count*10 + int(key[0]-'0')
+				return m, nil
+			}
+		}
+		count := max(m.count, 1)
+		m.count = 0
+
 		// Handle dd sequence
 		if key == "d" {
 			if m.pendingD {
 				m.pendingD = false
+				m.pendingG = false
 				return m, m.killCurrentPane()
 			}
 			m.pendingD = true
+			m.pendingG = false
 			return m, nil
 		}
 		m.pendingD = false
+
+		// Handle gg sequence
+		if key == "g" {
+			if m.pendingG {
+				m.pendingG = false
+				m.cursor = FirstPane(m.items)
+				return m, m.previewCmd()
+			}
+			m.pendingG = true
+			return m, nil
+		}
+		m.pendingG = false
 
 		switch key {
 		case "q", "esc", "ctrl+c":
 			return m, tea.Quit
 
+		case "G":
+			m.cursor = LastPane(m.items)
+			return m, m.previewCmd()
+
 		case "j", "down":
-			next := NextPane(m.items, m.cursor)
-			if next != m.cursor {
+			for range count {
+				next := NextPane(m.items, m.cursor)
+				if next == m.cursor {
+					break
+				}
 				m.cursor = next
-				return m, m.previewCmd()
 			}
+			return m, m.previewCmd()
 
 		case "k", "up":
-			prev := PrevPane(m.items, m.cursor)
-			if prev != m.cursor {
+			for range count {
+				prev := PrevPane(m.items, m.cursor)
+				if prev == m.cursor {
+					break
+				}
 				m.cursor = prev
-				return m, m.previewCmd()
 			}
+			return m, m.previewCmd()
 
 		case "enter":
 			if m.cursor >= 0 && m.cursor < len(m.items) && m.items[m.cursor].Kind == KindPane {

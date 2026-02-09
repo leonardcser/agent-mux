@@ -81,6 +81,16 @@ func NearestPane(items []TreeItem, from int) int {
 	return 0
 }
 
+// LastPane returns the index of the last KindPane item, or 0 if none.
+func LastPane(items []TreeItem) int {
+	for i := len(items) - 1; i >= 0; i-- {
+		if items[i].Kind == KindPane {
+			return i
+		}
+	}
+	return 0
+}
+
 // FirstPane returns the index of the first KindPane item, or 0 if none.
 func FirstPane(items []TreeItem) int {
 	for i, it := range items {
