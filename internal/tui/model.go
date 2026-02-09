@@ -116,8 +116,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.items = FlattenTree(m.workspaces)
 		if firstStatus {
 			m.cursor = FirstAttentionPane(m.items, m.workspaces)
-		} else if m.cursor >= len(m.items) || m.items[m.cursor].Kind != KindPane {
-			m.cursor = FirstPane(m.items)
+		} else {
+			m.cursor = NearestPane(m.items, m.cursor)
 		}
 		// Schedule next panes tick after completion (backpressure).
 		cmds := []tea.Cmd{panesTickCmd()}

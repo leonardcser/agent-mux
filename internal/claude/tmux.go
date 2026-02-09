@@ -200,11 +200,16 @@ func isClaudeBusy(shellPID int, pt *processTable) bool {
 
 // needsAttention checks if Claude is waiting for user interaction.
 func needsAttention(target string) bool {
-	out, err := exec.Command("tmux", "capture-pane", "-t", target, "-p", "-S", "-15").Output()
+	out, err := exec.Command("tmux", "capture-pane", "-t", target, "-p").Output()
 	if err != nil {
 		return false
 	}
-	content := string(out)
+	// Only inspect the last 10 lines of the visible pane.
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	if len(lines) > 10 {
+		lines = lines[len(lines)-10:]
+	}
+	content := strings.Join(lines, "\n")
 	for _, pattern := range []string{
 		// Tool permission prompts
 		"Do you want to proceed?",
@@ -245,16 +250,11 @@ func needsAttention(target string) bool {
 	}
 	// Check if any of the last non-empty lines ends with a question mark.
 	// This catches ad-hoc questions Claude asks that don't match explicit patterns.
-	// We scan 15 lines back because the Claude CLI renders several UI elements
-	// (separator, prompt, cost info) between the question and the bottom of the pane.
-	lines := strings.Split(strings.TrimSpace(content), "\n")
-	checked := 0
-	for i := len(lines) - 1; i >= 0 && checked < 15; i-- {
+	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
 		}
-		checked++
 		if strings.HasSuffix(line, "?") && !strings.HasPrefix(line, "❯") {
 			return true
 		}
