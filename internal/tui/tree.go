@@ -126,6 +126,19 @@ func FirstAttentionPane(items []TreeItem, workspaces []agent.Workspace) int {
 	return FirstPane(items)
 }
 
+// FindPaneByTarget returns the index of the pane with the given target.
+func FindPaneByTarget(items []TreeItem, workspaces []agent.Workspace, target string) int {
+	for i, item := range items {
+		if item.Kind == KindPane {
+			pane := workspaces[item.WorkspaceIndex].Panes[item.PaneIndex]
+			if pane.Target == target {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
 // RenderTreeItem renders a single row.
 func RenderTreeItem(item TreeItem, workspaces []agent.Workspace, selected bool, width int) string {
 	switch item.Kind {

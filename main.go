@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 	_ "github.com/leo/agent-mux/internal/provider" // register all providers
@@ -15,7 +16,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(tui.NewModel(), tea.WithAltScreen())
+	tmux := os.Getenv("TMUX")
+	sessionID := filepath.Base(tmux)
+
+	p := tea.NewProgram(tui.NewModel(sessionID), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

@@ -58,6 +58,7 @@ type Model struct {
 	workspaces         []agent.Workspace
 	items              []TreeItem
 	cursor             int
+	scrollStart        int
 	preview            viewport.Model
 	previewFor         string
 	lastPreviewContent string // raw content for dedup
@@ -65,24 +66,42 @@ type Model struct {
 	height             int
 	err                error
 	loaded             bool
-	statusLoaded       bool // true once first full status detection completes
+	firstLoad          bool
 	pendingD           bool
 	pendingG           bool
 	count              int // vim-style numeric prefix
+	tmuxSession        string
 }
 
 // NewModel creates the initial model.
 // Uses the fast path (no status detection) so the UI is ready on the first frame.
 // Full status detection happens on the first async tick.
-func NewModel() Model {
+func NewModel(tmuxSession string) Model {
 	m := Model{
-		preview: viewport.New(40, 20),
+		preview:     viewport.New(40, 20),
+		firstLoad:   true,
+		tmuxSession: tmuxSession,
 	}
-	panes, err := agent.ListPanesBasic()
-	m.loaded = true
-	if err != nil {
-		m.err = err
+
+	cachedPanes, cachedOK := agent.LoadCachedPanes()
+	paneTarget, _, lastScrollStart, stateOK := agent.LoadLastPosition(tmuxSession)
+
+	if cachedOK {
+		m.workspaces = agent.GroupByWorkspace(cachedPanes)
+		m.items = FlattenTree(m.workspaces)
+		if stateOK {
+			m.cursor = FindPaneByTarget(m.items, m.workspaces, paneTarget)
+			m.scrollStart = lastScrollStart
+		} else {
+			m.cursor = FirstAttentionPane(m.items, m.workspaces)
+		}
 	} else {
+		panes, err := agent.ListPanesBasic()
+		if err != nil {
+			m.err = err
+			m.loaded = true
+			return m
+		}
 		m.workspaces = agent.GroupByWorkspace(panes)
 		m.items = FlattenTree(m.workspaces)
 		m.cursor = FirstPane(m.items)
@@ -112,14 +131,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, panesTickCmd() // keep ticking even on error
 		}
 		m.err = nil
-		firstStatus := !m.statusLoaded
-		m.statusLoaded = true
+		agent.SaveCachedPanes(msg.panes)
+
 		m.workspaces = agent.GroupByWorkspace(msg.panes)
 		m.items = FlattenTree(m.workspaces)
-		if firstStatus {
-			m.cursor = FirstAttentionPane(m.items, m.workspaces)
-		} else {
-			m.cursor = NearestPane(m.items, m.cursor)
+
+		if m.firstLoad {
+			m.firstLoad = false
+			paneTarget, _, scrollStart, stateOK := agent.LoadLastPosition(m.tmuxSession)
+			attentionIndex := FirstAttentionPane(m.items, m.workspaces)
+			if attentionIndex != FirstPane(m.items) {
+				m.cursor = attentionIndex
+			} else if stateOK {
+				m.cursor = FindPaneByTarget(m.items, m.workspaces, paneTarget)
+				m.scrollStart = scrollStart
+			} else {
+				m.cursor = FirstPane(m.items)
+			}
 		}
 		// Schedule next panes tick after completion (backpressure).
 		cmds := []tea.Cmd{panesTickCmd()}
@@ -200,9 +228,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingG = false
 
 		switch key {
-		case "q", "esc", "ctrl+c":
-			return m, tea.Quit
-
 		case "G":
 			m.cursor = LastPane(m.items)
 			return m, m.previewCmd()
@@ -231,8 +256,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor >= 0 && m.cursor < len(m.items) && m.items[m.cursor].Kind == KindPane {
 				pane := m.workspaces[m.items[m.cursor].WorkspaceIndex].Panes[m.items[m.cursor].PaneIndex]
 				_ = agent.SwitchToPane(pane.Target)
+				agent.SaveLastPosition(m.tmuxSession, pane.Target, m.cursor, m.scrollStart)
 				return m, tea.Quit
 			}
+
+		case "q", "esc", "ctrl+c":
+			if m.cursor >= 0 && m.cursor < len(m.items) && m.items[m.cursor].Kind == KindPane {
+				pane := m.workspaces[m.items[m.cursor].WorkspaceIndex].Panes[m.items[m.cursor].PaneIndex]
+				agent.SaveLastPosition(m.tmuxSession, pane.Target, m.cursor, m.scrollStart)
+			}
+			return m, tea.Quit
 
 		}
 	}
@@ -287,6 +320,7 @@ func (m Model) renderTree(width, height int) []string {
 	}
 
 	start := VisibleSlice(len(m.items), m.cursor, height)
+	m.scrollStart = start
 	end := min(start+height, len(m.items))
 
 	lines := make([]string, 0, end-start)
