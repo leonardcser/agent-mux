@@ -65,6 +65,7 @@ type Model struct {
 	height             int
 	err                error
 	loaded             bool
+	showHelp           bool
 	pendingD           bool
 	pendingG           bool
 	count              int
@@ -252,6 +253,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.pendingG = false
 
 	switch key {
+	case "?":
+		m.showHelp = !m.showHelp
+		return m, nil
+
 	case "G":
 		m.cursor = LastPane(m.items)
 		return m, m.previewCmd()
@@ -348,11 +353,41 @@ func (m Model) View() string {
 	sep := separatorStyle.Render(strings.Repeat("│\n", h-1) + "│")
 
 	pw := m.previewWidth()
-	m.preview.Width = pw
-	m.preview.Height = h
-	previewRendered := lipgloss.NewStyle().Width(pw).Height(h).Render(m.preview.View())
+	var previewRendered string
+	if m.showHelp {
+		previewRendered = lipgloss.NewStyle().Width(pw).Height(h).Render(m.renderHelp())
+	} else {
+		m.preview.Width = pw
+		m.preview.Height = h
+		previewRendered = lipgloss.NewStyle().Width(pw).Height(h).Render(m.preview.View())
+	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, listRendered, sep, previewRendered)
+}
+
+func (m Model) renderHelp() string {
+	keys := []struct{ key, desc string }{
+		{"j/k", "move down/up"},
+		{"[n]j/k", "move down/up n times"},
+		{"enter", "switch to pane"},
+		{"s/u", "stash/unstash"},
+		{"dd", "kill pane"},
+		{"gg", "go to first"},
+		{"G", "go to last"},
+		{"?", "toggle help"},
+		{"q/esc", "quit"},
+	}
+	var b strings.Builder
+	b.WriteString(helpTitleStyle.Render(" Keybindings"))
+	b.WriteString("\n\n")
+	for _, k := range keys {
+		b.WriteString("  ")
+		b.WriteString(helpKeyStyle.Render(k.key))
+		b.WriteString("  ")
+		b.WriteString(helpDescStyle.Render(k.desc))
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func (m Model) listWidth() int {

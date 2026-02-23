@@ -58,8 +58,17 @@ var (
 	stashedSectionStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("242"))
 
-	// Help / status
+	// Help
 	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("8"))
+	helpTitleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("15")).
+			Bold(true)
+	helpKeyStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("15")).
+			Bold(true).
+			Width(8)
+	helpDescStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8"))
 
 	// Error
