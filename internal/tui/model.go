@@ -281,11 +281,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = LastPane(m.items)
 		return m, m.newPreviewCmd()
 
-	case "s", "u":
+	case "s":
 		if m.toggleStash() {
 			m.items = FlattenTree(m.workspaces, m.stashed)
 			m.cursor = NearestPane(m.items, m.cursor)
 			m.scrollStart = VisibleSlice(len(m.items), m.cursor, m.height)
+		}
+		return m, nil
+
+	case "u":
+		if p := m.resolvePane(m.cursor); p != nil && p.Stashed {
+			if m.toggleStash() {
+				m.items = FlattenTree(m.workspaces, m.stashed)
+				m.cursor = NearestPane(m.items, m.cursor)
+				m.scrollStart = VisibleSlice(len(m.items), m.cursor, m.height)
+			}
 		}
 		return m, nil
 
