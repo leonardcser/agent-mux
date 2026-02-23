@@ -85,7 +85,8 @@ func NewModel(tmuxSession string) Model {
 	state, stateOK := agent.LoadState()
 	m.state = state
 	if stateOK {
-		m.workspaces = agent.GroupByWorkspace(state.CachedPanes)
+		all := agent.WorkspacesFromState(state.Workspaces)
+		m.workspaces, m.stashed = splitByStash(all)
 	} else {
 		panes, err := agent.ListPanesBasic()
 		if err != nil {
@@ -95,8 +96,6 @@ func NewModel(tmuxSession string) Model {
 		}
 		m.workspaces = agent.GroupByWorkspace(panes)
 	}
-
-	m.workspaces, m.stashed = splitByStashState(m.workspaces, m.state.StashState)
 	m.items = FlattenTree(m.workspaces, m.stashed)
 
 	if attention := FirstAttentionPane(m.items, m.workspaces, m.stashed); attention >= 0 {
@@ -114,12 +113,38 @@ func NewModel(tmuxSession string) Model {
 	return m
 }
 
-func splitByStashState(workspaces []agent.Workspace, stashState map[string]bool) (working, stashed []agent.Workspace) {
+// splitByStash separates workspaces into working and stashed based on each pane's Stashed field.
+func splitByStash(workspaces []agent.Workspace) (working, stashed []agent.Workspace) {
 	for _, ws := range workspaces {
-		var stashedPanes []agent.Pane
-		var workingPanes []agent.Pane
+		var stashedPanes, workingPanes []agent.Pane
 		for _, p := range ws.Panes {
-			if stashState[p.Target] {
+			if p.Stashed {
+				stashedPanes = append(stashedPanes, p)
+			} else {
+				workingPanes = append(workingPanes, p)
+			}
+		}
+		base := agent.Workspace{Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch, GitDirty: ws.GitDirty}
+		if len(stashedPanes) > 0 {
+			s := base
+			s.Panes = stashedPanes
+			stashed = append(stashed, s)
+		}
+		if len(workingPanes) > 0 {
+			w := base
+			w.Panes = workingPanes
+			working = append(working, w)
+		}
+	}
+	return working, stashed
+}
+
+// splitByStashSet separates workspaces using an external set of stashed targets.
+func splitByStashSet(workspaces []agent.Workspace, stashSet map[string]bool) (working, stashed []agent.Workspace) {
+	for _, ws := range workspaces {
+		var stashedPanes, workingPanes []agent.Pane
+		for _, p := range ws.Panes {
+			if stashSet[p.Target] {
 				p.Stashed = true
 				stashedPanes = append(stashedPanes, p)
 			} else {
@@ -127,17 +152,16 @@ func splitByStashState(workspaces []agent.Workspace, stashState map[string]bool)
 				workingPanes = append(workingPanes, p)
 			}
 		}
+		base := agent.Workspace{Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch, GitDirty: ws.GitDirty}
 		if len(stashedPanes) > 0 {
-			stashed = append(stashed, agent.Workspace{
-				Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch, GitDirty: ws.GitDirty,
-				Panes: stashedPanes,
-			})
+			s := base
+			s.Panes = stashedPanes
+			stashed = append(stashed, s)
 		}
 		if len(workingPanes) > 0 {
-			working = append(working, agent.Workspace{
-				Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch, GitDirty: ws.GitDirty,
-				Panes: workingPanes,
-			})
+			w := base
+			w.Panes = workingPanes
+			working = append(working, w)
 		}
 	}
 	return working, stashed
@@ -183,7 +207,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = nil
 		m.workspaces = agent.GroupByWorkspace(msg.panes)
-		m.workspaces, m.stashed = splitByStashState(m.workspaces, m.state.StashState)
+		stashSet := m.stashSet()
+		m.workspaces, m.stashed = splitByStashSet(m.workspaces, stashSet)
 		m.items = FlattenTree(m.workspaces, m.stashed)
 		m.cursor = NearestPane(m.items, m.cursor)
 		return m, panesTickCmd()
@@ -332,24 +357,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) saveState() {
-	m.state.CachedPanes = make([]agent.Pane, 0)
-	for _, ws := range m.workspaces {
-		m.state.CachedPanes = append(m.state.CachedPanes, ws.Panes...)
-	}
-	for _, ws := range m.stashed {
-		m.state.CachedPanes = append(m.state.CachedPanes, ws.Panes...)
-	}
-	m.state.StashState = make(map[string]bool)
-	for _, ws := range m.workspaces {
-		for _, p := range ws.Panes {
-			m.state.StashState[p.Target] = false
-		}
-	}
-	for _, ws := range m.stashed {
-		for _, p := range ws.Panes {
-			m.state.StashState[p.Target] = true
-		}
-	}
+	all := append(m.workspaces, m.stashed...)
+	m.state.Workspaces = agent.CacheWorkspaces(all)
 	var paneTarget string
 	if p := m.resolvePane(m.cursor); p != nil {
 		paneTarget = p.Target
@@ -360,6 +369,17 @@ func (m *Model) saveState() {
 		ScrollStart: m.scrollStart,
 	}
 	_ = agent.SaveState(m.state)
+}
+
+// stashSet builds a set of stashed pane targets from current model state.
+func (m Model) stashSet() map[string]bool {
+	set := make(map[string]bool)
+	for _, ws := range m.stashed {
+		for _, p := range ws.Panes {
+			set[p.Target] = true
+		}
+	}
+	return set
 }
 
 func (m Model) View() string {
@@ -464,15 +484,9 @@ func (m *Model) toggleStash() bool {
 	}
 	target := p.Target
 
-	if m.state.StashState == nil {
-		m.state.StashState = make(map[string]bool)
-	}
-
 	if !p.Stashed {
-		m.state.StashState[target] = true
 		m.movePaneBetween(&m.workspaces, &m.stashed, target, true)
 	} else {
-		m.state.StashState[target] = false
 		m.movePaneBetween(&m.stashed, &m.workspaces, target, false)
 	}
 	return true
