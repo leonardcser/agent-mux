@@ -172,7 +172,7 @@ func FindPaneByTarget(items []TreeItem, workspaces []agent.Workspace, stashed []
 			}
 		}
 	}
-	return 0
+	return -1
 }
 
 // RenderTreeItem renders a single row.

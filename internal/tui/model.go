@@ -102,8 +102,12 @@ func NewModel(tmuxSession string) Model {
 	if attention := FirstAttentionPane(m.items, m.workspaces, m.stashed); attention >= 0 {
 		m.cursor = attention
 	} else if stateOK && state.LastPosition.PaneTarget != "" {
-		m.cursor = FindPaneByTarget(m.items, m.workspaces, m.stashed, state.LastPosition.PaneTarget)
-		m.scrollStart = state.LastPosition.ScrollStart
+		if pos := FindPaneByTarget(m.items, m.workspaces, m.stashed, state.LastPosition.PaneTarget); pos >= 0 {
+			m.cursor = pos
+			m.scrollStart = state.LastPosition.ScrollStart
+		} else {
+			m.cursor = FirstPane(m.items)
+		}
 	} else {
 		m.cursor = FirstPane(m.items)
 	}
