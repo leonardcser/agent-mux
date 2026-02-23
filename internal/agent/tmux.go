@@ -151,7 +151,6 @@ func ListPanes() ([]Pane, error) {
 	raw := resolveAgentPanes(parseTmuxPanes(tmuxOut), &pt)
 
 	panes := make([]Pane, len(raw))
-	var hashWg sync.WaitGroup
 	for i, r := range raw {
 		panes[i] = Pane{
 			Target:     r.target,
@@ -163,15 +162,21 @@ func ListPanes() ([]Pane, error) {
 			Status:     StatusIdle,
 			LastActive: history[r.path],
 		}
-		hashWg.Add(1)
-		go func(idx int, target string) {
-			defer hashWg.Done()
-			h, att := contentHashAndAttention(target)
-			panes[idx].ContentHash = h
-			panes[idx].HeuristicAttention = att
-		}(i, r.target)
 	}
-	hashWg.Wait()
+
+	// Run content hashing and git enrichment concurrently.
+	var allWg sync.WaitGroup
+	allWg.Go(func() {
+		EnrichPanes(panes)
+	})
+	for i := range panes {
+		allWg.Go(func() {
+			h, att := contentHashAndAttention(panes[i].Target)
+			panes[i].ContentHash = h
+			panes[i].HeuristicAttention = att
+		})
+	}
+	allWg.Wait()
 	return panes, nil
 }
 

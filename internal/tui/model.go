@@ -247,7 +247,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, panesTickCmd()
 		}
 		m.err = nil
-		agent.EnrichPanes(msg.panes)
 
 		// Build new pane set, preserving stashed state from existing panes.
 		alive := make(map[string]bool, len(msg.panes))

@@ -23,6 +23,10 @@ func main() {
 		runBench(slices.Contains(os.Args[1:], "--bench-cold"))
 		return
 	}
+	if slices.Contains(os.Args[1:], "--bench-loop") {
+		runBenchLoop()
+		return
+	}
 
 	tmux := os.Getenv("TMUX")
 	sessionID := filepath.Base(tmux)
@@ -32,6 +36,27 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func runBenchLoop() {
+	// Simulate one full refresh cycle (what runs every 2s in the runtime loop).
+	// 1. ListPanesBasic (tmux + ps + history, parallel)
+	// 2. Content hashing (per-pane tmux capture)
+	// 3. EnrichPanes (git operations)
+	// 4. CapturePane (preview load)
+
+	t0 := time.Now()
+	panes, err := agent.ListPanes()
+	fmt.Fprintf(os.Stderr, "ListPanes:      %v (panes=%d, err=%v)\n", time.Since(t0), len(panes), err)
+	if err != nil || len(panes) == 0 {
+		return
+	}
+
+	t1 := time.Now()
+	_, _ = agent.CapturePane(panes[0].Target, 50)
+	fmt.Fprintf(os.Stderr, "CapturePane:    %v\n", time.Since(t1))
+
+	fmt.Fprintf(os.Stderr, "Total:          %v\n", time.Since(t0))
 }
 
 func runBench(cold bool) {
