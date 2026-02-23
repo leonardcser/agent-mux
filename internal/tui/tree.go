@@ -19,40 +19,9 @@ const (
 
 // TreeItem is one visible row in the flattened tree.
 type TreeItem struct {
-	Kind           ItemKind
-	WorkspaceIndex int
-	PaneIndex      int
-	HeaderTitle    string
-}
-
-// FlattenTree builds the visible flat list from workspaces.
-// Workspaces are always expanded; headers are non-selectable.
-func FlattenTree(workspaces []agent.Workspace, stashed []agent.Workspace) []TreeItem {
-	var items []TreeItem
-
-	for wi, ws := range workspaces {
-		items = append(items, TreeItem{Kind: KindWorkspace, WorkspaceIndex: wi})
-		for pi := range ws.Panes {
-			if !ws.Panes[pi].Stashed {
-				items = append(items, TreeItem{Kind: KindPane, WorkspaceIndex: wi, PaneIndex: pi})
-			}
-		}
-	}
-
-	if len(stashed) > 0 {
-		items = append(items, TreeItem{Kind: KindSectionHeader, HeaderTitle: ""})
-		items = append(items, TreeItem{Kind: KindSectionHeader, HeaderTitle: "stashed"})
-	}
-
-	for wi, ws := range stashed {
-		items = append(items, TreeItem{Kind: KindWorkspace, WorkspaceIndex: wi + len(workspaces)})
-		for pi := range ws.Panes {
-			if ws.Panes[pi].Stashed {
-				items = append(items, TreeItem{Kind: KindPane, WorkspaceIndex: wi + len(workspaces), PaneIndex: pi})
-			}
-		}
-	}
-	return items
+	Kind        ItemKind
+	Target      string // pane target (KindPane) or first pane target in workspace (KindWorkspace)
+	HeaderTitle string // for KindSectionHeader
 }
 
 // NextPane returns the index of the next KindPane item after from, wrapping around if none.
@@ -90,8 +59,6 @@ func PrevPane(items []TreeItem, from int) int {
 }
 
 // NearestPane returns the closest KindPane to the given index without wrapping.
-// It prefers panes within the same section (working or stashed), falling back
-// to panes in the other section if none are found.
 func NearestPane(items []TreeItem, from int) int {
 	if len(items) == 0 {
 		return 0
@@ -108,23 +75,35 @@ func NearestPane(items []TreeItem, from int) int {
 
 	sectionStart, sectionEnd := sectionBounds(items, from)
 
-	for i := from + 1; i < sectionEnd; i++ {
-		if items[i].Kind == KindPane {
-			return i
+	// Find closest pane within the current section (by distance).
+	best := -1
+	for i := sectionStart; i < sectionEnd; i++ {
+		if items[i].Kind != KindPane {
+			continue
+		}
+		dist := i - from
+		bestDist := best - from
+		if dist < 0 {
+			dist = -dist
+		}
+		if bestDist < 0 {
+			bestDist = -bestDist
+		}
+		if best < 0 || dist < bestDist {
+			best = i
 		}
 	}
-	for i := from - 1; i >= sectionStart; i-- {
-		if items[i].Kind == KindPane {
-			return i
-		}
+	if best >= 0 {
+		return best
 	}
 
-	for i := from + 1; i < len(items); i++ {
+	// Fall back to other sections.
+	for i := from - 1; i >= 0; i-- {
 		if items[i].Kind == KindPane {
 			return i
 		}
 	}
-	for i := from - 1; i >= 0; i-- {
+	for i := from + 1; i < len(items); i++ {
 		if items[i].Kind == KindPane {
 			return i
 		}
@@ -133,8 +112,7 @@ func NearestPane(items []TreeItem, from int) int {
 }
 
 // sectionBounds returns the start (inclusive) and end (exclusive) indices of
-// the section containing the given index. Sections are separated by
-// KindSectionHeader items with a non-empty HeaderTitle.
+// the section containing the given index.
 func sectionBounds(items []TreeItem, idx int) (int, int) {
 	start := 0
 	for i := idx - 1; i >= 0; i-- {
@@ -173,43 +151,8 @@ func FirstPane(items []TreeItem) int {
 	return -1
 }
 
-// FirstAttentionPane returns the index of the first pane that needs attention, or -1 if none.
-func FirstAttentionPane(items []TreeItem, workspaces []agent.Workspace) int {
-	for i, it := range items {
-		if it.Kind == KindPane {
-			if it.WorkspaceIndex >= len(workspaces) {
-				break
-			}
-			p := workspaces[it.WorkspaceIndex].Panes[it.PaneIndex]
-			if p.Status == agent.StatusNeedsAttention {
-				return i
-			}
-		}
-	}
-	return -1
-}
-
-// FindPaneByTarget returns the index of the pane with the given target.
-func FindPaneByTarget(items []TreeItem, workspaces []agent.Workspace, stashed []agent.Workspace, target string) int {
-	for i, item := range items {
-		if item.Kind == KindPane {
-			ws := workspaces
-			wsIndex := item.WorkspaceIndex
-			if wsIndex >= len(workspaces) {
-				ws = stashed
-				wsIndex -= len(workspaces)
-			}
-			pane := ws[wsIndex].Panes[item.PaneIndex]
-			if pane.Target == target {
-				return i
-			}
-		}
-	}
-	return -1
-}
-
-// RenderTreeItem renders a single row.
-func RenderTreeItem(item TreeItem, workspaces []agent.Workspace, stashed []agent.Workspace, selected bool, width int) string {
+// renderTreeItem renders a single row.
+func (m Model) renderTreeItem(item TreeItem, selected bool, width int) string {
 	if item.Kind == KindSectionHeader {
 		if item.HeaderTitle == "" {
 			return ""
@@ -219,103 +162,92 @@ func RenderTreeItem(item TreeItem, workspaces []agent.Workspace, stashed []agent
 		return stashedSectionStyle.Render("─" + label + strings.Repeat("─", lineLen))
 	}
 
-	var ws agent.Workspace
-	if item.WorkspaceIndex < len(workspaces) {
-		ws = workspaces[item.WorkspaceIndex]
-	} else {
-		ws = stashed[item.WorkspaceIndex-len(workspaces)]
+	p := m.panes[item.Target]
+	if p == nil {
+		return ""
 	}
 
 	switch item.Kind {
 	case KindWorkspace:
-		avail := width - 2 // 1 leading space + 1 trailing minimum
-		name := ws.ShortPath
-		branch := ws.GitBranch
-		if branch != "" && ws.GitDirty {
-			branch += "*"
-		}
-
-		if branch != "" {
-			// " name branch " — space between name and branch = 1
-			needed := len(name) + 1 + len(branch)
-			if needed > avail {
-				// Step 1: truncate the branch name
-				branchAvail := avail - len(name) - 1
-				if branchAvail >= 4 { // room for at least "x..."
-					branch = truncate(branch, branchAvail)
-				} else {
-					// Step 2: drop branch entirely, show only name
-					branch = ""
-				}
-			}
-			if branch == "" {
-				name = truncate(name, avail)
-			}
-		} else {
-			name = truncate(name, avail)
-		}
-
-		text := " " + name
-		if branch != "" {
-			pad := max(width-len(text)-len(branch)-1, 0)
-			text += strings.Repeat(" ", pad)
-			return workspaceStyle.Render(text) + branchStyle.Render(branch) + branchStyle.Render(" ")
-		}
-		text += strings.Repeat(" ", max(width-len(text), 0))
-		return workspaceStyle.Render(text)
-
+		return renderWorkspaceHeader(p, width)
 	case KindPane:
-		p := ws.Panes[item.PaneIndex]
-		label := fmt.Sprintf("%s:%s", p.Session, p.Window)
-		elapsed := formatElapsed(time.Since(p.LastActive))
-
-		prefix := "   "
-		right := " " + elapsed + " "
-		middle := label
-		avail := width - len(prefix) - 2 - len(right) // 2 for icon+space
-		if len(middle) > avail {
-			middle = truncate(middle, avail)
-		}
-		gap := max(avail-len(middle), 0)
-
-		var icon string
-		switch p.Status {
-		case agent.StatusBusy:
-			if selected {
-				icon = busyIconSelectedStyle.Render("●")
-			} else if p.Stashed {
-				icon = stashedBusyIconStyle.Render("●")
-			} else {
-				icon = busyIconStyle.Render("●")
-			}
-		case agent.StatusNeedsAttention:
-			if selected {
-				icon = attentionIconSelectedStyle.Render("●")
-			} else if p.Stashed {
-				icon = stashedAttentionIconStyle.Render("●")
-			} else {
-				icon = attentionIconStyle.Render("●")
-			}
-		default:
-			if selected {
-				icon = idleIconSelectedStyle.Render("○")
-			} else if p.Stashed {
-				icon = stashedIdleIconStyle.Render("○")
-			} else {
-				icon = stashedPaneItemStyle.Render("○")
-			}
-		}
-
-		if selected {
-			return selectedStyle.Render(prefix) + icon + selectedStyle.Render(" "+middle+strings.Repeat(" ", gap)+right)
-		}
-
-		if p.Stashed {
-			return stashedPaneItemStyle.Render(prefix) + icon + stashedPaneItemStyle.Render(" "+middle) + stashedDimStyle.Render(strings.Repeat(" ", gap)+right)
-		}
-		return paneItemStyle.Render(prefix) + icon + paneItemStyle.Render(" "+middle) + dimStyle.Render(strings.Repeat(" ", gap)+right)
+		return renderPaneRow(p, selected, width)
 	}
 	return ""
+}
+
+func renderWorkspaceHeader(p *agent.Pane, width int) string {
+	avail := width - 2
+	name := p.ShortPath
+	branch := p.GitBranch
+	if branch != "" && p.GitDirty {
+		branch += "*"
+	}
+
+	if branch != "" {
+		needed := len(name) + 1 + len(branch)
+		if needed > avail {
+			branchAvail := avail - len(name) - 1
+			if branchAvail >= 4 {
+				branch = truncate(branch, branchAvail)
+			} else {
+				branch = ""
+			}
+		}
+		if branch == "" {
+			name = truncate(name, avail)
+		}
+	} else {
+		name = truncate(name, avail)
+	}
+
+	text := " " + name
+	if branch != "" {
+		pad := max(width-len(text)-len(branch)-1, 0)
+		text += strings.Repeat(" ", pad)
+		return workspaceStyle.Render(text) + branchStyle.Render(branch) + branchStyle.Render(" ")
+	}
+	text += strings.Repeat(" ", max(width-len(text), 0))
+	return workspaceStyle.Render(text)
+}
+
+func renderPaneRow(p *agent.Pane, selected bool, width int) string {
+	label := fmt.Sprintf("%s:%s", p.Session, p.Window)
+	elapsed := formatElapsed(time.Since(p.LastActive))
+
+	prefix := "   "
+	right := " " + elapsed + " "
+	middle := label
+	avail := width - len(prefix) - 2 - len(right)
+	if len(middle) > avail {
+		middle = truncate(middle, avail)
+	}
+	gap := max(avail-len(middle), 0)
+
+	icons := normalIcons
+	if selected {
+		icons = selectedIcons
+	} else if p.Stashed {
+		icons = stashedIcons
+	}
+
+	var icon string
+	switch p.Status {
+	case agent.StatusBusy:
+		icon = icons.busy
+	case agent.StatusNeedsAttention:
+		icon = icons.attention
+	default:
+		icon = icons.idle
+	}
+
+	if selected {
+		return selectedStyle.Render(prefix) + icon + selectedStyle.Render(" "+middle+strings.Repeat(" ", gap)+right)
+	}
+	if p.Stashed {
+		return icons.text.Render(prefix) + icon + icons.text.Render(" "+middle) + icons.dim.Render(strings.Repeat(" ", gap)+right)
+	}
+	return icons.text.Render(prefix) + icon + icons.text.Render(" "+middle) + icons.dim.Render(strings.Repeat(" ", gap)+right)
 }
 
 // truncate shortens s to maxLen, adding ellipsis if needed.

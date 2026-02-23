@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -20,57 +19,54 @@ const (
 
 // Pane represents a tmux pane running an AI coding agent.
 type Pane struct {
-	Target     string // e.g. "main:2.1"
-	Session    string
-	Window     string
-	Pane       string
-	Path       string
-	PID        int
-	Status      PaneStatus
-	ContentHash uint64
-	LastActive  time.Time
-	Stashed     bool
+	Target      string // e.g. "main:2.1"
+	Session     string
+	Window      string
+	Pane        string
+	Path        string
+	ShortPath   string
+	GitBranch   string
+	GitDirty    bool
+	PID         int
+	Status             PaneStatus
+	ContentHash        uint64
+	HeuristicAttention bool
+	LastActive         time.Time
+	Stashed            bool
 }
 
-// Workspace groups panes by working directory.
-type Workspace struct {
-	Path      string
-	ShortPath string
-	GitBranch string
-	GitDirty  bool
-	Panes     []Pane
-}
-
-// GroupByWorkspace groups panes by their working directory.
-func GroupByWorkspace(panes []Pane) []Workspace {
+// EnrichPanes populates workspace metadata (ShortPath, GitBranch, GitDirty) on each pane.
+// Metadata is computed once per unique path.
+func EnrichPanes(panes []Pane) {
 	home, _ := os.UserHomeDir()
-	groups := make(map[string][]Pane)
-	for _, p := range panes {
-		groups[p.Path] = append(groups[p.Path], p)
+	type wsInfo struct {
+		ShortPath string
+		GitBranch string
+		GitDirty  bool
 	}
-
-	var workspaces []Workspace
-	for path, ps := range groups {
-		short := filepath.Base(path)
-		if short == "." || short == "/" {
-			short = path
-			if home != "" && strings.HasPrefix(short, home) {
-				short = "~" + strings.TrimPrefix(short, home)
+	cache := make(map[string]wsInfo)
+	for i := range panes {
+		p := &panes[i]
+		info, ok := cache[p.Path]
+		if !ok {
+			short := filepath.Base(p.Path)
+			if short == "." || short == "/" {
+				short = p.Path
+				if home != "" && strings.HasPrefix(short, home) {
+					short = "~" + strings.TrimPrefix(short, home)
+				}
 			}
+			info = wsInfo{
+				ShortPath: short,
+				GitBranch: gitBranch(p.Path),
+				GitDirty:  gitDirty(p.Path),
+			}
+			cache[p.Path] = info
 		}
-		workspaces = append(workspaces, Workspace{
-			Path:      path,
-			ShortPath: short,
-			GitBranch: gitBranch(path),
-			GitDirty:  gitDirty(path),
-			Panes:     ps,
-		})
+		p.ShortPath = info.ShortPath
+		p.GitBranch = info.GitBranch
+		p.GitDirty = info.GitDirty
 	}
-
-	sort.Slice(workspaces, func(i, j int) bool {
-		return workspaces[i].Path < workspaces[j].Path
-	})
-	return workspaces
 }
 
 // gitBranch returns the current git branch by reading .git/HEAD directly,

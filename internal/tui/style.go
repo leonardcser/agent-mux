@@ -2,6 +2,14 @@ package tui
 
 import "github.com/charmbracelet/lipgloss"
 
+type iconSet struct {
+	busy      string
+	attention string
+	idle      string
+	text      lipgloss.Style
+	dim       lipgloss.Style
+}
+
 var (
 	// Tree items
 	selectedStyle = lipgloss.NewStyle().
@@ -19,24 +27,6 @@ var (
 	paneItemStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8"))
 
-	busyIconStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#D97706"))
-
-	attentionIconStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#9B9BF5"))
-
-	busyIconSelectedStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#D97706")).
-				Background(lipgloss.Color("8"))
-
-	attentionIconSelectedStyle = lipgloss.NewStyle().
-					Foreground(lipgloss.Color("#9B9BF5")).
-					Background(lipgloss.Color("8"))
-
-	idleIconSelectedStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("15")).
-				Background(lipgloss.Color("8"))
-
 	dimStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8"))
 
@@ -45,16 +35,6 @@ var (
 			Foreground(lipgloss.Color("8"))
 
 	// Stashed items
-	stashedPaneItemStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("8"))
-	stashedBusyIconStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("242"))
-	stashedAttentionIconStyle = lipgloss.NewStyle().
-					Foreground(lipgloss.Color("242"))
-	stashedIdleIconStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("242"))
-	stashedDimStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("242"))
 	stashedSectionStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("242"))
 
@@ -74,4 +54,27 @@ var (
 	// Error
 	errStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("1"))
+
+	// Icon sets for status × context
+	normalIcons = iconSet{
+		busy:      lipgloss.NewStyle().Foreground(lipgloss.Color("#D97706")).Render("●"),
+		attention: lipgloss.NewStyle().Foreground(lipgloss.Color("#9B9BF5")).Render("●"),
+		idle:      lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("○"),
+		text:      paneItemStyle,
+		dim:       dimStyle,
+	}
+	selectedIcons = iconSet{
+		busy:      lipgloss.NewStyle().Foreground(lipgloss.Color("#D97706")).Background(lipgloss.Color("8")).Render("●"),
+		attention: lipgloss.NewStyle().Foreground(lipgloss.Color("#9B9BF5")).Background(lipgloss.Color("8")).Render("●"),
+		idle:      lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8")).Render("○"),
+		text:      selectedStyle,
+		dim:       selectedStyle,
+	}
+	stashedIcons = iconSet{
+		busy:      lipgloss.NewStyle().Foreground(lipgloss.Color("242")).Render("●"),
+		attention: lipgloss.NewStyle().Foreground(lipgloss.Color("242")).Render("●"),
+		idle:      lipgloss.NewStyle().Foreground(lipgloss.Color("242")).Render("○"),
+		text:      lipgloss.NewStyle().Foreground(lipgloss.Color("8")),
+		dim:       lipgloss.NewStyle().Foreground(lipgloss.Color("242")),
+	}
 )

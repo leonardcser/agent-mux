@@ -8,25 +8,21 @@ import (
 
 type CachedPane struct {
 	Target         string `json:"target"`
+	Path           string `json:"path"`
+	ShortPath      string `json:"shortPath"`
+	GitBranch      string `json:"gitBranch,omitempty"`
+	GitDirty       bool   `json:"gitDirty,omitempty"`
 	Stashed        bool   `json:"stashed"`
 	StatusOverride *int   `json:"statusOverride,omitempty"`
 	ContentHash    uint64 `json:"contentHash,omitempty"`
 	LastStatus     *int   `json:"lastStatus,omitempty"`
-}
-
-type CachedWorkspace struct {
-	Path      string       `json:"path"`
-	ShortPath string       `json:"shortPath"`
-	GitBranch string       `json:"gitBranch"`
-	GitDirty  bool         `json:"gitDirty"`
-	Panes     []CachedPane `json:"panes"`
+	AutoAttention  bool   `json:"autoAttention,omitempty"`
 }
 
 type State struct {
-	Version      int               `json:"version"`
-	Workspaces   []CachedWorkspace `json:"workspaces"`
-	LastPosition LastPosition      `json:"lastPosition"`
-	LastUpdated  string            `json:"lastUpdated"`
+	Version      int          `json:"version"`
+	Panes        []CachedPane `json:"panes"`
+	LastPosition LastPosition `json:"lastPosition"`
 }
 
 type LastPosition struct {
@@ -53,7 +49,7 @@ func LoadState() (State, bool) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return State{}, false
 	}
-	if state.Version != 2 {
+	if state.Version != 3 {
 		return State{}, false
 	}
 
@@ -62,8 +58,7 @@ func LoadState() (State, bool) {
 
 func SaveState(state State) error {
 	path := statePath()
-	state.Version = 2
-	state.LastUpdated = ""
+	state.Version = 3
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -71,46 +66,34 @@ func SaveState(state State) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// WorkspacesFromState rebuilds Workspace structs from cached state.
-// Panes are populated with only the Target and Stashed fields.
-func WorkspacesFromState(cached []CachedWorkspace) []Workspace {
-	var workspaces []Workspace
-	for _, cw := range cached {
-		var panes []Pane
-		for _, cp := range cw.Panes {
-			panes = append(panes, Pane{
-				Target:  cp.Target,
-				Stashed: cp.Stashed,
-			})
+// PanesFromState rebuilds Pane structs from cached state.
+func PanesFromState(cached []CachedPane) []Pane {
+	panes := make([]Pane, len(cached))
+	for i, cp := range cached {
+		panes[i] = Pane{
+			Target:    cp.Target,
+			Path:      cp.Path,
+			ShortPath: cp.ShortPath,
+			GitBranch: cp.GitBranch,
+			GitDirty:  cp.GitDirty,
+			Stashed:   cp.Stashed,
 		}
-		workspaces = append(workspaces, Workspace{
-			Path:      cw.Path,
-			ShortPath: cw.ShortPath,
-			GitBranch: cw.GitBranch,
-			GitDirty:  cw.GitDirty,
-			Panes:     panes,
-		})
 	}
-	return workspaces
+	return panes
 }
 
-// CacheWorkspaces converts live Workspace structs into the cached format.
-func CacheWorkspaces(workspaces []Workspace) []CachedWorkspace {
-	var cached []CachedWorkspace
-	for _, ws := range workspaces {
-		cw := CachedWorkspace{
-			Path:      ws.Path,
-			ShortPath: ws.ShortPath,
-			GitBranch: ws.GitBranch,
-			GitDirty:  ws.GitDirty,
+// CachePanes converts live Pane structs into the cached format.
+func CachePanes(panes []*Pane) []CachedPane {
+	cached := make([]CachedPane, len(panes))
+	for i, p := range panes {
+		cached[i] = CachedPane{
+			Target:    p.Target,
+			Path:      p.Path,
+			ShortPath: p.ShortPath,
+			GitBranch: p.GitBranch,
+			GitDirty:  p.GitDirty,
+			Stashed:   p.Stashed,
 		}
-		for _, p := range ws.Panes {
-			cw.Panes = append(cw.Panes, CachedPane{
-				Target:  p.Target,
-				Stashed: p.Stashed,
-			})
-		}
-		cached = append(cached, cw)
 	}
 	return cached
 }

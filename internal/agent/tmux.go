@@ -154,29 +154,82 @@ func ListPanes() ([]Pane, error) {
 	// capture-pane, and tmux serializes these via a server lock.
 	panes := make([]Pane, len(raw))
 	for i, r := range raw {
+		hash, attention := contentHashAndAttention(r.target)
 		panes[i] = Pane{
-			Target:      r.target,
-			Session:     r.session,
-			Window:      r.window,
-			Pane:        r.pane,
-			Path:        r.path,
-			PID:         r.pid,
-			Status:      StatusIdle,
-			ContentHash: contentHash(r.target),
-			LastActive:  history[r.path],
+			Target:             r.target,
+			Session:            r.session,
+			Window:             r.window,
+			Pane:               r.pane,
+			Path:               r.path,
+			PID:                r.pid,
+			Status:             StatusIdle,
+			ContentHash:        hash,
+			HeuristicAttention: attention,
+			LastActive:         history[r.path],
 		}
 	}
 	return panes, nil
 }
 
-// contentHash captures the last 10 lines of a pane and returns their FNV hash.
-func contentHash(target string) uint64 {
+// contentHashAndAttention captures the last 10 lines of a pane and returns
+// their FNV hash and whether the content matches attention heuristics.
+func contentHashAndAttention(target string) (uint64, bool) {
 	lines := capturePaneLines(target)
 	h := fnv.New64a()
 	for _, l := range lines {
 		h.Write([]byte(l))
 	}
-	return h.Sum64()
+	return h.Sum64(), needsAttention(lines)
+}
+
+// needsAttention checks if a pane is waiting for user interaction.
+func needsAttention(lines []string) bool {
+	content := strings.Join(lines, "\n")
+	for _, pattern := range []string{
+		"Do you want to proceed?",
+		"Do you want to allow",
+		"Allow once",
+		"press Enter to approve",
+		"Enter to select",
+		"Type something",
+		"Esc to cancel",
+		"I'll wait for your",
+		"waiting for your response",
+		"Let me know when",
+		"Please let me know",
+		"What would you like",
+		"How would you like",
+		"Should I proceed",
+		"Would you like me to",
+		"please provide",
+		"please specify",
+		"I need more information",
+		"Could you clarify",
+		"awaiting your",
+		"ready when you are",
+		"let me know if you'd like",
+		"Feel free to ask",
+		"Is there anything else",
+		"What else can I help",
+		"Want me to go ahead",
+		"Shall I",
+		"Do you want me to",
+		"Ready to proceed",
+	} {
+		if strings.Contains(content, pattern) {
+			return true
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if strings.HasSuffix(line, "?") && !strings.HasPrefix(line, "❯") {
+			return true
+		}
+	}
+	return false
 }
 
 // capturePaneLines captures the last 10 visible lines of a tmux pane.
@@ -187,7 +240,6 @@ func capturePaneLines(target string) []string {
 	}
 	return strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 }
-
 
 // CapturePane captures the visible content of a tmux pane.
 func CapturePane(target string, lines int) (string, error) {

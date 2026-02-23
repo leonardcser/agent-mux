@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -60,8 +61,7 @@ type statusOverride struct {
 
 // Model is the top-level Bubble Tea model.
 type Model struct {
-	workspaces         []agent.Workspace
-	stashed            []agent.Workspace
+	panes              map[string]*agent.Pane
 	items              []TreeItem
 	cursor             int
 	scrollStart        int
@@ -82,38 +82,54 @@ type Model struct {
 	overrides          map[string]statusOverride
 	prevHashes         map[string]uint64
 	prevStatuses       map[string]agent.PaneStatus
+	autoAttention      map[string]bool
 }
 
 func NewModel(tmuxSession string) Model {
 	m := Model{
-		preview:     viewport.New(40, 20),
-		tmuxSession: tmuxSession,
-		overrides:    make(map[string]statusOverride),
-		prevHashes:   make(map[string]uint64),
-		prevStatuses: make(map[string]agent.PaneStatus),
+		preview:      viewport.New(40, 20),
+		tmuxSession:  tmuxSession,
+		panes:        make(map[string]*agent.Pane),
+		overrides:     make(map[string]statusOverride),
+		prevHashes:    make(map[string]uint64),
+		prevStatuses:  make(map[string]agent.PaneStatus),
+		autoAttention: make(map[string]bool),
 	}
 
 	state, stateOK := agent.LoadState()
 	m.state = state
 	if stateOK {
-		for _, cw := range state.Workspaces {
-			for _, cp := range cw.Panes {
-				if cp.StatusOverride != nil {
-					m.overrides[cp.Target] = statusOverride{
-						Status:      agent.PaneStatus(*cp.StatusOverride),
-						ContentHash: cp.ContentHash,
-					}
+		for _, cp := range state.Panes {
+			p := &agent.Pane{
+				Target:    cp.Target,
+				Path:      cp.Path,
+				ShortPath: cp.ShortPath,
+				Stashed:   cp.Stashed,
+			}
+			if cp.StatusOverride != nil {
+				p.Status = agent.PaneStatus(*cp.StatusOverride)
+				m.overrides[cp.Target] = statusOverride{
+					Status:      agent.PaneStatus(*cp.StatusOverride),
+					ContentHash: cp.ContentHash,
 				}
-				if cp.ContentHash != 0 {
-					m.prevHashes[cp.Target] = cp.ContentHash
+			} else if cp.LastStatus != nil {
+				s := agent.PaneStatus(*cp.LastStatus)
+				if s == agent.StatusBusy {
+					s = agent.StatusNeedsAttention
 				}
-				if cp.LastStatus != nil {
-					m.prevStatuses[cp.Target] = agent.PaneStatus(*cp.LastStatus)
-				}
+				p.Status = s
+			}
+			m.panes[cp.Target] = p
+			if cp.ContentHash != 0 {
+				m.prevHashes[cp.Target] = cp.ContentHash
+			}
+			if cp.LastStatus != nil {
+				m.prevStatuses[cp.Target] = agent.PaneStatus(*cp.LastStatus)
+			}
+			if cp.AutoAttention {
+				m.autoAttention[cp.Target] = true
 			}
 		}
-		all := agent.WorkspacesFromState(state.Workspaces)
-		m.workspaces, m.stashed = splitByStash(all)
 	} else {
 		panes, err := agent.ListPanesBasic()
 		if err != nil {
@@ -121,12 +137,15 @@ func NewModel(tmuxSession string) Model {
 			m.loaded = true
 			return m
 		}
-		m.workspaces = agent.GroupByWorkspace(panes)
+		agent.EnrichPanes(panes)
+		for i := range panes {
+			m.panes[panes[i].Target] = &panes[i]
+		}
 	}
-	m.items = FlattenTree(m.workspaces, m.stashed)
+	m.rebuildItems()
 
 	if stateOK && state.LastPosition.PaneTarget != "" {
-		if pos := FindPaneByTarget(m.items, m.workspaces, m.stashed, state.LastPosition.PaneTarget); pos >= 0 {
+		if pos := m.findPaneByTarget(state.LastPosition.PaneTarget); pos >= 0 {
 			m.cursor = pos
 			m.scrollStart = state.LastPosition.ScrollStart
 		} else {
@@ -138,77 +157,60 @@ func NewModel(tmuxSession string) Model {
 	return m
 }
 
-// splitByStash separates workspaces into working and stashed based on each pane's Stashed field.
-func splitByStash(workspaces []agent.Workspace) (working, stashed []agent.Workspace) {
-	for _, ws := range workspaces {
-		var stashedPanes, workingPanes []agent.Pane
-		for _, p := range ws.Panes {
-			if p.Stashed {
-				stashedPanes = append(stashedPanes, p)
-			} else {
-				workingPanes = append(workingPanes, p)
-			}
-		}
-		base := agent.Workspace{Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch, GitDirty: ws.GitDirty}
-		if len(stashedPanes) > 0 {
-			s := base
-			s.Panes = stashedPanes
-			stashed = append(stashed, s)
-		}
-		if len(workingPanes) > 0 {
-			w := base
-			w.Panes = workingPanes
-			working = append(working, w)
-		}
+// rebuildItems builds the flat display list from the pane map.
+// Sorts by (stashed, path, target) and inserts workspace headers.
+func (m *Model) rebuildItems() {
+	sorted := make([]*agent.Pane, 0, len(m.panes))
+	for _, p := range m.panes {
+		sorted = append(sorted, p)
 	}
-	return working, stashed
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Stashed != sorted[j].Stashed {
+			return !sorted[i].Stashed
+		}
+		if sorted[i].Path != sorted[j].Path {
+			return sorted[i].Path < sorted[j].Path
+		}
+		return sorted[i].Target < sorted[j].Target
+	})
+
+	var items []TreeItem
+	prevPath := ""
+	inStashed := false
+	for _, p := range sorted {
+		if p.Stashed && !inStashed {
+			inStashed = true
+			prevPath = ""
+			items = append(items,
+				TreeItem{Kind: KindSectionHeader},
+				TreeItem{Kind: KindSectionHeader, HeaderTitle: "stashed"},
+			)
+		}
+		if p.Path != prevPath {
+			prevPath = p.Path
+			items = append(items, TreeItem{Kind: KindWorkspace, Target: p.Target})
+		}
+		items = append(items, TreeItem{Kind: KindPane, Target: p.Target})
+	}
+	m.items = items
 }
 
-// splitByStashSet separates workspaces using an external set of stashed targets.
-func splitByStashSet(workspaces []agent.Workspace, stashSet map[string]bool) (working, stashed []agent.Workspace) {
-	for _, ws := range workspaces {
-		var stashedPanes, workingPanes []agent.Pane
-		for _, p := range ws.Panes {
-			if stashSet[p.Target] {
-				p.Stashed = true
-				stashedPanes = append(stashedPanes, p)
-			} else {
-				p.Stashed = false
-				workingPanes = append(workingPanes, p)
-			}
-		}
-		base := agent.Workspace{Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch, GitDirty: ws.GitDirty}
-		if len(stashedPanes) > 0 {
-			s := base
-			s.Panes = stashedPanes
-			stashed = append(stashed, s)
-		}
-		if len(workingPanes) > 0 {
-			w := base
-			w.Panes = workingPanes
-			working = append(working, w)
-		}
-	}
-	return working, stashed
-}
-
-// resolvePane returns the pane referenced by the tree item at the given index,
-// or nil if the index is out of bounds or not a pane item.
+// resolvePane returns the pane for the tree item at idx, or nil.
 func (m Model) resolvePane(idx int) *agent.Pane {
-	if idx < 0 || idx >= len(m.items) {
+	if idx < 0 || idx >= len(m.items) || m.items[idx].Kind != KindPane {
 		return nil
 	}
-	item := m.items[idx]
-	if item.Kind != KindPane {
-		return nil
+	return m.panes[m.items[idx].Target]
+}
+
+// findPaneByTarget returns the item index for the given target, or -1.
+func (m Model) findPaneByTarget(target string) int {
+	for i, item := range m.items {
+		if item.Kind == KindPane && item.Target == target {
+			return i
+		}
 	}
-	ws := m.workspaces
-	wsIdx := item.WorkspaceIndex
-	if wsIdx >= len(m.workspaces) {
-		ws = m.stashed
-		wsIdx -= len(m.workspaces)
-	}
-	return &ws[wsIdx].Panes[item.PaneIndex]
+	return -1
 }
 
 func (m Model) Init() tea.Cmd {
@@ -232,8 +234,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, panesTickCmd()
 		}
 		m.err = nil
+		agent.EnrichPanes(msg.panes)
+
+		// Build new pane set, preserving stashed state from existing panes.
+		alive := make(map[string]bool, len(msg.panes))
 		for i := range msg.panes {
 			p := &msg.panes[i]
+			alive[p.Target] = true
+
+			if existing, ok := m.panes[p.Target]; ok {
+				p.Stashed = existing.Stashed
+			}
+
 			if ov, ok := m.overrides[p.Target]; ok {
 				if p.ContentHash != ov.ContentHash {
 					delete(m.overrides, p.Target)
@@ -241,26 +253,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					p.Status = ov.Status
 					m.prevHashes[p.Target] = p.ContentHash
 					m.prevStatuses[p.Target] = p.Status
+					m.panes[p.Target] = p
 					continue
 				}
 			}
-			prev, seen := m.prevHashes[p.Target]
-			if seen && p.ContentHash != prev {
-				p.Status = agent.StatusBusy
-			} else if m.prevStatuses[p.Target] == agent.StatusBusy {
+			if p.HeuristicAttention {
 				p.Status = agent.StatusNeedsAttention
-			} else if m.prevStatuses[p.Target] == agent.StatusNeedsAttention {
-				p.Status = agent.StatusNeedsAttention
+				delete(m.autoAttention, p.Target)
+			} else {
+				prev, seen := m.prevHashes[p.Target]
+				if seen && p.ContentHash != prev {
+					p.Status = agent.StatusBusy
+				} else if m.prevStatuses[p.Target] == agent.StatusBusy {
+					p.Status = agent.StatusNeedsAttention
+					m.autoAttention[p.Target] = true
+				} else if m.prevStatuses[p.Target] == agent.StatusNeedsAttention {
+					p.Status = agent.StatusNeedsAttention
+				}
 			}
 			m.prevHashes[p.Target] = p.ContentHash
 			m.prevStatuses[p.Target] = p.Status
+			m.panes[p.Target] = p
 		}
-		m.workspaces = agent.GroupByWorkspace(msg.panes)
-		stashSet := m.stashSet()
-		m.workspaces, m.stashed = splitByStashSet(m.workspaces, stashSet)
-		m.items = FlattenTree(m.workspaces, m.stashed)
+
+		// Remove panes that no longer exist.
+		for target := range m.panes {
+			if !alive[target] {
+				delete(m.panes, target)
+				delete(m.overrides, target)
+				delete(m.prevHashes, target)
+				delete(m.prevStatuses, target)
+				delete(m.autoAttention, target)
+			}
+		}
+
+		m.rebuildItems()
 		if firstLoad {
-			if att := FirstAttentionPane(m.items, m.workspaces); att >= 0 {
+			if att := m.firstAttentionPane(); att >= 0 {
 				m.cursor = att
 			} else {
 				m.cursor = NearestPane(m.items, m.cursor)
@@ -367,12 +396,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if p := m.resolvePane(m.cursor); p != nil {
 			switch p.Status {
 			case agent.StatusIdle:
-				p.Status = agent.StatusBusy
-			case agent.StatusBusy:
 				p.Status = agent.StatusNeedsAttention
 			case agent.StatusNeedsAttention:
 				p.Status = agent.StatusIdle
+			default:
+				return m, nil
 			}
+			delete(m.autoAttention, p.Target)
 			m.overrides[p.Target] = statusOverride{
 				Status:      p.Status,
 				ContentHash: p.ContentHash,
@@ -381,20 +411,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "s":
-		if m.toggleStash() {
-			m.items = FlattenTree(m.workspaces, m.stashed)
-			m.cursor = NearestPane(m.items, m.cursor)
-			m.scrollStart = VisibleSlice(len(m.items), m.cursor, m.height)
+		if p := m.resolvePane(m.cursor); p != nil {
+			wasStashed := p.Stashed
+			p.Stashed = !p.Stashed
+			m.rebuildItems()
+			m.clampCursorInSection(m.cursor, wasStashed)
 		}
 		return m, nil
 
 	case "u":
 		if p := m.resolvePane(m.cursor); p != nil && p.Stashed {
-			if m.toggleStash() {
-				m.items = FlattenTree(m.workspaces, m.stashed)
-				m.cursor = NearestPane(m.items, m.cursor)
-				m.scrollStart = VisibleSlice(len(m.items), m.cursor, m.height)
-			}
+			p.Stashed = false
+			m.rebuildItems()
+			m.clampCursorInSection(m.cursor, true)
 		}
 		return m, nil
 
@@ -421,6 +450,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", "q", "esc", "ctrl+c":
 		if key == "enter" {
 			if p := m.resolvePane(m.cursor); p != nil {
+				if m.autoAttention[p.Target] {
+					p.Status = agent.StatusIdle
+					delete(m.autoAttention, p.Target)
+					delete(m.overrides, p.Target)
+					delete(m.prevStatuses, p.Target)
+					delete(m.prevHashes, p.Target)
+				}
 				_ = agent.SwitchToPane(p.Target)
 			}
 		}
@@ -430,25 +466,88 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) saveState() {
-	all := append(m.workspaces, m.stashed...)
-	m.state.Workspaces = agent.CacheWorkspaces(all)
-	for i := range m.state.Workspaces {
-		for j := range m.state.Workspaces[i].Panes {
-			cp := &m.state.Workspaces[i].Panes[j]
-			if ov, ok := m.overrides[cp.Target]; ok {
-				s := int(ov.Status)
-				cp.StatusOverride = &s
-				cp.ContentHash = ov.ContentHash
-			}
-			if h, ok := m.prevHashes[cp.Target]; ok {
-				cp.ContentHash = h
-			}
-			if s, ok := m.prevStatuses[cp.Target]; ok {
-				v := int(s)
-				cp.LastStatus = &v
-			}
+// clampCursorInSection keeps the cursor at the same index but ensures it stays
+// within the section the pane was originally in (wasStashed). Falls back to
+// other sections only if the original section has no panes left.
+func (m *Model) clampCursorInSection(idx int, wasStashed bool) {
+	// Find the bounds of the original section in the new item list.
+	sectionStart, sectionEnd := m.stashedSectionBounds()
+
+	var start, end int
+	if wasStashed {
+		start, end = sectionStart, sectionEnd
+	} else {
+		start, end = 0, sectionStart
+	}
+
+	// Section is empty, fall back to any pane.
+	if start >= end {
+		m.cursor = NearestPane(m.items, idx)
+		m.scrollStart = VisibleSlice(len(m.items), m.cursor, m.height)
+		return
+	}
+
+	// Clamp idx within section, then find nearest pane.
+	if idx >= end {
+		idx = end - 1
+	}
+	if idx < start {
+		idx = start
+	}
+
+	// Search for a pane within the section bounds.
+	for i := idx; i >= start; i-- {
+		if m.items[i].Kind == KindPane {
+			m.cursor = i
+			m.scrollStart = VisibleSlice(len(m.items), m.cursor, m.height)
+			return
 		}
+	}
+	for i := idx + 1; i < end; i++ {
+		if m.items[i].Kind == KindPane {
+			m.cursor = i
+			m.scrollStart = VisibleSlice(len(m.items), m.cursor, m.height)
+			return
+		}
+	}
+
+	// Section is empty, fall back to any pane.
+	m.cursor = NearestPane(m.items, idx)
+	m.scrollStart = VisibleSlice(len(m.items), m.cursor, m.height)
+}
+
+// stashedSectionBounds returns the start and end indices of the stashed section.
+// If there's no stashed section, returns (len(items), len(items)).
+func (m Model) stashedSectionBounds() (int, int) {
+	for i, item := range m.items {
+		if item.Kind == KindSectionHeader && item.HeaderTitle == "stashed" {
+			return i, len(m.items)
+		}
+	}
+	return len(m.items), len(m.items)
+}
+
+func (m *Model) saveState() {
+	paneList := make([]*agent.Pane, 0, len(m.panes))
+	for _, p := range m.panes {
+		paneList = append(paneList, p)
+	}
+	m.state.Panes = agent.CachePanes(paneList)
+	for i := range m.state.Panes {
+		cp := &m.state.Panes[i]
+		if ov, ok := m.overrides[cp.Target]; ok {
+			s := int(ov.Status)
+			cp.StatusOverride = &s
+			cp.ContentHash = ov.ContentHash
+		}
+		if h, ok := m.prevHashes[cp.Target]; ok {
+			cp.ContentHash = h
+		}
+		if s, ok := m.prevStatuses[cp.Target]; ok {
+			v := int(s)
+			cp.LastStatus = &v
+		}
+		cp.AutoAttention = m.autoAttention[cp.Target]
 	}
 	var paneTarget string
 	if p := m.resolvePane(m.cursor); p != nil {
@@ -462,15 +561,18 @@ func (m *Model) saveState() {
 	_ = agent.SaveState(m.state)
 }
 
-// stashSet builds a set of stashed pane targets from current model state.
-func (m Model) stashSet() map[string]bool {
-	set := make(map[string]bool)
-	for _, ws := range m.stashed {
-		for _, p := range ws.Panes {
-			set[p.Target] = true
+// firstAttentionPane returns the index of the first non-stashed pane needing attention, or -1.
+func (m Model) firstAttentionPane() int {
+	for i, item := range m.items {
+		if item.Kind != KindPane {
+			continue
+		}
+		p := m.panes[item.Target]
+		if p != nil && !p.Stashed && p.Status == agent.StatusNeedsAttention {
+			return i
 		}
 	}
-	return set
+	return -1
 }
 
 func (m Model) View() string {
@@ -511,7 +613,7 @@ func (m Model) renderHelp() string {
 		{"j/k", "move down/up"},
 		{"[n]j/k", "move down/up n times"},
 		{"enter", "switch to pane"},
-		{"space", "cycle status"},
+		{"space", "toggle attention"},
 		{"s/u", "stash/unstash"},
 		{"dd", "kill pane"},
 		{"gg", "go to first"},
@@ -551,7 +653,7 @@ func (m Model) renderTree(width, height int) []string {
 
 	lines := make([]string, 0, end-start)
 	for i := start; i < end; i++ {
-		lines = append(lines, RenderTreeItem(m.items[i], m.workspaces, m.stashed, i == m.cursor, width))
+		lines = append(lines, m.renderTreeItem(m.items[i], i == cursor, width))
 	}
 	return lines
 }
@@ -564,82 +666,6 @@ func (m Model) killCurrentPane() tea.Cmd {
 	target := p.Target
 	return func() tea.Msg {
 		return paneKilledMsg{err: agent.KillPane(target)}
-	}
-}
-
-// toggleStash moves the pane under the cursor between working and stashed lists.
-// Returns true if a pane was toggled.
-func (m *Model) toggleStash() bool {
-	p := m.resolvePane(m.cursor)
-	if p == nil {
-		return false
-	}
-	target := p.Target
-
-	if !p.Stashed {
-		m.movePaneBetween(&m.workspaces, &m.stashed, target, true)
-	} else {
-		m.movePaneBetween(&m.stashed, &m.workspaces, target, false)
-	}
-	return true
-}
-
-// movePaneBetween removes the pane with the given target from src and adds it to dst,
-// merging into an existing workspace or creating a new one.
-func (m *Model) movePaneBetween(src, dst *[]agent.Workspace, target string, stashed bool) {
-	for i := range *src {
-		for j := range (*src)[i].Panes {
-			if (*src)[i].Panes[j].Target != target {
-				continue
-			}
-			pane := (*src)[i].Panes[j]
-			pane.Stashed = stashed
-			path := (*src)[i].Path
-
-			(*src)[i].Panes = append((*src)[i].Panes[:j], (*src)[i].Panes[j+1:]...)
-
-			added := false
-			for di := range *dst {
-				if (*dst)[di].Path == path {
-					insertAt := len((*dst)[di].Panes)
-					for pi := range (*dst)[di].Panes {
-						if (*dst)[di].Panes[pi].Target > pane.Target {
-							insertAt = pi
-							break
-						}
-					}
-					(*dst)[di].Panes = append((*dst)[di].Panes, agent.Pane{})
-					copy((*dst)[di].Panes[insertAt+1:], (*dst)[di].Panes[insertAt:])
-					(*dst)[di].Panes[insertAt] = pane
-					added = true
-					break
-				}
-			}
-			if !added {
-				newWS := agent.Workspace{
-					Path:      (*src)[i].Path,
-					ShortPath: (*src)[i].ShortPath,
-					GitBranch: (*src)[i].GitBranch,
-					GitDirty:  (*src)[i].GitDirty,
-					Panes:     []agent.Pane{pane},
-				}
-				insertAt := len(*dst)
-				for di := range *dst {
-					if (*dst)[di].Path > path {
-						insertAt = di
-						break
-					}
-				}
-				*dst = append(*dst, agent.Workspace{})
-				copy((*dst)[insertAt+1:], (*dst)[insertAt:])
-				(*dst)[insertAt] = newWS
-			}
-
-			if len((*src)[i].Panes) == 0 {
-				*src = append((*src)[:i], (*src)[i+1:]...)
-			}
-			return
-		}
 	}
 }
 
