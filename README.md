@@ -42,6 +42,7 @@ bind j run-shell "tmux neww agent-mux"
 | `[count]j` / `k` | Move N sessions      |
 | `gg`             | Go to first session  |
 | `G`              | Go to last session   |
+| `space`          | Cycle status         |
 | `s` / `u`        | Stash/unstash        |
 | `enter`          | Switch to session    |
 | `dd`             | Kill session         |

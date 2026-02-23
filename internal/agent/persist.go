@@ -7,8 +7,10 @@ import (
 )
 
 type CachedPane struct {
-	Target  string `json:"target"`
-	Stashed bool   `json:"stashed"`
+	Target         string `json:"target"`
+	Stashed        bool   `json:"stashed"`
+	StatusOverride *int   `json:"statusOverride,omitempty"`
+	ContentHash    uint64 `json:"contentHash,omitempty"`
 }
 
 type CachedWorkspace struct {

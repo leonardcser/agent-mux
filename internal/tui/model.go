@@ -53,6 +53,11 @@ func loadPreview(target string, lines int, gen int) tea.Cmd {
 	}
 }
 
+type statusOverride struct {
+	Status      agent.PaneStatus
+	ContentHash uint64
+}
+
 // Model is the top-level Bubble Tea model.
 type Model struct {
 	workspaces         []agent.Workspace
@@ -74,17 +79,29 @@ type Model struct {
 	count              int
 	tmuxSession        string
 	state              agent.State
+	overrides          map[string]statusOverride
 }
 
 func NewModel(tmuxSession string) Model {
 	m := Model{
 		preview:     viewport.New(40, 20),
 		tmuxSession: tmuxSession,
+		overrides:   make(map[string]statusOverride),
 	}
 
 	state, stateOK := agent.LoadState()
 	m.state = state
 	if stateOK {
+		for _, cw := range state.Workspaces {
+			for _, cp := range cw.Panes {
+				if cp.StatusOverride != nil {
+					m.overrides[cp.Target] = statusOverride{
+						Status:      agent.PaneStatus(*cp.StatusOverride),
+						ContentHash: cp.ContentHash,
+					}
+				}
+			}
+		}
 		all := agent.WorkspacesFromState(state.Workspaces)
 		m.workspaces, m.stashed = splitByStash(all)
 	} else {
@@ -205,6 +222,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, panesTickCmd()
 		}
 		m.err = nil
+		for i := range msg.panes {
+			p := &msg.panes[i]
+			if ov, ok := m.overrides[p.Target]; ok {
+				if p.ContentHash != ov.ContentHash {
+					delete(m.overrides, p.Target)
+				} else {
+					p.Status = ov.Status
+				}
+			}
+		}
 		m.workspaces = agent.GroupByWorkspace(msg.panes)
 		stashSet := m.stashSet()
 		m.workspaces, m.stashed = splitByStashSet(m.workspaces, stashSet)
@@ -313,6 +340,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = LastPane(m.items)
 		return m, m.newPreviewCmd()
 
+	case " ":
+		if p := m.resolvePane(m.cursor); p != nil {
+			switch p.Status {
+			case agent.StatusIdle:
+				p.Status = agent.StatusBusy
+			case agent.StatusBusy:
+				p.Status = agent.StatusNeedsAttention
+			case agent.StatusNeedsAttention:
+				p.Status = agent.StatusIdle
+			}
+			m.overrides[p.Target] = statusOverride{
+				Status:      p.Status,
+				ContentHash: p.ContentHash,
+			}
+		}
+		return m, nil
+
 	case "s":
 		if m.toggleStash() {
 			m.items = FlattenTree(m.workspaces, m.stashed)
@@ -366,6 +410,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) saveState() {
 	all := append(m.workspaces, m.stashed...)
 	m.state.Workspaces = agent.CacheWorkspaces(all)
+	for i := range m.state.Workspaces {
+		for j := range m.state.Workspaces[i].Panes {
+			cp := &m.state.Workspaces[i].Panes[j]
+			if ov, ok := m.overrides[cp.Target]; ok {
+				s := int(ov.Status)
+				cp.StatusOverride = &s
+				cp.ContentHash = ov.ContentHash
+			}
+		}
+	}
 	var paneTarget string
 	if p := m.resolvePane(m.cursor); p != nil {
 		paneTarget = p.Target
@@ -427,6 +481,7 @@ func (m Model) renderHelp() string {
 		{"j/k", "move down/up"},
 		{"[n]j/k", "move down/up n times"},
 		{"enter", "switch to pane"},
+		{"space", "cycle status"},
 		{"s/u", "stash/unstash"},
 		{"dd", "kill pane"},
 		{"gg", "go to first"},

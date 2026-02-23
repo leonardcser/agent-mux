@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -154,15 +155,17 @@ func ListPanes() ([]Pane, error) {
 	// calls just contend on that lock. Sequential avoids the overhead.
 	panes := make([]Pane, len(raw))
 	for i, r := range raw {
+		status, hash := detectStatus(r.pid, r.target, r.cmd, &pt)
 		panes[i] = Pane{
-			Target:     r.target,
-			Session:    r.session,
-			Window:     r.window,
-			Pane:       r.pane,
-			Path:       r.path,
-			PID:        r.pid,
-			Status:     detectStatus(r.pid, r.target, r.cmd, &pt),
-			LastActive: history[r.path],
+			Target:      r.target,
+			Session:     r.session,
+			Window:      r.window,
+			Pane:        r.pane,
+			Path:        r.path,
+			PID:         r.pid,
+			Status:      status,
+			ContentHash: hash,
+			LastActive:  history[r.path],
 		}
 	}
 	return panes, nil
@@ -170,17 +173,23 @@ func ListPanes() ([]Pane, error) {
 
 // detectStatus determines whether a pane needs attention, is busy, or is idle.
 // Captures pane content once and reuses it for both attention and busy checks.
-func detectStatus(shellPID int, target, cmd string, pt *provider.ProcessTable) PaneStatus {
+// Returns the detected status and a content hash for change detection.
+func detectStatus(shellPID int, target, cmd string, pt *provider.ProcessTable) (PaneStatus, uint64) {
 	lines := capturePaneLines(target)
+	h := fnv.New64a()
+	for _, l := range lines {
+		h.Write([]byte(l))
+	}
+	hash := h.Sum64()
 	if needsAttention(lines) {
-		return StatusNeedsAttention
+		return StatusNeedsAttention, hash
 	}
 	if p := provider.Get(cmd); p != nil {
 		if p.IsBusy(lines, shellPID, pt) {
-			return StatusBusy
+			return StatusBusy, hash
 		}
 	}
-	return StatusIdle
+	return StatusIdle, hash
 }
 
 // capturePaneLines captures the last 10 visible lines of a tmux pane.
