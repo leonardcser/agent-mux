@@ -174,17 +174,14 @@ func FirstPane(items []TreeItem) int {
 }
 
 // FirstAttentionPane returns the index of the first pane that needs attention, or -1 if none.
-func FirstAttentionPane(items []TreeItem, workspaces []agent.Workspace, stashed []agent.Workspace) int {
+func FirstAttentionPane(items []TreeItem, workspaces []agent.Workspace) int {
 	for i, it := range items {
 		if it.Kind == KindPane {
-			ws := workspaces
-			wsIndex := it.WorkspaceIndex
-			if wsIndex >= len(workspaces) {
-				ws = stashed
-				wsIndex -= len(workspaces)
+			if it.WorkspaceIndex >= len(workspaces) {
+				break
 			}
-			p := ws[wsIndex].Panes[it.PaneIndex]
-			if p.Status == agent.StatusNeedsAttention && !p.Stashed {
+			p := workspaces[it.WorkspaceIndex].Panes[it.PaneIndex]
+			if p.Status == agent.StatusNeedsAttention {
 				return i
 			}
 		}

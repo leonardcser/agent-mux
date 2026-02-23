@@ -98,9 +98,7 @@ func NewModel(tmuxSession string) Model {
 	}
 	m.items = FlattenTree(m.workspaces, m.stashed)
 
-	if attention := FirstAttentionPane(m.items, m.workspaces, m.stashed); attention >= 0 {
-		m.cursor = attention
-	} else if stateOK && state.LastPosition.PaneTarget != "" {
+	if stateOK && state.LastPosition.PaneTarget != "" {
 		if pos := FindPaneByTarget(m.items, m.workspaces, m.stashed, state.LastPosition.PaneTarget); pos >= 0 {
 			m.cursor = pos
 			m.scrollStart = state.LastPosition.ScrollStart
@@ -200,6 +198,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case panesLoadedMsg:
+		firstLoad := !m.loaded
 		m.loaded = true
 		if msg.err != nil {
 			m.err = msg.err
@@ -210,7 +209,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		stashSet := m.stashSet()
 		m.workspaces, m.stashed = splitByStashSet(m.workspaces, stashSet)
 		m.items = FlattenTree(m.workspaces, m.stashed)
-		m.cursor = NearestPane(m.items, m.cursor)
+		if firstLoad {
+			if att := FirstAttentionPane(m.items, m.workspaces); att >= 0 {
+				m.cursor = att
+			} else {
+				m.cursor = NearestPane(m.items, m.cursor)
+			}
+		} else {
+			m.cursor = NearestPane(m.items, m.cursor)
+		}
 		return m, panesTickCmd()
 
 	case previewLoadedMsg:
