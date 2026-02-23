@@ -14,6 +14,7 @@ type ItemKind int
 const (
 	KindWorkspace ItemKind = iota
 	KindPane
+	KindSectionHeader
 )
 
 // TreeItem is one visible row in the flattened tree.
@@ -21,16 +22,34 @@ type TreeItem struct {
 	Kind           ItemKind
 	WorkspaceIndex int
 	PaneIndex      int
+	HeaderTitle    string
 }
 
 // FlattenTree builds the visible flat list from workspaces.
 // Workspaces are always expanded; headers are non-selectable.
-func FlattenTree(workspaces []agent.Workspace) []TreeItem {
+func FlattenTree(workspaces []agent.Workspace, stashed []agent.Workspace) []TreeItem {
 	var items []TreeItem
+
 	for wi, ws := range workspaces {
 		items = append(items, TreeItem{Kind: KindWorkspace, WorkspaceIndex: wi})
 		for pi := range ws.Panes {
-			items = append(items, TreeItem{Kind: KindPane, WorkspaceIndex: wi, PaneIndex: pi})
+			if !ws.Panes[pi].Stashed {
+				items = append(items, TreeItem{Kind: KindPane, WorkspaceIndex: wi, PaneIndex: pi})
+			}
+		}
+	}
+
+	if len(stashed) > 0 {
+		items = append(items, TreeItem{Kind: KindSectionHeader, HeaderTitle: ""})
+		items = append(items, TreeItem{Kind: KindSectionHeader, HeaderTitle: "stashed"})
+	}
+
+	for wi, ws := range stashed {
+		items = append(items, TreeItem{Kind: KindWorkspace, WorkspaceIndex: wi + len(workspaces)})
+		for pi := range ws.Panes {
+			if ws.Panes[pi].Stashed {
+				items = append(items, TreeItem{Kind: KindPane, WorkspaceIndex: wi + len(workspaces), PaneIndex: pi})
+			}
 		}
 	}
 	return items
@@ -105,32 +124,45 @@ func LastPane(items []TreeItem) int {
 	return 0
 }
 
-// FirstPane returns the index of the first KindPane item, or 0 if none.
+// FirstPane returns the index of the first KindPane item, or -1 if none.
 func FirstPane(items []TreeItem) int {
 	for i, it := range items {
 		if it.Kind == KindPane {
 			return i
 		}
 	}
-	return 0
+	return -1
 }
 
-// FirstAttentionPane returns the index of the first pane that needs attention,
-// falling back to FirstPane if none need attention.
-func FirstAttentionPane(items []TreeItem, workspaces []agent.Workspace) int {
+// FirstAttentionPane returns the index of the first pane that needs attention, or -1 if none.
+func FirstAttentionPane(items []TreeItem, workspaces []agent.Workspace, stashed []agent.Workspace) int {
 	for i, it := range items {
-		if it.Kind == KindPane && workspaces[it.WorkspaceIndex].Panes[it.PaneIndex].Status == agent.StatusNeedsAttention {
-			return i
+		if it.Kind == KindPane {
+			ws := workspaces
+			wsIndex := it.WorkspaceIndex
+			if wsIndex >= len(workspaces) {
+				ws = stashed
+				wsIndex -= len(workspaces)
+			}
+			if ws[wsIndex].Panes[it.PaneIndex].Status == agent.StatusNeedsAttention {
+				return i
+			}
 		}
 	}
-	return FirstPane(items)
+	return -1
 }
 
 // FindPaneByTarget returns the index of the pane with the given target.
-func FindPaneByTarget(items []TreeItem, workspaces []agent.Workspace, target string) int {
+func FindPaneByTarget(items []TreeItem, workspaces []agent.Workspace, stashed []agent.Workspace, target string) int {
 	for i, item := range items {
 		if item.Kind == KindPane {
-			pane := workspaces[item.WorkspaceIndex].Panes[item.PaneIndex]
+			ws := workspaces
+			wsIndex := item.WorkspaceIndex
+			if wsIndex >= len(workspaces) {
+				ws = stashed
+				wsIndex -= len(workspaces)
+			}
+			pane := ws[wsIndex].Panes[item.PaneIndex]
 			if pane.Target == target {
 				return i
 			}
@@ -140,10 +172,25 @@ func FindPaneByTarget(items []TreeItem, workspaces []agent.Workspace, target str
 }
 
 // RenderTreeItem renders a single row.
-func RenderTreeItem(item TreeItem, workspaces []agent.Workspace, selected bool, width int) string {
+func RenderTreeItem(item TreeItem, workspaces []agent.Workspace, stashed []agent.Workspace, selected bool, width int) string {
+	if item.Kind == KindSectionHeader {
+		if item.HeaderTitle == "" {
+			return ""
+		}
+		label := " " + item.HeaderTitle + " "
+		lineLen := max(width-len(label)-1, 0)
+		return stashedSectionStyle.Render("─" + label + strings.Repeat("─", lineLen))
+	}
+
+	var ws agent.Workspace
+	if item.WorkspaceIndex < len(workspaces) {
+		ws = workspaces[item.WorkspaceIndex]
+	} else {
+		ws = stashed[item.WorkspaceIndex-len(workspaces)]
+	}
+
 	switch item.Kind {
 	case KindWorkspace:
-		ws := workspaces[item.WorkspaceIndex]
 		avail := width - 2 // 1 leading space + 1 trailing minimum
 		name := ws.ShortPath
 		branch := ws.GitBranch
@@ -178,7 +225,7 @@ func RenderTreeItem(item TreeItem, workspaces []agent.Workspace, selected bool, 
 		return workspaceStyle.Render(text)
 
 	case KindPane:
-		p := workspaces[item.WorkspaceIndex].Panes[item.PaneIndex]
+		p := ws.Panes[item.PaneIndex]
 		label := fmt.Sprintf("%s:%s", p.Session, p.Window)
 		elapsed := formatElapsed(time.Since(p.LastActive))
 
@@ -191,26 +238,40 @@ func RenderTreeItem(item TreeItem, workspaces []agent.Workspace, selected bool, 
 		}
 		gap := max(avail-len(middle), 0)
 
-		if selected {
-			var icon string
-			switch p.Status {
-			case agent.StatusBusy:
-				icon = busyIconSelectedStyle.Render("●")
-			case agent.StatusNeedsAttention:
-				icon = attentionIconSelectedStyle.Render("●")
-			default:
-				icon = idleIconSelectedStyle.Render("○")
-			}
-			return selectedStyle.Render(prefix) + icon + selectedStyle.Render(" "+middle+strings.Repeat(" ", gap)+right)
-		}
 		var icon string
 		switch p.Status {
 		case agent.StatusBusy:
-			icon = busyIconStyle.Render("●")
+			if selected {
+				icon = busyIconSelectedStyle.Render("●")
+			} else if p.Stashed {
+				icon = stashedBusyIconStyle.Render("●")
+			} else {
+				icon = busyIconStyle.Render("●")
+			}
 		case agent.StatusNeedsAttention:
-			icon = attentionIconStyle.Render("●")
+			if selected {
+				icon = attentionIconSelectedStyle.Render("●")
+			} else if p.Stashed {
+				icon = stashedAttentionIconStyle.Render("●")
+			} else {
+				icon = attentionIconStyle.Render("●")
+			}
 		default:
-			icon = paneItemStyle.Render("○")
+			if selected {
+				icon = idleIconSelectedStyle.Render("○")
+			} else if p.Stashed {
+				icon = stashedIdleIconStyle.Render("○")
+			} else {
+				icon = stashedPaneItemStyle.Render("○")
+			}
+		}
+
+		if selected {
+			return selectedStyle.Render(prefix) + icon + selectedStyle.Render(" "+middle+strings.Repeat(" ", gap)+right)
+		}
+
+		if p.Stashed {
+			return stashedPaneItemStyle.Render(prefix) + icon + stashedPaneItemStyle.Render(" "+middle) + stashedDimStyle.Render(strings.Repeat(" ", gap)+right)
 		}
 		return paneItemStyle.Render(prefix) + icon + paneItemStyle.Render(" "+middle) + dimStyle.Render(strings.Repeat(" ", gap)+right)
 	}

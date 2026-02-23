@@ -27,6 +27,7 @@ type Pane struct {
 	PID        int
 	Status     PaneStatus
 	LastActive time.Time
+	Stashed    bool
 }
 
 // Workspace groups panes by working directory.

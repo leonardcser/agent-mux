@@ -44,6 +44,20 @@ var (
 	separatorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8"))
 
+	// Stashed items
+	stashedPaneItemStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("8"))
+	stashedBusyIconStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("242"))
+	stashedAttentionIconStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("242"))
+	stashedIdleIconStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("242"))
+	stashedDimStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("242"))
+	stashedSectionStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("242"))
+
 	// Help / status
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8"))
