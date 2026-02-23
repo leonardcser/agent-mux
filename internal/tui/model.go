@@ -430,7 +430,16 @@ func (m *Model) movePaneBetween(src, dst *[]agent.Workspace, target string, stas
 			added := false
 			for di := range *dst {
 				if (*dst)[di].Path == path {
-					(*dst)[di].Panes = append((*dst)[di].Panes, pane)
+					insertAt := len((*dst)[di].Panes)
+					for pi := range (*dst)[di].Panes {
+						if (*dst)[di].Panes[pi].Target > pane.Target {
+							insertAt = pi
+							break
+						}
+					}
+					(*dst)[di].Panes = append((*dst)[di].Panes, agent.Pane{})
+					copy((*dst)[di].Panes[insertAt+1:], (*dst)[di].Panes[insertAt:])
+					(*dst)[di].Panes[insertAt] = pane
 					added = true
 					break
 				}

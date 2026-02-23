@@ -89,9 +89,9 @@ func PrevPane(items []TreeItem, from int) int {
 	return from
 }
 
-// NearestPane returns the closest KindPane to the given index.
+// NearestPane returns the closest KindPane to the given index without wrapping.
 // It clamps out-of-bounds indices, keeps the position if it's already a pane,
-// otherwise tries the previous pane first (like Neovim dd), then next.
+// otherwise tries the next pane forward first, then previous.
 func NearestPane(items []TreeItem, from int) int {
 	if len(items) == 0 {
 		return 0
@@ -105,11 +105,15 @@ func NearestPane(items []TreeItem, from int) int {
 	if items[from].Kind == KindPane {
 		return from
 	}
-	if prev := PrevPane(items, from); prev != from {
-		return prev
+	for i := from + 1; i < len(items); i++ {
+		if items[i].Kind == KindPane {
+			return i
+		}
 	}
-	if next := NextPane(items, from); next != from {
-		return next
+	for i := from - 1; i >= 0; i-- {
+		if items[i].Kind == KindPane {
+			return i
+		}
 	}
 	return 0
 }
