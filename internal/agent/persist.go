@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type CachedPane struct {
@@ -14,9 +15,10 @@ type CachedPane struct {
 	GitDirty       bool   `json:"gitDirty,omitempty"`
 	Stashed        bool   `json:"stashed"`
 	StatusOverride *int   `json:"statusOverride,omitempty"`
-	ContentHash    uint64 `json:"contentHash,omitempty"`
-	LastStatus     *int   `json:"lastStatus,omitempty"`
-	AutoAttention  bool   `json:"autoAttention,omitempty"`
+	ContentHash    uint64     `json:"contentHash,omitempty"`
+	LastStatus     *int      `json:"lastStatus,omitempty"`
+	LastActive     *time.Time `json:"lastActive,omitempty"`
+	AutoAttention  bool      `json:"autoAttention,omitempty"`
 }
 
 type State struct {
@@ -86,7 +88,7 @@ func PanesFromState(cached []CachedPane) []Pane {
 func CachePanes(panes []*Pane) []CachedPane {
 	cached := make([]CachedPane, len(panes))
 	for i, p := range panes {
-		cached[i] = CachedPane{
+		cp := CachedPane{
 			Target:    p.Target,
 			Path:      p.Path,
 			ShortPath: p.ShortPath,
@@ -94,6 +96,11 @@ func CachePanes(panes []*Pane) []CachedPane {
 			GitDirty:  p.GitDirty,
 			Stashed:   p.Stashed,
 		}
+		if !p.LastActive.IsZero() {
+			t := p.LastActive
+			cp.LastActive = &t
+		}
+		cached[i] = cp
 	}
 	return cached
 }

@@ -73,6 +73,7 @@ type Model struct {
 	height             int
 	err                error
 	loaded             bool
+	firstRefreshDone   bool
 	showHelp           bool
 	pendingD           bool
 	pendingG           bool
@@ -100,11 +101,20 @@ func NewModel(tmuxSession string) Model {
 	m.state = state
 	if stateOK {
 		for _, cp := range state.Panes {
+			session, window, pane := agent.ParseTarget(cp.Target)
 			p := &agent.Pane{
 				Target:    cp.Target,
+				Session:   session,
+				Window:    window,
+				Pane:      pane,
 				Path:      cp.Path,
 				ShortPath: cp.ShortPath,
+				GitBranch: cp.GitBranch,
+				GitDirty:  cp.GitDirty,
 				Stashed:   cp.Stashed,
+			}
+			if cp.LastActive != nil {
+				p.LastActive = *cp.LastActive
 			}
 			if cp.StatusOverride != nil {
 				p.Status = agent.PaneStatus(*cp.StatusOverride)
@@ -130,6 +140,7 @@ func NewModel(tmuxSession string) Model {
 				m.autoAttention[cp.Target] = true
 			}
 		}
+		m.loaded = true
 	} else {
 		panes, err := agent.ListPanesBasic()
 		if err != nil {
@@ -141,6 +152,7 @@ func NewModel(tmuxSession string) Model {
 		for i := range panes {
 			m.panes[panes[i].Target] = &panes[i]
 		}
+		m.loaded = true
 	}
 	m.rebuildItems()
 
@@ -227,7 +239,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case panesLoadedMsg:
-		firstLoad := !m.loaded
+		firstLoad := !m.firstRefreshDone
+		m.firstRefreshDone = true
 		m.loaded = true
 		if msg.err != nil {
 			m.err = msg.err

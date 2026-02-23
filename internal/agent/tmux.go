@@ -31,7 +31,7 @@ func parseTmuxPanes(out []byte) []rawPane {
 		}
 		target, cmd, path, pidStr := fields[0], fields[1], fields[2], fields[3]
 		pid, _ := strconv.Atoi(pidStr)
-		session, window, pane := parseTarget(target)
+		session, window, pane := ParseTarget(target)
 		raw = append(raw, rawPane{target, session, window, pane, path, cmd, pid})
 	}
 	return raw
@@ -257,7 +257,7 @@ func CapturePane(target string, lines int) (string, error) {
 
 // SwitchToPane switches the tmux client to the given pane.
 func SwitchToPane(target string) error {
-	session, window, _ := parseTarget(target)
+	session, window, _ := ParseTarget(target)
 	sessionWindow := session + ":" + window
 	if err := exec.Command("tmux", "switch-client", "-t", sessionWindow).Run(); err != nil {
 		return fmt.Errorf("switch-client: %w", err)
@@ -270,7 +270,7 @@ func SwitchToPane(target string) error {
 
 // KillPane kills a tmux pane. If it's the only pane in the window, kills the window instead.
 func KillPane(target string) error {
-	session, window, _ := parseTarget(target)
+	session, window, _ := ParseTarget(target)
 	sessionWindow := session + ":" + window
 
 	out, err := exec.Command("tmux", "list-panes", "-t", sessionWindow).Output()
@@ -286,7 +286,7 @@ func KillPane(target string) error {
 }
 
 // parseTarget splits "foo:2.1" into session="foo", window="2", pane="1".
-func parseTarget(s string) (session, window, pane string) {
+func ParseTarget(s string) (session, window, pane string) {
 	colonIdx := strings.LastIndex(s, ":")
 	if colonIdx < 0 {
 		return s, "", ""

@@ -213,10 +213,12 @@ func renderWorkspaceHeader(p *agent.Pane, width int) string {
 
 func renderPaneRow(p *agent.Pane, selected bool, width int) string {
 	label := fmt.Sprintf("%s:%s", p.Session, p.Window)
-	elapsed := formatElapsed(time.Since(p.LastActive))
 
 	prefix := "   "
-	right := " " + elapsed + " "
+	right := ""
+	if !p.LastActive.IsZero() {
+		right = " " + formatElapsed(time.Since(p.LastActive)) + " "
+	}
 	middle := label
 	avail := width - len(prefix) - 2 - len(right)
 	if len(middle) > avail {
