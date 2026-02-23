@@ -16,9 +16,9 @@ type panesLoadedMsg struct {
 }
 
 type previewLoadedMsg struct {
-	target string
+	target  string
 	content string
-	gen    int
+	gen     int
 }
 
 type paneKilledMsg struct{ err error }
@@ -185,6 +185,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.workspaces = agent.GroupByWorkspace(msg.panes)
 		m.workspaces, m.stashed = splitByStashState(m.workspaces, m.state.StashState)
 		m.items = FlattenTree(m.workspaces, m.stashed)
+		m.cursor = NearestPane(m.items, m.cursor)
 		return m, panesTickCmd()
 
 	case previewLoadedMsg:

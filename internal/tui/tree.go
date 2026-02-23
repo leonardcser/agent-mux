@@ -90,8 +90,8 @@ func PrevPane(items []TreeItem, from int) int {
 }
 
 // NearestPane returns the closest KindPane to the given index without wrapping.
-// It clamps out-of-bounds indices, keeps the position if it's already a pane,
-// otherwise tries the next pane forward first, then previous.
+// It prefers panes within the same section (working or stashed), falling back
+// to panes in the other section if none are found.
 func NearestPane(items []TreeItem, from int) int {
 	if len(items) == 0 {
 		return 0
@@ -105,6 +105,20 @@ func NearestPane(items []TreeItem, from int) int {
 	if items[from].Kind == KindPane {
 		return from
 	}
+
+	sectionStart, sectionEnd := sectionBounds(items, from)
+
+	for i := from + 1; i < sectionEnd; i++ {
+		if items[i].Kind == KindPane {
+			return i
+		}
+	}
+	for i := from - 1; i >= sectionStart; i-- {
+		if items[i].Kind == KindPane {
+			return i
+		}
+	}
+
 	for i := from + 1; i < len(items); i++ {
 		if items[i].Kind == KindPane {
 			return i
@@ -116,6 +130,27 @@ func NearestPane(items []TreeItem, from int) int {
 		}
 	}
 	return 0
+}
+
+// sectionBounds returns the start (inclusive) and end (exclusive) indices of
+// the section containing the given index. Sections are separated by
+// KindSectionHeader items with a non-empty HeaderTitle.
+func sectionBounds(items []TreeItem, idx int) (int, int) {
+	start := 0
+	for i := idx - 1; i >= 0; i-- {
+		if items[i].Kind == KindSectionHeader && items[i].HeaderTitle != "" {
+			start = i
+			break
+		}
+	}
+	end := len(items)
+	for i := idx + 1; i < len(items); i++ {
+		if items[i].Kind == KindSectionHeader && items[i].HeaderTitle != "" {
+			end = i
+			break
+		}
+	}
+	return start, end
 }
 
 // LastPane returns the index of the last KindPane item, or 0 if none.
