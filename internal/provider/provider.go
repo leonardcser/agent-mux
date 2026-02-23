@@ -12,70 +12,39 @@ type ProcessTable struct {
 	Args     map[int]string // pid -> full command line args
 }
 
-// HasGrandchild returns true if any grandchild of pid matches the given command name.
-func (pt *ProcessTable) HasGrandchild(pid int, name string) bool {
-	for _, childPID := range pt.Children[pid] {
-		for _, grandchildPID := range pt.Children[childPID] {
-			comm := pt.Comm[grandchildPID]
-			if comm == name || strings.HasSuffix(comm, "/"+name) {
-				return true
-			}
-		}
-	}
-	return false
-}
+var registry = map[string]bool{}
 
-// Provider defines how to detect an AI coding agent in tmux.
-type Provider interface {
-	// Command returns the binary name that appears as tmux pane_current_command.
-	Command() string
-	// IsBusy reports whether the agent is actively working.
-	IsBusy(lines []string, shellPID int, pt *ProcessTable) bool
-}
-
-var registry = map[string]Provider{}
-
-// Register adds a provider to the global registry.
-func Register(p Provider) {
-	registry[p.Command()] = p
-}
-
-// Get returns the provider for the given command, or nil.
-func Get(cmd string) Provider {
-	return registry[cmd]
+// Register adds an agent command name to the global registry.
+func Register(cmd string) {
+	registry[cmd] = true
 }
 
 // IsAgent returns true if the command matches a registered provider.
 func IsAgent(cmd string) bool {
-	_, ok := registry[cmd]
-	return ok
+	return registry[cmd]
 }
 
 // Resolve returns the provider command name for a tmux pane. It first checks
 // the direct command, then falls back to inspecting children of the shell
 // process via the process table (handles cases like gemini running as "node").
 func Resolve(cmd string, shellPID int, pt *ProcessTable) string {
-	if _, ok := registry[cmd]; ok {
+	if registry[cmd] {
 		return cmd
 	}
-	// Check if any child of the shell is running a registered agent.
-	// First check comm, then check args for script-based tools (e.g.
-	// gemini runs as "node /opt/homebrew/bin/gemini").
 	for _, childPID := range pt.Children[shellPID] {
 		comm := pt.Comm[childPID]
 		base := comm
 		if idx := strings.LastIndex(comm, "/"); idx >= 0 {
 			base = comm[idx+1:]
 		}
-		if _, ok := registry[base]; ok {
+		if registry[base] {
 			return base
 		}
-		// Check each arg token for a registered command basename.
 		for arg := range strings.SplitSeq(pt.Args[childPID], " ") {
 			if idx := strings.LastIndex(arg, "/"); idx >= 0 {
 				arg = arg[idx+1:]
 			}
-			if _, ok := registry[arg]; ok {
+			if registry[arg] {
 				return arg
 			}
 		}

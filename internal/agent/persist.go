@@ -11,6 +11,7 @@ type CachedPane struct {
 	Stashed        bool   `json:"stashed"`
 	StatusOverride *int   `json:"statusOverride,omitempty"`
 	ContentHash    uint64 `json:"contentHash,omitempty"`
+	LastStatus     *int   `json:"lastStatus,omitempty"`
 }
 
 type CachedWorkspace struct {

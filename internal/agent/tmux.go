@@ -150,12 +150,10 @@ func ListPanes() ([]Pane, error) {
 
 	raw := resolveAgentPanes(parseTmuxPanes(tmuxOut), &pt)
 
-	// Detect status sequentially. capturePaneLines calls tmux capture-pane,
-	// and tmux serializes these internally via a server lock — concurrent
-	// calls just contend on that lock. Sequential avoids the overhead.
+	// Capture content hashes sequentially. capturePaneLines calls tmux
+	// capture-pane, and tmux serializes these via a server lock.
 	panes := make([]Pane, len(raw))
 	for i, r := range raw {
-		status, hash := detectStatus(r.pid, r.target, r.cmd, &pt)
 		panes[i] = Pane{
 			Target:      r.target,
 			Session:     r.session,
@@ -163,33 +161,22 @@ func ListPanes() ([]Pane, error) {
 			Pane:        r.pane,
 			Path:        r.path,
 			PID:         r.pid,
-			Status:      status,
-			ContentHash: hash,
+			Status:      StatusIdle,
+			ContentHash: contentHash(r.target),
 			LastActive:  history[r.path],
 		}
 	}
 	return panes, nil
 }
 
-// detectStatus determines whether a pane needs attention, is busy, or is idle.
-// Captures pane content once and reuses it for both attention and busy checks.
-// Returns the detected status and a content hash for change detection.
-func detectStatus(shellPID int, target, cmd string, pt *provider.ProcessTable) (PaneStatus, uint64) {
+// contentHash captures the last 10 lines of a pane and returns their FNV hash.
+func contentHash(target string) uint64 {
 	lines := capturePaneLines(target)
 	h := fnv.New64a()
 	for _, l := range lines {
 		h.Write([]byte(l))
 	}
-	hash := h.Sum64()
-	if needsAttention(lines) {
-		return StatusNeedsAttention, hash
-	}
-	if p := provider.Get(cmd); p != nil {
-		if p.IsBusy(lines, shellPID, pt) {
-			return StatusBusy, hash
-		}
-	}
-	return StatusIdle, hash
+	return h.Sum64()
 }
 
 // capturePaneLines captures the last 10 visible lines of a tmux pane.
@@ -201,59 +188,6 @@ func capturePaneLines(target string) []string {
 	return strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 }
 
-// needsAttention checks if a pane is waiting for user interaction.
-func needsAttention(lines []string) bool {
-	content := strings.Join(lines, "\n")
-	for _, pattern := range []string{
-		// Tool permission prompts
-		"Do you want to proceed?",
-		"Do you want to allow",
-		"Allow once",
-		"press Enter to approve",
-		// Question / selection prompts
-		"Enter to select",
-		"Type something",
-		"Esc to cancel",
-		// Waiting for user response
-		"I'll wait for your",
-		"waiting for your response",
-		"Let me know when",
-		"Please let me know",
-		"What would you like",
-		"How would you like",
-		"Should I proceed",
-		"Would you like me to",
-		"please provide",
-		"please specify",
-		"I need more information",
-		"Could you clarify",
-		"awaiting your",
-		"ready when you are",
-		"let me know if you'd like",
-		"Feel free to ask",
-		"Is there anything else",
-		"What else can I help",
-		"Want me to go ahead",
-		"Shall I",
-		"Do you want me to",
-		"Ready to proceed",
-	} {
-		if strings.Contains(content, pattern) {
-			return true
-		}
-	}
-	// Check if any of the last non-empty lines ends with a question mark.
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
-		}
-		if strings.HasSuffix(line, "?") && !strings.HasPrefix(line, "❯") {
-			return true
-		}
-	}
-	return false
-}
 
 // CapturePane captures the visible content of a tmux pane.
 func CapturePane(target string, lines int) (string, error) {

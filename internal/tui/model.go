@@ -80,13 +80,17 @@ type Model struct {
 	tmuxSession        string
 	state              agent.State
 	overrides          map[string]statusOverride
+	prevHashes         map[string]uint64
+	prevStatuses       map[string]agent.PaneStatus
 }
 
 func NewModel(tmuxSession string) Model {
 	m := Model{
 		preview:     viewport.New(40, 20),
 		tmuxSession: tmuxSession,
-		overrides:   make(map[string]statusOverride),
+		overrides:    make(map[string]statusOverride),
+		prevHashes:   make(map[string]uint64),
+		prevStatuses: make(map[string]agent.PaneStatus),
 	}
 
 	state, stateOK := agent.LoadState()
@@ -99,6 +103,12 @@ func NewModel(tmuxSession string) Model {
 						Status:      agent.PaneStatus(*cp.StatusOverride),
 						ContentHash: cp.ContentHash,
 					}
+				}
+				if cp.ContentHash != 0 {
+					m.prevHashes[cp.Target] = cp.ContentHash
+				}
+				if cp.LastStatus != nil {
+					m.prevStatuses[cp.Target] = agent.PaneStatus(*cp.LastStatus)
 				}
 			}
 		}
@@ -229,8 +239,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					delete(m.overrides, p.Target)
 				} else {
 					p.Status = ov.Status
+					m.prevHashes[p.Target] = p.ContentHash
+					m.prevStatuses[p.Target] = p.Status
+					continue
 				}
 			}
+			prev, seen := m.prevHashes[p.Target]
+			if seen && p.ContentHash != prev {
+				p.Status = agent.StatusBusy
+			} else if m.prevStatuses[p.Target] == agent.StatusBusy {
+				p.Status = agent.StatusNeedsAttention
+			} else if m.prevStatuses[p.Target] == agent.StatusNeedsAttention {
+				p.Status = agent.StatusNeedsAttention
+			}
+			m.prevHashes[p.Target] = p.ContentHash
+			m.prevStatuses[p.Target] = p.Status
 		}
 		m.workspaces = agent.GroupByWorkspace(msg.panes)
 		stashSet := m.stashSet()
@@ -417,6 +440,13 @@ func (m *Model) saveState() {
 				s := int(ov.Status)
 				cp.StatusOverride = &s
 				cp.ContentHash = ov.ContentHash
+			}
+			if h, ok := m.prevHashes[cp.Target]; ok {
+				cp.ContentHash = h
+			}
+			if s, ok := m.prevStatuses[cp.Target]; ok {
+				v := int(s)
+				cp.LastStatus = &v
 			}
 		}
 	}
