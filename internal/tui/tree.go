@@ -183,7 +183,8 @@ func FirstAttentionPane(items []TreeItem, workspaces []agent.Workspace, stashed 
 				ws = stashed
 				wsIndex -= len(workspaces)
 			}
-			if ws[wsIndex].Panes[it.PaneIndex].Status == agent.StatusNeedsAttention {
+			p := ws[wsIndex].Panes[it.PaneIndex]
+			if p.Status == agent.StatusNeedsAttention && !p.Stashed {
 				return i
 			}
 		}
