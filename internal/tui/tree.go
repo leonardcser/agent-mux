@@ -36,21 +36,35 @@ func FlattenTree(workspaces []agent.Workspace) []TreeItem {
 	return items
 }
 
-// NextPane returns the index of the next KindPane item after from, or from if none.
+// NextPane returns the index of the next KindPane item after from, wrapping around if none.
 func NextPane(items []TreeItem, from int) int {
 	for i := from + 1; i < len(items); i++ {
 		if items[i].Kind == KindPane {
 			return i
 		}
 	}
+	if len(items) > 0 {
+		for i := range from {
+			if items[i].Kind == KindPane {
+				return i
+			}
+		}
+	}
 	return from
 }
 
-// PrevPane returns the index of the previous KindPane item before from, or from if none.
+// PrevPane returns the index of the previous KindPane item before from, wrapping around if none.
 func PrevPane(items []TreeItem, from int) int {
 	for i := from - 1; i >= 0; i-- {
 		if items[i].Kind == KindPane {
 			return i
+		}
+	}
+	if len(items) > 0 {
+		for i := len(items) - 1; i > from; i-- {
+			if items[i].Kind == KindPane {
+				return i
+			}
 		}
 	}
 	return from
