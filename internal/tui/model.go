@@ -41,9 +41,9 @@ func loadPanes() tea.Msg {
 	return panesLoadedMsg{panes: panes, err: err}
 }
 
-func loadPreview(target string) tea.Cmd {
+func loadPreview(target string, lines int) tea.Cmd {
 	return func() tea.Msg {
-		content, err := agent.CapturePane(target, 50)
+		content, err := agent.CapturePane(target, lines)
 		if err != nil {
 			content = "error: " + err.Error()
 		}
@@ -470,5 +470,9 @@ func (m Model) previewCmd() tea.Cmd {
 	if p.Target == m.previewFor {
 		return nil
 	}
-	return loadPreview(p.Target)
+	lines := m.height
+	if lines <= 0 {
+		lines = 50
+	}
+	return loadPreview(p.Target, lines)
 }

@@ -185,15 +185,11 @@ func detectStatus(shellPID int, target, cmd string, pt *provider.ProcessTable) P
 
 // capturePaneLines captures the last 10 visible lines of a tmux pane.
 func capturePaneLines(target string) []string {
-	out, err := exec.Command("tmux", "capture-pane", "-t", target, "-p").Output()
+	out, err := exec.Command("tmux", "capture-pane", "-t", target, "-p", "-S", "-10").Output()
 	if err != nil {
 		return nil
 	}
-	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	if len(lines) > 10 {
-		lines = lines[len(lines)-10:]
-	}
-	return lines
+	return strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 }
 
 // needsAttention checks if a pane is waiting for user interaction.
