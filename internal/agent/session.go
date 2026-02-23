@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -44,28 +45,37 @@ func EnrichPanes(panes []Pane) {
 		GitBranch string
 		GitDirty  bool
 	}
-	cache := make(map[string]wsInfo)
+
+	unique := make(map[string]*wsInfo)
 	for i := range panes {
-		p := &panes[i]
-		info, ok := cache[p.Path]
-		if !ok {
-			short := filepath.Base(p.Path)
+		if _, ok := unique[panes[i].Path]; !ok {
+			short := filepath.Base(panes[i].Path)
 			if short == "." || short == "/" {
-				short = p.Path
+				short = panes[i].Path
 				if home != "" && strings.HasPrefix(short, home) {
 					short = "~" + strings.TrimPrefix(short, home)
 				}
 			}
-			info = wsInfo{
-				ShortPath: short,
-				GitBranch: gitBranch(p.Path),
-				GitDirty:  gitDirty(p.Path),
-			}
-			cache[p.Path] = info
+			unique[panes[i].Path] = &wsInfo{ShortPath: short}
 		}
-		p.ShortPath = info.ShortPath
-		p.GitBranch = info.GitBranch
-		p.GitDirty = info.GitDirty
+	}
+
+	var wg sync.WaitGroup
+	for path, info := range unique {
+		wg.Add(1)
+		go func(path string, info *wsInfo) {
+			defer wg.Done()
+			info.GitBranch = gitBranch(path)
+			info.GitDirty = gitDirty(path)
+		}(path, info)
+	}
+	wg.Wait()
+
+	for i := range panes {
+		info := unique[panes[i].Path]
+		panes[i].ShortPath = info.ShortPath
+		panes[i].GitBranch = info.GitBranch
+		panes[i].GitDirty = info.GitDirty
 	}
 }
 

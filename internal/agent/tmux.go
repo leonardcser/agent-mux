@@ -150,24 +150,28 @@ func ListPanes() ([]Pane, error) {
 
 	raw := resolveAgentPanes(parseTmuxPanes(tmuxOut), &pt)
 
-	// Capture content hashes sequentially. capturePaneLines calls tmux
-	// capture-pane, and tmux serializes these via a server lock.
 	panes := make([]Pane, len(raw))
+	var hashWg sync.WaitGroup
 	for i, r := range raw {
-		hash, attention := contentHashAndAttention(r.target)
 		panes[i] = Pane{
-			Target:             r.target,
-			Session:            r.session,
-			Window:             r.window,
-			Pane:               r.pane,
-			Path:               r.path,
-			PID:                r.pid,
-			Status:             StatusIdle,
-			ContentHash:        hash,
-			HeuristicAttention: attention,
-			LastActive:         history[r.path],
+			Target:     r.target,
+			Session:    r.session,
+			Window:     r.window,
+			Pane:       r.pane,
+			Path:       r.path,
+			PID:        r.pid,
+			Status:     StatusIdle,
+			LastActive: history[r.path],
 		}
+		hashWg.Add(1)
+		go func(idx int, target string) {
+			defer hashWg.Done()
+			h, att := contentHashAndAttention(target)
+			panes[idx].ContentHash = h
+			panes[idx].HeuristicAttention = att
+		}(i, r.target)
 	}
+	hashWg.Wait()
 	return panes, nil
 }
 

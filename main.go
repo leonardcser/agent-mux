@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/leo/agent-mux/internal/agent"
 	_ "github.com/leo/agent-mux/internal/provider" // register all providers
 	"github.com/leo/agent-mux/internal/tui"
 )
@@ -16,6 +19,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if slices.Contains(os.Args[1:], "--bench") || slices.Contains(os.Args[1:], "--bench-cold") {
+		runBench(slices.Contains(os.Args[1:], "--bench-cold"))
+		return
+	}
+
 	tmux := os.Getenv("TMUX")
 	sessionID := filepath.Base(tmux)
 
@@ -24,4 +32,28 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func runBench(cold bool) {
+	start := time.Now()
+
+	if !cold {
+		t0 := time.Now()
+		_, ok := agent.LoadState()
+		fmt.Fprintf(os.Stderr, "LoadState:      %v (hit=%v)\n", time.Since(t0), ok)
+	}
+
+	t1 := time.Now()
+	panes, err := agent.ListPanesBasic()
+	fmt.Fprintf(os.Stderr, "ListPanesBasic: %v (panes=%d, err=%v)\n", time.Since(t1), len(panes), err)
+
+	t2 := time.Now()
+	agent.EnrichPanes(panes)
+	fmt.Fprintf(os.Stderr, "EnrichPanes:    %v\n", time.Since(t2))
+
+	t3 := time.Now()
+	full, err := agent.ListPanes()
+	fmt.Fprintf(os.Stderr, "ListPanes:      %v (panes=%d, err=%v)\n", time.Since(t3), len(full), err)
+
+	fmt.Fprintf(os.Stderr, "Total:          %v\n", time.Since(start))
 }
