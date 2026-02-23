@@ -16,17 +16,19 @@ type panesLoadedMsg struct {
 }
 
 type previewLoadedMsg struct {
-	target  string
+	target string
 	content string
+	gen    int
 }
 
 type paneKilledMsg struct{ err error }
-type previewTickMsg time.Time
+type previewTickMsg struct{ gen int }
+type previewDebounceMsg struct{ gen int }
 type panesTickMsg time.Time
 
-func previewTickCmd() tea.Cmd {
+func previewTickCmd(gen int) tea.Cmd {
 	return tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg {
-		return previewTickMsg(t)
+		return previewTickMsg{gen: gen}
 	})
 }
 
@@ -41,13 +43,13 @@ func loadPanes() tea.Msg {
 	return panesLoadedMsg{panes: panes, err: err}
 }
 
-func loadPreview(target string, lines int) tea.Cmd {
+func loadPreview(target string, lines int, gen int) tea.Cmd {
 	return func() tea.Msg {
 		content, err := agent.CapturePane(target, lines)
 		if err != nil {
 			content = "error: " + err.Error()
 		}
-		return previewLoadedMsg{target: target, content: content}
+		return previewLoadedMsg{target: target, content: content, gen: gen}
 	}
 }
 
@@ -61,6 +63,7 @@ type Model struct {
 	preview            viewport.Model
 	previewFor         string
 	lastPreviewContent string
+	previewGen         int
 	width              int
 	height             int
 	err                error
@@ -178,13 +181,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.workspaces = agent.GroupByWorkspace(msg.panes)
 		m.workspaces, m.stashed = splitByStashState(m.workspaces, m.state.StashState)
 		m.items = FlattenTree(m.workspaces, m.stashed)
-		cmds := []tea.Cmd{panesTickCmd()}
-		if cmd := m.previewCmd(); cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		return m, tea.Batch(cmds...)
+		return m, panesTickCmd()
 
 	case previewLoadedMsg:
+		if msg.gen != m.previewGen {
+			return m, nil
+		}
 		m.previewFor = msg.target
 		content := strings.TrimRight(msg.content, "\n")
 		if content != m.lastPreviewContent {
@@ -192,14 +194,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.preview.SetContent(content)
 			m.preview.GotoBottom()
 		}
-		return m, previewTickCmd()
+		return m, previewTickCmd(m.previewGen)
 
-	case previewTickMsg:
+	case previewDebounceMsg:
+		if msg.gen != m.previewGen {
+			return m, nil
+		}
 		m.previewFor = ""
 		if cmd := m.previewCmd(); cmd != nil {
 			return m, cmd
 		}
-		return m, previewTickCmd()
+		return m, previewTickCmd(m.previewGen)
+
+	case previewTickMsg:
+		if msg.gen != m.previewGen {
+			return m, nil
+		}
+		m.previewFor = ""
+		if cmd := m.previewCmd(); cmd != nil {
+			return m, cmd
+		}
+		return m, previewTickCmd(m.previewGen)
 
 	case panesTickMsg:
 		return m, loadPanes
@@ -245,7 +260,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.pendingG {
 			m.pendingG = false
 			m.cursor = FirstPane(m.items)
-			return m, m.previewCmd()
+			return m, m.newPreviewCmd()
 		}
 		m.pendingG = true
 		return m, nil
@@ -259,7 +274,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "G":
 		m.cursor = LastPane(m.items)
-		return m, m.previewCmd()
+		return m, m.newPreviewCmd()
 
 	case "s", "u":
 		if m.toggleStash() {
@@ -277,7 +292,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.cursor = next
 		}
-		return m, m.previewCmd()
+		return m, m.newPreviewCmd()
 
 	case "k", "up":
 		for range count {
@@ -287,7 +302,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.cursor = prev
 		}
-		return m, m.previewCmd()
+		return m, m.newPreviewCmd()
 
 	case "enter", "q", "esc", "ctrl+c":
 		if key == "enter" {
@@ -506,6 +521,14 @@ func (m *Model) movePaneBetween(src, dst *[]agent.Workspace, target string, stas
 	}
 }
 
+func (m *Model) newPreviewCmd() tea.Cmd {
+	m.previewGen++
+	gen := m.previewGen
+	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+		return previewDebounceMsg{gen: gen}
+	})
+}
+
 func (m Model) previewCmd() tea.Cmd {
 	p := m.resolvePane(m.cursor)
 	if p == nil {
@@ -518,5 +541,5 @@ func (m Model) previewCmd() tea.Cmd {
 	if lines <= 0 {
 		lines = 50
 	}
-	return loadPreview(p.Target, lines)
+	return loadPreview(p.Target, lines, m.previewGen)
 }
