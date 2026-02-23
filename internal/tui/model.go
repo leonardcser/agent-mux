@@ -129,13 +129,13 @@ func splitByStashState(workspaces []agent.Workspace, stashState map[string]bool)
 		}
 		if len(stashedPanes) > 0 {
 			stashed = append(stashed, agent.Workspace{
-				Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch,
+				Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch, GitDirty: ws.GitDirty,
 				Panes: stashedPanes,
 			})
 		}
 		if len(workingPanes) > 0 {
 			working = append(working, agent.Workspace{
-				Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch,
+				Path: ws.Path, ShortPath: ws.ShortPath, GitBranch: ws.GitBranch, GitDirty: ws.GitDirty,
 				Panes: workingPanes,
 			})
 		}
@@ -514,6 +514,7 @@ func (m *Model) movePaneBetween(src, dst *[]agent.Workspace, target string, stas
 					Path:      (*src)[i].Path,
 					ShortPath: (*src)[i].ShortPath,
 					GitBranch: (*src)[i].GitBranch,
+					GitDirty:  (*src)[i].GitDirty,
 					Panes:     []agent.Pane{pane},
 				}
 				insertAt := len(*dst)

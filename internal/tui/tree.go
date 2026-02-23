@@ -234,6 +234,9 @@ func RenderTreeItem(item TreeItem, workspaces []agent.Workspace, stashed []agent
 		avail := width - 2 // 1 leading space + 1 trailing minimum
 		name := ws.ShortPath
 		branch := ws.GitBranch
+		if branch != "" && ws.GitDirty {
+			branch += "*"
+		}
 
 		if branch != "" {
 			// " name branch " — space between name and branch = 1

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -35,6 +36,7 @@ type Workspace struct {
 	Path      string
 	ShortPath string
 	GitBranch string
+	GitDirty  bool
 	Panes     []Pane
 }
 
@@ -59,6 +61,7 @@ func GroupByWorkspace(panes []Pane) []Workspace {
 			Path:      path,
 			ShortPath: short,
 			GitBranch: gitBranch(path),
+			GitDirty:  gitDirty(path),
 			Panes:     ps,
 		})
 	}
@@ -84,4 +87,15 @@ func gitBranch(dir string) string {
 		return ref[:8]
 	}
 	return ref
+}
+
+// gitDirty returns true if the git working tree has uncommitted changes.
+func gitDirty(dir string) bool {
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return len(strings.TrimSpace(string(out))) > 0
 }
