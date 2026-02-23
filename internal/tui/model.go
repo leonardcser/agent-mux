@@ -130,7 +130,7 @@ func NewModel(tmuxSession string) Model {
 				p.Status = s
 			}
 			m.panes[cp.Target] = p
-			if cp.ContentHash != 0 {
+			if cp.ContentHash != 0 && cp.LastStatus != nil && agent.PaneStatus(*cp.LastStatus) == agent.StatusBusy {
 				m.prevHashes[cp.Target] = cp.ContentHash
 			}
 			if cp.LastStatus != nil {
@@ -561,14 +561,20 @@ func (m *Model) saveState() {
 		}
 		cp.AutoAttention = m.autoAttention[cp.Target]
 	}
+	cursor := m.cursor
+	scrollStart := m.scrollStart
+	if att := m.firstAttentionPane(); att >= 0 {
+		cursor = att
+		scrollStart = 0
+	}
 	var paneTarget string
-	if p := m.resolvePane(m.cursor); p != nil {
+	if p := m.resolvePane(cursor); p != nil {
 		paneTarget = p.Target
 	}
 	m.state.LastPosition = agent.LastPosition{
 		PaneTarget:  paneTarget,
-		Cursor:      m.cursor,
-		ScrollStart: m.scrollStart,
+		Cursor:      cursor,
+		ScrollStart: scrollStart,
 	}
 	_ = agent.SaveState(m.state)
 }
