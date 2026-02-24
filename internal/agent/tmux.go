@@ -220,7 +220,7 @@ func needsAttention(lines []string) bool {
 		"Feel free to ask",
 		"Is there anything else",
 		"What else can I help",
-		"Want me to go ahead",
+		"Want me to",
 		"Shall I",
 		"Do you want me to",
 		"Ready to proceed",
