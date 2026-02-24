@@ -33,8 +33,15 @@ func previewTickCmd(gen int) tea.Cmd {
 	})
 }
 
-func panesTickCmd() tea.Cmd {
-	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+func (m Model) pollInterval() time.Duration {
+	if m.refreshCount <= 2 {
+		return 500 * time.Millisecond
+	}
+	return 2 * time.Second
+}
+
+func panesTickCmd(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return panesTickMsg(t)
 	})
 }
@@ -85,6 +92,7 @@ type Model struct {
 	overrides          map[string]statusOverride
 	prevHashes         map[string]uint64
 	prevStatuses       map[string]agent.PaneStatus
+	refreshCount       int
 }
 
 func NewModel(tmuxSession string) Model {
@@ -236,9 +244,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		firstLoad := !m.firstRefreshDone
 		m.firstRefreshDone = true
 		m.loaded = true
+		m.refreshCount++
 		if msg.err != nil {
 			m.err = msg.err
-			return m, panesTickCmd()
+			return m, panesTickCmd(m.pollInterval())
 		}
 		m.err = nil
 
@@ -301,7 +310,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.cursor = NearestPane(m.items, m.cursor)
 		}
-		return m, panesTickCmd()
+		return m, panesTickCmd(m.pollInterval())
 
 	case previewLoadedMsg:
 		if msg.gen != m.previewGen {
