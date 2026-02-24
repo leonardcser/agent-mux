@@ -33,12 +33,8 @@ func previewTickCmd(gen int) tea.Cmd {
 	})
 }
 
-func panesTickCmd(hasBusy bool) tea.Cmd {
-	d := 2 * time.Second
-	if hasBusy {
-		d = 500 * time.Millisecond
-	}
-	return tea.Tick(d, func(t time.Time) tea.Msg {
+func panesTickCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return panesTickMsg(t)
 	})
 }
@@ -242,7 +238,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loaded = true
 		if msg.err != nil {
 			m.err = msg.err
-			return m, panesTickCmd(false)
+			return m, panesTickCmd()
 		}
 		m.err = nil
 
@@ -305,7 +301,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.cursor = NearestPane(m.items, m.cursor)
 		}
-		return m, panesTickCmd(m.hasBusy())
+		return m, panesTickCmd()
 
 	case previewLoadedMsg:
 		if msg.gen != m.previewGen {
@@ -605,15 +601,6 @@ func (m *Model) saveState() {
 	}
 	m.state.SidebarWidth = m.sidebarWidth
 	_ = agent.SaveState(m.state)
-}
-
-func (m Model) hasBusy() bool {
-	for _, p := range m.panes {
-		if p.Status == agent.StatusBusy {
-			return true
-		}
-	}
-	return false
 }
 
 // firstAttentionPane returns the index of the first non-stashed pane needing attention, or -1.
