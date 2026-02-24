@@ -123,14 +123,10 @@ func NewModel(tmuxSession string) Model {
 					ContentHash: cp.ContentHash,
 				}
 			} else if cp.LastStatus != nil {
-				s := agent.PaneStatus(*cp.LastStatus)
-				if s == agent.StatusBusy {
-					s = agent.StatusNeedsAttention
-				}
-				p.Status = s
+				p.Status = agent.PaneStatus(*cp.LastStatus)
 			}
 			m.panes[cp.Target] = p
-			if cp.ContentHash != 0 && cp.LastStatus != nil && agent.PaneStatus(*cp.LastStatus) == agent.StatusBusy {
+			if cp.ContentHash != 0 {
 				m.prevHashes[cp.Target] = cp.ContentHash
 			}
 			if cp.LastStatus != nil {
@@ -269,13 +265,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					continue
 				}
 			}
-			if p.HeuristicAttention {
-				p.Status = agent.StatusNeedsAttention
-				delete(m.autoAttention, p.Target)
-			} else {
+			{
 				prev, seen := m.prevHashes[p.Target]
 				if seen && p.ContentHash != prev {
 					p.Status = agent.StatusBusy
+				} else if p.HeuristicAttention {
+					p.Status = agent.StatusNeedsAttention
+					delete(m.autoAttention, p.Target)
 				} else if m.prevStatuses[p.Target] == agent.StatusBusy {
 					p.Status = agent.StatusNeedsAttention
 					m.autoAttention[p.Target] = true
