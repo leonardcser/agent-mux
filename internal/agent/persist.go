@@ -18,7 +18,6 @@ type CachedPane struct {
 	ContentHash    uint64     `json:"contentHash,omitempty"`
 	LastStatus     *int      `json:"lastStatus,omitempty"`
 	LastActive     *time.Time `json:"lastActive,omitempty"`
-	AutoAttention  bool      `json:"autoAttention,omitempty"`
 }
 
 type State struct {
@@ -51,7 +50,7 @@ func LoadState() (State, bool) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return State{}, false
 	}
-	if state.Version != 3 {
+	if state.Version != 4 {
 		return State{}, false
 	}
 
@@ -60,7 +59,7 @@ func LoadState() (State, bool) {
 
 func SaveState(state State) error {
 	path := statePath()
-	state.Version = 3
+	state.Version = 4
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err

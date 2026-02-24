@@ -83,7 +83,6 @@ type Model struct {
 	overrides          map[string]statusOverride
 	prevHashes         map[string]uint64
 	prevStatuses       map[string]agent.PaneStatus
-	autoAttention      map[string]bool
 }
 
 func NewModel(tmuxSession string) Model {
@@ -94,7 +93,6 @@ func NewModel(tmuxSession string) Model {
 		overrides:     make(map[string]statusOverride),
 		prevHashes:    make(map[string]uint64),
 		prevStatuses:  make(map[string]agent.PaneStatus),
-		autoAttention: make(map[string]bool),
 	}
 
 	state, stateOK := agent.LoadState()
@@ -131,9 +129,6 @@ func NewModel(tmuxSession string) Model {
 			}
 			if cp.LastStatus != nil {
 				m.prevStatuses[cp.Target] = agent.PaneStatus(*cp.LastStatus)
-			}
-			if cp.AutoAttention {
-				m.autoAttention[cp.Target] = true
 			}
 		}
 		m.loaded = true
@@ -271,12 +266,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					p.Status = agent.StatusBusy
 				} else if p.HeuristicAttention {
 					p.Status = agent.StatusNeedsAttention
-					delete(m.autoAttention, p.Target)
 				} else if m.prevStatuses[p.Target] == agent.StatusBusy {
-					p.Status = agent.StatusNeedsAttention
-					m.autoAttention[p.Target] = true
-				} else if m.prevStatuses[p.Target] == agent.StatusNeedsAttention {
-					p.Status = agent.StatusNeedsAttention
+					p.Status = agent.StatusUnread
+				} else if m.prevStatuses[p.Target] == agent.StatusNeedsAttention ||
+					m.prevStatuses[p.Target] == agent.StatusUnread {
+					p.Status = m.prevStatuses[p.Target]
 				}
 			}
 			m.prevHashes[p.Target] = p.ContentHash
@@ -291,7 +285,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				delete(m.overrides, target)
 				delete(m.prevHashes, target)
 				delete(m.prevStatuses, target)
-				delete(m.autoAttention, target)
 			}
 		}
 
@@ -405,12 +398,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			switch p.Status {
 			case agent.StatusIdle:
 				p.Status = agent.StatusNeedsAttention
-			case agent.StatusNeedsAttention:
+			case agent.StatusNeedsAttention, agent.StatusUnread:
 				p.Status = agent.StatusIdle
 			default:
 				return m, nil
 			}
-			delete(m.autoAttention, p.Target)
 			m.overrides[p.Target] = statusOverride{
 				Status:      p.Status,
 				ContentHash: p.ContentHash,
@@ -458,9 +450,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", "q", "esc", "ctrl+c":
 		if key == "enter" {
 			if p := m.resolvePane(m.cursor); p != nil {
-				if m.autoAttention[p.Target] {
+				if p.Status == agent.StatusUnread {
 					p.Status = agent.StatusIdle
-					delete(m.autoAttention, p.Target)
 					delete(m.overrides, p.Target)
 					delete(m.prevStatuses, p.Target)
 					delete(m.prevHashes, p.Target)
@@ -555,7 +546,6 @@ func (m *Model) saveState() {
 			v := int(s)
 			cp.LastStatus = &v
 		}
-		cp.AutoAttention = m.autoAttention[cp.Target]
 	}
 	cursor := m.cursor
 	scrollStart := m.scrollStart
@@ -582,7 +572,7 @@ func (m Model) firstAttentionPane() int {
 			continue
 		}
 		p := m.panes[item.Target]
-		if p != nil && !p.Stashed && p.Status == agent.StatusNeedsAttention {
+		if p != nil && !p.Stashed && p.Status == agent.StatusNeedsAttention || p.Status == agent.StatusUnread {
 			return i
 		}
 	}

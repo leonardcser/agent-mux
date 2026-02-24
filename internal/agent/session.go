@@ -16,6 +16,7 @@ const (
 	StatusIdle           PaneStatus = iota // waiting for user input
 	StatusBusy                             // agent is working
 	StatusNeedsAttention                   // agent needs user attention
+	StatusUnread                           // finished but not yet viewed
 )
 
 // Pane represents a tmux pane running an AI coding agent.

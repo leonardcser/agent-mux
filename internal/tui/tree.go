@@ -237,7 +237,7 @@ func renderPaneRow(p *agent.Pane, selected bool, width int) string {
 	switch p.Status {
 	case agent.StatusBusy:
 		icon = icons.busy
-	case agent.StatusNeedsAttention:
+	case agent.StatusNeedsAttention, agent.StatusUnread:
 		icon = icons.attention
 	default:
 		icon = icons.idle
