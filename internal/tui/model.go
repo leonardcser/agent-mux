@@ -78,6 +78,8 @@ type Model struct {
 	pendingD           bool
 	pendingG           bool
 	count              int
+	sidebarWidth       int
+	dragging           bool
 	tmuxSession        string
 	state              agent.State
 	overrides          map[string]statusOverride
@@ -97,6 +99,7 @@ func NewModel(tmuxSession string) Model {
 
 	state, stateOK := agent.LoadState()
 	m.state = state
+	m.sidebarWidth = state.SidebarWidth
 	if stateOK {
 		for _, cp := range state.Panes {
 			session, window, pane := agent.ParseTarget(cp.Target)
@@ -343,8 +346,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, loadPanes
 
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+	}
+	return m, nil
+}
+
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	sep := m.listWidth()
+	switch msg.Action {
+	case tea.MouseActionPress:
+		if msg.Button == tea.MouseButtonLeft && msg.X >= sep-1 && msg.X <= sep+1 {
+			m.dragging = true
+		}
+	case tea.MouseActionMotion:
+		if m.dragging {
+			w := max(min(msg.X, m.width-20), 20)
+			m.sidebarWidth = w
+			m.preview.Width = m.previewWidth()
+		}
+	case tea.MouseActionRelease:
+		m.dragging = false
 	}
 	return m, nil
 }
@@ -425,6 +450,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rebuildItems()
 			m.clampCursorInSection(m.cursor, true)
 		}
+		return m, nil
+
+	case "H":
+		w := max(m.listWidth()-2*count, 20)
+		m.sidebarWidth = w
+		m.preview.Width = m.previewWidth()
+		return m, nil
+
+	case "L":
+		w := min(m.listWidth()+2*count, m.width-20)
+		m.sidebarWidth = w
+		m.preview.Width = m.previewWidth()
 		return m, nil
 
 	case "j", "down":
@@ -562,6 +599,7 @@ func (m *Model) saveState() {
 		Cursor:      cursor,
 		ScrollStart: scrollStart,
 	}
+	m.state.SidebarWidth = m.sidebarWidth
 	_ = agent.SaveState(m.state)
 }
 
@@ -622,6 +660,7 @@ func (m Model) renderHelp() string {
 		{"dd", "kill pane"},
 		{"gg", "go to first"},
 		{"G", "go to last"},
+		{"H/L", "resize sidebar"},
 		{"?", "toggle help"},
 		{"q/esc", "quit"},
 	}
@@ -639,6 +678,9 @@ func (m Model) renderHelp() string {
 }
 
 func (m Model) listWidth() int {
+	if m.sidebarWidth > 0 {
+		return m.sidebarWidth
+	}
 	return max(m.width*25/100, 20)
 }
 

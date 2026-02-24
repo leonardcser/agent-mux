@@ -46,5 +46,8 @@ bind j run-shell "tmux neww agent-mux"
 | `s` / `u`        | Stash/unstash        |
 | `enter`          | Switch to session    |
 | `dd`             | Kill session         |
+| `H` / `L`        | Resize sidebar       |
 | `?`              | Toggle help          |
 | `q` / `esc`      | Quit                 |
+
+The sidebar separator can also be dragged with the mouse.

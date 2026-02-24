@@ -24,6 +24,7 @@ type State struct {
 	Version      int          `json:"version"`
 	Panes        []CachedPane `json:"panes"`
 	LastPosition LastPosition `json:"lastPosition"`
+	SidebarWidth int          `json:"sidebarWidth,omitempty"`
 }
 
 type LastPosition struct {
