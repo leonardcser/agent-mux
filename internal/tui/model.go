@@ -572,7 +572,7 @@ func (m Model) firstAttentionPane() int {
 			continue
 		}
 		p := m.panes[item.Target]
-		if p != nil && !p.Stashed && p.Status == agent.StatusNeedsAttention || p.Status == agent.StatusUnread {
+		if p != nil && !p.Stashed && (p.Status == agent.StatusNeedsAttention || p.Status == agent.StatusUnread) {
 			return i
 		}
 	}
