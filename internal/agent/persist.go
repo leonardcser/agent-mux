@@ -9,6 +9,7 @@ import (
 
 type CachedPane struct {
 	Target         string     `json:"target"`
+	WindowName     string     `json:"windowName,omitempty"`
 	Path           string     `json:"path"`
 	ShortPath      string     `json:"shortPath"`
 	GitBranch      string     `json:"gitBranch,omitempty"`
@@ -51,7 +52,7 @@ func LoadState() (State, bool) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return State{}, false
 	}
-	if state.Version != 4 {
+	if state.Version != 1 {
 		return State{}, false
 	}
 
@@ -60,7 +61,7 @@ func LoadState() (State, bool) {
 
 func SaveState(state State) error {
 	path := statePath()
-	state.Version = 4
+	state.Version = 1
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -72,13 +73,18 @@ func SaveState(state State) error {
 func PanesFromState(cached []CachedPane) []Pane {
 	panes := make([]Pane, len(cached))
 	for i, cp := range cached {
+		session, window, pane := ParseTarget(cp.Target)
 		panes[i] = Pane{
-			Target:    cp.Target,
-			Path:      cp.Path,
-			ShortPath: cp.ShortPath,
-			GitBranch: cp.GitBranch,
-			GitDirty:  cp.GitDirty,
-			Stashed:   cp.Stashed,
+			Target:     cp.Target,
+			Session:    session,
+			Window:     window,
+			WindowName: cp.WindowName,
+			Pane:       pane,
+			Path:       cp.Path,
+			ShortPath:  cp.ShortPath,
+			GitBranch:  cp.GitBranch,
+			GitDirty:   cp.GitDirty,
+			Stashed:    cp.Stashed,
 		}
 	}
 	return panes
@@ -89,12 +95,13 @@ func CachePanes(panes []*Pane) []CachedPane {
 	cached := make([]CachedPane, len(panes))
 	for i, p := range panes {
 		cp := CachedPane{
-			Target:    p.Target,
-			Path:      p.Path,
-			ShortPath: p.ShortPath,
-			GitBranch: p.GitBranch,
-			GitDirty:  p.GitDirty,
-			Stashed:   p.Stashed,
+			Target:     p.Target,
+			WindowName: p.WindowName,
+			Path:       p.Path,
+			ShortPath:  p.ShortPath,
+			GitBranch:  p.GitBranch,
+			GitDirty:   p.GitDirty,
+			Stashed:    p.Stashed,
 		}
 		if !p.LastActive.IsZero() {
 			t := p.LastActive

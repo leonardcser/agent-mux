@@ -112,15 +112,16 @@ func NewModel(tmuxSession string) Model {
 		for _, cp := range state.Panes {
 			session, window, pane := agent.ParseTarget(cp.Target)
 			p := &agent.Pane{
-				Target:    cp.Target,
-				Session:   session,
-				Window:    window,
-				Pane:      pane,
-				Path:      cp.Path,
-				ShortPath: cp.ShortPath,
-				GitBranch: cp.GitBranch,
-				GitDirty:  cp.GitDirty,
-				Stashed:   cp.Stashed,
+				Target:     cp.Target,
+				Session:    session,
+				Window:     window,
+				WindowName: cp.WindowName,
+				Pane:       pane,
+				Path:       cp.Path,
+				ShortPath:  cp.ShortPath,
+				GitBranch:  cp.GitBranch,
+				GitDirty:   cp.GitDirty,
+				Stashed:    cp.Stashed,
 			}
 			if cp.LastActive != nil {
 				p.LastActive = *cp.LastActive

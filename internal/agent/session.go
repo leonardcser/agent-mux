@@ -24,6 +24,7 @@ type Pane struct {
 	Target             string // e.g. "main:2.1"
 	Session            string
 	Window             string
+	WindowName         string
 	Pane               string
 	Path               string
 	ShortPath          string

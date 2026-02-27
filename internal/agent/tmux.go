@@ -14,8 +14,8 @@ import (
 
 // rawPane holds parsed tmux pane info before status detection.
 type rawPane struct {
-	target, session, window, pane, path, cmd string
-	pid                                      int
+	target, session, window, windowName, pane, path, cmd string
+	pid                                                  int
 }
 
 // parseTmuxPanes parses tmux list-panes output into rawPane structs.
@@ -25,14 +25,18 @@ func parseTmuxPanes(out []byte) []rawPane {
 		if line == "" {
 			continue
 		}
-		fields := strings.SplitN(line, "\t", 4)
+		fields := strings.SplitN(line, "\t", 5)
 		if len(fields) < 4 {
 			continue
 		}
 		target, cmd, path, pidStr := fields[0], fields[1], fields[2], fields[3]
+		windowName := ""
+		if len(fields) == 5 {
+			windowName = fields[4]
+		}
 		pid, _ := strconv.Atoi(pidStr)
 		session, window, pane := ParseTarget(target)
-		raw = append(raw, rawPane{target, session, window, pane, path, cmd, pid})
+		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid})
 	}
 	return raw
 }
@@ -56,7 +60,7 @@ func resolveAgentPanes(raw []rawPane, pt *provider.ProcessTable) []rawPane {
 // listTmuxPanes runs tmux list-panes and returns raw output.
 func listTmuxPanes() ([]byte, error) {
 	return exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}").Output()
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}").Output()
 }
 
 // loadProcessTable snapshots the process tree via a single ps call.
@@ -108,6 +112,7 @@ func ListPanesBasic() ([]Pane, error) {
 			Target:     r.target,
 			Session:    r.session,
 			Window:     r.window,
+			WindowName: r.windowName,
 			Pane:       r.pane,
 			Path:       r.path,
 			PID:        r.pid,
@@ -156,6 +161,7 @@ func ListPanes() ([]Pane, error) {
 			Target:     r.target,
 			Session:    r.session,
 			Window:     r.window,
+			WindowName: r.windowName,
 			Pane:       r.pane,
 			Path:       r.path,
 			PID:        r.pid,
