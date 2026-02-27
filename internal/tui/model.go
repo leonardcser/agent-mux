@@ -100,9 +100,9 @@ func NewModel(tmuxSession string) Model {
 		preview:      viewport.New(40, 20),
 		tmuxSession:  tmuxSession,
 		panes:        make(map[string]*agent.Pane),
-		overrides:     make(map[string]statusOverride),
-		prevHashes:    make(map[string]uint64),
-		prevStatuses:  make(map[string]agent.PaneStatus),
+		overrides:    make(map[string]statusOverride),
+		prevHashes:   make(map[string]uint64),
+		prevStatuses: make(map[string]agent.PaneStatus),
 	}
 
 	state, stateOK := agent.LoadState()

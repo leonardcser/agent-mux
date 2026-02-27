@@ -21,15 +21,15 @@ const (
 
 // Pane represents a tmux pane running an AI coding agent.
 type Pane struct {
-	Target      string // e.g. "main:2.1"
-	Session     string
-	Window      string
-	Pane        string
-	Path        string
-	ShortPath   string
-	GitBranch   string
-	GitDirty    bool
-	PID         int
+	Target             string // e.g. "main:2.1"
+	Session            string
+	Window             string
+	Pane               string
+	Path               string
+	ShortPath          string
+	GitBranch          string
+	GitDirty           bool
+	PID                int
 	Status             PaneStatus
 	ContentHash        uint64
 	HeuristicAttention bool

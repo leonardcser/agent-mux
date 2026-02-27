@@ -8,15 +8,15 @@ import (
 )
 
 type CachedPane struct {
-	Target         string `json:"target"`
-	Path           string `json:"path"`
-	ShortPath      string `json:"shortPath"`
-	GitBranch      string `json:"gitBranch,omitempty"`
-	GitDirty       bool   `json:"gitDirty,omitempty"`
-	Stashed        bool   `json:"stashed"`
-	StatusOverride *int   `json:"statusOverride,omitempty"`
+	Target         string     `json:"target"`
+	Path           string     `json:"path"`
+	ShortPath      string     `json:"shortPath"`
+	GitBranch      string     `json:"gitBranch,omitempty"`
+	GitDirty       bool       `json:"gitDirty,omitempty"`
+	Stashed        bool       `json:"stashed"`
+	StatusOverride *int       `json:"statusOverride,omitempty"`
 	ContentHash    uint64     `json:"contentHash,omitempty"`
-	LastStatus     *int      `json:"lastStatus,omitempty"`
+	LastStatus     *int       `json:"lastStatus,omitempty"`
 	LastActive     *time.Time `json:"lastActive,omitempty"`
 }
 
