@@ -415,6 +415,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "R":
+		agent.RestartWatch()
+		return m, loadPanes
+
 	case "H":
 		w := max(m.listWidth()-2*count, 20)
 		m.sidebarWidth = w
@@ -607,6 +611,7 @@ func (m Model) renderHelp() string {
 		{"dd", "kill pane"},
 		{"gg", "go to first"},
 		{"G", "go to last"},
+		{"R", "reload watch"},
 		{"H/L", "resize sidebar"},
 		{"?", "toggle help"},
 		{"q/esc", "quit"},

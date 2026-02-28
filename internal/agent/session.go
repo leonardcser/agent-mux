@@ -98,13 +98,48 @@ func gitBranch(dir string) string {
 	return ref
 }
 
+// gitDirtyCache caches git dirty state per directory, keyed by .git/index mtime.
+var gitDirtyCache struct {
+	mu      sync.Mutex
+	entries map[string]gitDirtyCacheEntry
+}
+
+type gitDirtyCacheEntry struct {
+	indexMtime time.Time
+	dirty      bool
+}
+
+func init() {
+	gitDirtyCache.entries = make(map[string]gitDirtyCacheEntry)
+}
+
 // gitDirty returns true if the git working tree has uncommitted changes.
+// Results are cached and only recomputed when .git/index mtime changes.
 func gitDirty(dir string) bool {
+	indexPath := filepath.Join(dir, ".git", "index")
+	info, err := os.Stat(indexPath)
+	if err != nil {
+		return false
+	}
+	mtime := info.ModTime()
+
+	gitDirtyCache.mu.Lock()
+	if cached, ok := gitDirtyCache.entries[dir]; ok && cached.indexMtime.Equal(mtime) {
+		gitDirtyCache.mu.Unlock()
+		return cached.dirty
+	}
+	gitDirtyCache.mu.Unlock()
+
 	cmd := exec.Command("git", "status", "--porcelain")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
 		return false
 	}
-	return len(strings.TrimSpace(string(out))) > 0
+	dirty := len(strings.TrimSpace(string(out))) > 0
+
+	gitDirtyCache.mu.Lock()
+	gitDirtyCache.entries[dir] = gitDirtyCacheEntry{indexMtime: mtime, dirty: dirty}
+	gitDirtyCache.mu.Unlock()
+	return dirty
 }

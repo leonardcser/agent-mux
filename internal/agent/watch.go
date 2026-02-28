@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -27,15 +30,21 @@ func Watch(ctx context.Context) error {
 	}
 	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 
+	// Write PID so RestartWatch can find us.
+	lockFile.Truncate(0)
+	lockFile.Seek(0, 0)
+	fmt.Fprintf(lockFile, "%d", os.Getpid())
+
 	r := NewReconciler()
 	if state, ok := LoadState(); ok {
 		r.SeedFromState(state)
 	}
 
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	const interval = 1 * time.Second
 
 	for {
+		start := time.Now()
+
 		// Read state once per cycle: merge TUI overrides and preserve
 		// TUI-owned fields (LastPosition, SidebarWidth) for the save.
 		state, _ := LoadState()
@@ -64,10 +73,50 @@ func Watch(ctx context.Context) error {
 			_ = SaveState(state)
 		}
 
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
+		// Sleep for the remainder of the interval, accounting for work time.
+		elapsed := time.Since(start)
+		if remaining := interval - elapsed; remaining > 0 {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(remaining):
+			}
+		} else {
+			// Work took longer than interval; check cancellation without blocking.
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
 		}
 	}
+}
+
+// watchLockPath returns the path to the watch lock file.
+func watchLockPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "agent-mux", "watch.lock")
+}
+
+// RestartWatch kills the running watch process (if any) and spawns a new one.
+func RestartWatch() error {
+	lockPath := watchLockPath()
+
+	// Kill existing watcher by reading its PID from the lock file.
+	if data, err := os.ReadFile(lockPath); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
+			if proc, err := os.FindProcess(pid); err == nil {
+				_ = proc.Signal(syscall.SIGTERM)
+			}
+		}
+	}
+
+	// Spawn a new watcher. Use our own executable.
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("restart watch: %w", err)
+	}
+	cmd := exec.Command(exe, "watch")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return cmd.Start()
 }

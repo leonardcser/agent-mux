@@ -58,6 +58,7 @@ bind j run-shell "tmux neww agent-mux"
 | `s` / `u`        | Stash/unstash        |
 | `enter`          | Switch to session    |
 | `dd`             | Kill session         |
+| `R`              | Reload watch process |
 | `H` / `L`        | Resize sidebar       |
 | `?`              | Toggle help          |
 | `q` / `esc`      | Quit                 |
