@@ -26,6 +26,18 @@ From inside tmux:
 agent-mux
 ```
 
+### Background watcher
+
+`agent-mux watch` runs a background daemon that polls session statuses every 2s
+and writes them to disk. This means the TUI opens instantly with accurate
+statuses instead of needing a few seconds to detect activity.
+
+Add to your `~/.tmux.conf` to start the watcher automatically with tmux:
+
+```tmux
+run-shell -b "agent-mux watch"
+```
+
 ### tmux binding
 
 Add to your `~/.tmux.conf` to open agent-mux with `prefix + j`:

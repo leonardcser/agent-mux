@@ -32,7 +32,7 @@ type Pane struct {
 	GitDirty           bool
 	PID                int
 	Status             PaneStatus
-	ContentHash        uint64
+	WindowActivity     int64
 	HeuristicAttention bool
 	LastActive         time.Time
 	Stashed            bool

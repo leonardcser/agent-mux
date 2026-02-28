@@ -61,14 +61,10 @@ func loadPreview(target string, lines int, gen int) tea.Cmd {
 	}
 }
 
-type statusOverride struct {
-	Status      agent.PaneStatus
-	ContentHash uint64
-}
-
 // Model is the top-level Bubble Tea model.
 type Model struct {
 	panes              map[string]*agent.Pane
+	reconciler         *agent.Reconciler
 	items              []TreeItem
 	cursor             int
 	scrollStart        int
@@ -89,26 +85,22 @@ type Model struct {
 	dragging           bool
 	tmuxSession        string
 	state              agent.State
-	overrides          map[string]statusOverride
-	prevHashes         map[string]uint64
-	prevStatuses       map[string]agent.PaneStatus
 	refreshCount       int
 }
 
 func NewModel(tmuxSession string) Model {
 	m := Model{
-		preview:      viewport.New(40, 20),
-		tmuxSession:  tmuxSession,
-		panes:        make(map[string]*agent.Pane),
-		overrides:    make(map[string]statusOverride),
-		prevHashes:   make(map[string]uint64),
-		prevStatuses: make(map[string]agent.PaneStatus),
+		preview:    viewport.New(40, 20),
+		tmuxSession: tmuxSession,
+		panes:      make(map[string]*agent.Pane),
+		reconciler: agent.NewReconciler(),
 	}
 
 	state, stateOK := agent.LoadState()
 	m.state = state
 	m.sidebarWidth = state.SidebarWidth
 	if stateOK {
+		m.reconciler.SeedFromState(state)
 		for _, cp := range state.Panes {
 			session, window, pane := agent.ParseTarget(cp.Target)
 			p := &agent.Pane{
@@ -128,20 +120,10 @@ func NewModel(tmuxSession string) Model {
 			}
 			if cp.StatusOverride != nil {
 				p.Status = agent.PaneStatus(*cp.StatusOverride)
-				m.overrides[cp.Target] = statusOverride{
-					Status:      agent.PaneStatus(*cp.StatusOverride),
-					ContentHash: cp.ContentHash,
-				}
 			} else if cp.LastStatus != nil {
 				p.Status = agent.PaneStatus(*cp.LastStatus)
 			}
 			m.panes[cp.Target] = p
-			if cp.ContentHash != 0 {
-				m.prevHashes[cp.Target] = cp.ContentHash
-			}
-			if cp.LastStatus != nil {
-				m.prevStatuses[cp.Target] = agent.PaneStatus(*cp.LastStatus)
-			}
 		}
 		m.loaded = true
 	} else {
@@ -252,54 +234,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = nil
 
-		// Build new pane set, preserving stashed state from existing panes.
-		alive := make(map[string]bool, len(msg.panes))
+		// Preserve stashed state before reconciliation.
+		stashed := make(map[string]bool, len(m.panes))
+		for target, p := range m.panes {
+			if p.Stashed {
+				stashed[target] = true
+			}
+		}
+
+		// Seed during the fast startup window (500ms polls) instead of
+		// running the full state machine. window_activity has 1-second
+		// granularity, so sub-second polls would see identical timestamps
+		// and falsely transition Busy → Unread.
+		if m.refreshCount <= 3 {
+			m.reconciler.Seed(msg.panes)
+		} else {
+			m.reconciler.Reconcile(msg.panes)
+		}
+
+		// Rebuild pane map from fresh data.
+		newPanes := make(map[string]*agent.Pane, len(msg.panes))
 		for i := range msg.panes {
 			p := &msg.panes[i]
-			alive[p.Target] = true
-
-			if existing, ok := m.panes[p.Target]; ok {
-				p.Stashed = existing.Stashed
-			}
-
-			if ov, ok := m.overrides[p.Target]; ok {
-				if p.ContentHash != ov.ContentHash {
-					delete(m.overrides, p.Target)
-				} else {
-					p.Status = ov.Status
-					m.prevHashes[p.Target] = p.ContentHash
-					m.prevStatuses[p.Target] = p.Status
-					m.panes[p.Target] = p
-					continue
-				}
-			}
-			{
-				prev, seen := m.prevHashes[p.Target]
-				if seen && p.ContentHash != prev {
-					p.Status = agent.StatusBusy
-				} else if p.HeuristicAttention {
-					p.Status = agent.StatusNeedsAttention
-				} else if m.prevStatuses[p.Target] == agent.StatusBusy {
-					p.Status = agent.StatusUnread
-				} else if m.prevStatuses[p.Target] == agent.StatusNeedsAttention ||
-					m.prevStatuses[p.Target] == agent.StatusUnread {
-					p.Status = m.prevStatuses[p.Target]
-				}
-			}
-			m.prevHashes[p.Target] = p.ContentHash
-			m.prevStatuses[p.Target] = p.Status
-			m.panes[p.Target] = p
+			p.Stashed = stashed[p.Target]
+			newPanes[p.Target] = p
 		}
-
-		// Remove panes that no longer exist.
-		for target := range m.panes {
-			if !alive[target] {
-				delete(m.panes, target)
-				delete(m.overrides, target)
-				delete(m.prevHashes, target)
-				delete(m.prevStatuses, target)
-			}
-		}
+		m.panes = newPanes
 
 		m.rebuildItems()
 		if firstLoad {
@@ -438,10 +398,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			default:
 				return m, nil
 			}
-			m.overrides[p.Target] = statusOverride{
-				Status:      p.Status,
-				ContentHash: p.ContentHash,
+			m.reconciler.Overrides[p.Target] = agent.StatusOverride{
+				Status:         p.Status,
+				WindowActivity: p.WindowActivity,
 			}
+			m.reconciler.PrevStatuses[p.Target] = p.Status
 		}
 		return m, nil
 
@@ -499,9 +460,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if p := m.resolvePane(m.cursor); p != nil {
 				if p.Status == agent.StatusUnread {
 					p.Status = agent.StatusIdle
-					delete(m.overrides, p.Target)
-					delete(m.prevStatuses, p.Target)
-					delete(m.prevHashes, p.Target)
+					delete(m.reconciler.Overrides, p.Target)
+					delete(m.reconciler.PrevStatuses, p.Target)
+					delete(m.reconciler.PrevActivity, p.Target)
 				}
 				_ = agent.SwitchToPane(p.Target)
 			}
@@ -579,21 +540,7 @@ func (m *Model) saveState() {
 		paneList = append(paneList, p)
 	}
 	m.state.Panes = agent.CachePanes(paneList)
-	for i := range m.state.Panes {
-		cp := &m.state.Panes[i]
-		if ov, ok := m.overrides[cp.Target]; ok {
-			s := int(ov.Status)
-			cp.StatusOverride = &s
-			cp.ContentHash = ov.ContentHash
-		}
-		if h, ok := m.prevHashes[cp.Target]; ok {
-			cp.ContentHash = h
-		}
-		if s, ok := m.prevStatuses[cp.Target]; ok {
-			v := int(s)
-			cp.LastStatus = &v
-		}
-	}
+	m.reconciler.ApplyToCache(m.state.Panes)
 	cursor := m.cursor
 	scrollStart := m.scrollStart
 	if att := m.firstAttentionPane(); att >= 0 {

@@ -16,7 +16,7 @@ type CachedPane struct {
 	GitDirty       bool       `json:"gitDirty,omitempty"`
 	Stashed        bool       `json:"stashed"`
 	StatusOverride *int       `json:"statusOverride,omitempty"`
-	ContentHash    uint64     `json:"contentHash,omitempty"`
+	WindowActivity int64      `json:"windowActivity,omitempty"`
 	LastStatus     *int       `json:"lastStatus,omitempty"`
 	LastActive     *time.Time `json:"lastActive,omitempty"`
 }
@@ -67,27 +67,6 @@ func SaveState(state State) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0644)
-}
-
-// PanesFromState rebuilds Pane structs from cached state.
-func PanesFromState(cached []CachedPane) []Pane {
-	panes := make([]Pane, len(cached))
-	for i, cp := range cached {
-		session, window, pane := ParseTarget(cp.Target)
-		panes[i] = Pane{
-			Target:     cp.Target,
-			Session:    session,
-			Window:     window,
-			WindowName: cp.WindowName,
-			Pane:       pane,
-			Path:       cp.Path,
-			ShortPath:  cp.ShortPath,
-			GitBranch:  cp.GitBranch,
-			GitDirty:   cp.GitDirty,
-			Stashed:    cp.Stashed,
-		}
-	}
-	return panes
 }
 
 // CachePanes converts live Pane structs into the cached format.

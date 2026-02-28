@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"time"
@@ -17,6 +19,16 @@ func main() {
 	if os.Getenv("TMUX") == "" {
 		fmt.Fprintln(os.Stderr, "error: agent-mux must be run inside tmux")
 		os.Exit(1)
+	}
+
+	if slices.Contains(os.Args[1:], "watch") {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		if err := agent.Watch(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if slices.Contains(os.Args[1:], "--bench") || slices.Contains(os.Args[1:], "--bench-cold") {
@@ -40,10 +52,8 @@ func main() {
 
 func runBenchLoop() {
 	// Simulate one full refresh cycle (what runs every 2s in the runtime loop).
-	// 1. ListPanesBasic (tmux + ps + history, parallel)
-	// 2. Content hashing (per-pane tmux capture)
-	// 3. EnrichPanes (git operations)
-	// 4. CapturePane (preview load)
+	// 1. ListPanes (tmux + ps + history + attention heuristics, parallel)
+	// 2. CapturePane (preview load)
 
 	t0 := time.Now()
 	panes, err := agent.ListPanes()

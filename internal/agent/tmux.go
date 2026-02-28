@@ -2,7 +2,6 @@ package agent
 
 import (
 	"fmt"
-	"hash/fnv"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -16,6 +15,7 @@ import (
 type rawPane struct {
 	target, session, window, windowName, pane, path, cmd string
 	pid                                                  int
+	windowActivity                                       int64
 }
 
 // parseTmuxPanes parses tmux list-panes output into rawPane structs.
@@ -25,18 +25,15 @@ func parseTmuxPanes(out []byte) []rawPane {
 		if line == "" {
 			continue
 		}
-		fields := strings.SplitN(line, "\t", 5)
-		if len(fields) < 4 {
+		fields := strings.SplitN(line, "\t", 6)
+		if len(fields) < 6 {
 			continue
 		}
-		target, cmd, path, pidStr := fields[0], fields[1], fields[2], fields[3]
-		windowName := ""
-		if len(fields) == 5 {
-			windowName = fields[4]
-		}
+		target, cmd, path, pidStr, windowName, actStr := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
 		pid, _ := strconv.Atoi(pidStr)
+		activity, _ := strconv.ParseInt(actStr, 10, 64)
 		session, window, pane := ParseTarget(target)
-		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid})
+		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid, activity})
 	}
 	return raw
 }
@@ -60,7 +57,7 @@ func resolveAgentPanes(raw []rawPane, pt *provider.ProcessTable) []rawPane {
 // listTmuxPanes runs tmux list-panes and returns raw output.
 func listTmuxPanes() ([]byte, error) {
 	return exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}").Output()
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_activity}").Output()
 }
 
 // loadProcessTable snapshots the process tree via a single ps call.
@@ -109,15 +106,16 @@ func ListPanesBasic() ([]Pane, error) {
 	panes := make([]Pane, len(raw))
 	for i, r := range raw {
 		panes[i] = Pane{
-			Target:     r.target,
-			Session:    r.session,
-			Window:     r.window,
-			WindowName: r.windowName,
-			Pane:       r.pane,
-			Path:       r.path,
-			PID:        r.pid,
-			Status:     StatusIdle,
-			LastActive: history[r.path],
+			Target:         r.target,
+			Session:        r.session,
+			Window:         r.window,
+			WindowName:     r.windowName,
+			Pane:           r.pane,
+			Path:           r.path,
+			PID:            r.pid,
+			Status:         StatusIdle,
+			WindowActivity: r.windowActivity,
+			LastActive:     history[r.path],
 		}
 	}
 	return panes, nil
@@ -125,7 +123,7 @@ func ListPanesBasic() ([]Pane, error) {
 
 // ListPanes returns all tmux panes running a registered agent with full
 // status detection. Runs tmux list-panes, history read, and process table
-// snapshot in parallel, then detects per-pane status sequentially.
+// snapshot in parallel, then checks attention heuristics per pane.
 func ListPanes() ([]Pane, error) {
 	var (
 		tmuxOut []byte
@@ -158,43 +156,37 @@ func ListPanes() ([]Pane, error) {
 	panes := make([]Pane, len(raw))
 	for i, r := range raw {
 		panes[i] = Pane{
-			Target:     r.target,
-			Session:    r.session,
-			Window:     r.window,
-			WindowName: r.windowName,
-			Pane:       r.pane,
-			Path:       r.path,
-			PID:        r.pid,
-			Status:     StatusIdle,
-			LastActive: history[r.path],
+			Target:         r.target,
+			Session:        r.session,
+			Window:         r.window,
+			WindowName:     r.windowName,
+			Pane:           r.pane,
+			Path:           r.path,
+			PID:            r.pid,
+			Status:         StatusIdle,
+			WindowActivity: r.windowActivity,
+			LastActive:     history[r.path],
 		}
 	}
 
-	// Run content hashing and git enrichment concurrently.
+	// Run attention heuristics and git enrichment concurrently.
 	var allWg sync.WaitGroup
 	allWg.Go(func() {
 		EnrichPanes(panes)
 	})
 	for i := range panes {
 		allWg.Go(func() {
-			h, att := contentHashAndAttention(panes[i].Target)
-			panes[i].ContentHash = h
-			panes[i].HeuristicAttention = att
+			panes[i].HeuristicAttention = checkAttention(panes[i].Target)
 		})
 	}
 	allWg.Wait()
 	return panes, nil
 }
 
-// contentHashAndAttention captures the last 10 lines of a pane and returns
-// their FNV hash and whether the content matches attention heuristics.
-func contentHashAndAttention(target string) (uint64, bool) {
-	lines := capturePaneLines(target)
-	h := fnv.New64a()
-	for _, l := range lines {
-		h.Write([]byte(l))
-	}
-	return h.Sum64(), needsAttention(lines)
+// checkAttention captures the last 10 lines of a pane and returns whether
+// the content matches attention heuristics (waiting for user input).
+func checkAttention(target string) bool {
+	return needsAttention(capturePaneLines(target))
 }
 
 // needsAttention checks if a pane is waiting for user interaction.

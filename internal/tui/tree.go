@@ -212,8 +212,10 @@ func renderWorkspaceHeader(p *agent.Pane, width int) string {
 }
 
 func renderPaneRow(p *agent.Pane, selected bool, width int) string {
-	label := fmt.Sprintf("%s:%s", p.Window, p.WindowName)
-	if p.WindowName == "" {
+	var label string
+	if p.WindowName != "" {
+		label = fmt.Sprintf("%s:%s", p.Window, p.WindowName)
+	} else {
 		label = fmt.Sprintf("%s:%s", p.Session, p.Window)
 	}
 
