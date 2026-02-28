@@ -18,16 +18,14 @@ func Watch(ctx context.Context) error {
 	defer ticker.Stop()
 
 	for {
-		// Pick up overrides the TUI may have written while we were sleeping.
-		if state, ok := LoadState(); ok {
-			r.MergeOverrides(state)
-		}
+		// Read state once per cycle: merge TUI overrides and preserve
+		// TUI-owned fields (LastPosition, SidebarWidth) for the save.
+		state, _ := LoadState()
+		r.MergeOverrides(state)
 
 		if panes, err := ListPanes(); err == nil {
 			r.Reconcile(panes)
 
-			// Read existing state to preserve TUI-owned fields (LastPosition, SidebarWidth).
-			state, _ := LoadState()
 			paneRefs := make([]*Pane, len(panes))
 			for i := range panes {
 				paneRefs[i] = &panes[i]

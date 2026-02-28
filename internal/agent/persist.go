@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -34,10 +35,12 @@ type LastPosition struct {
 	ScrollStart int    `json:"scroll_start"`
 }
 
+var stateDir sync.Once
+
 func statePath() string {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".local", "state", "agent-mux")
-	os.MkdirAll(dir, 0755)
+	stateDir.Do(func() { os.MkdirAll(dir, 0755) })
 	return filepath.Join(dir, "state.json")
 }
 

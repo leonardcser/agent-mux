@@ -118,11 +118,7 @@ func NewModel(tmuxSession string) Model {
 			if cp.LastActive != nil {
 				p.LastActive = *cp.LastActive
 			}
-			if cp.StatusOverride != nil {
-				p.Status = agent.PaneStatus(*cp.StatusOverride)
-			} else if cp.LastStatus != nil {
-				p.Status = agent.PaneStatus(*cp.LastStatus)
-			}
+			p.Status = m.reconciler.Status(cp.Target)
 			m.panes[cp.Target] = p
 		}
 		m.loaded = true
@@ -398,11 +394,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			default:
 				return m, nil
 			}
-			m.reconciler.Overrides[p.Target] = agent.StatusOverride{
-				Status:         p.Status,
-				WindowActivity: p.WindowActivity,
-			}
-			m.reconciler.PrevStatuses[p.Target] = p.Status
+			m.reconciler.SetOverride(p.Target, p.Status, p.WindowActivity)
 		}
 		return m, nil
 
@@ -460,9 +452,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if p := m.resolvePane(m.cursor); p != nil {
 				if p.Status == agent.StatusUnread {
 					p.Status = agent.StatusIdle
-					delete(m.reconciler.Overrides, p.Target)
-					delete(m.reconciler.PrevStatuses, p.Target)
-					delete(m.reconciler.PrevActivity, p.Target)
+					m.reconciler.ClearTarget(p.Target)
 				}
 				_ = agent.SwitchToPane(p.Target)
 			}

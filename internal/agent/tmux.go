@@ -73,9 +73,9 @@ func loadProcessTable() provider.ProcessTable {
 	return provider.ParseProcessTable(string(out))
 }
 
-// ListPanesBasic returns panes with StatusIdle (no status detection).
-// Used for instant initial display before async status detection kicks in.
-func ListPanesBasic() ([]Pane, error) {
+// fetchPanes runs the tmux query, process table snapshot, and history read
+// in parallel, then resolves agent panes and builds the Pane slice.
+func fetchPanes() ([]Pane, error) {
 	var (
 		tmuxOut []byte
 		tmuxErr error
@@ -121,65 +121,31 @@ func ListPanesBasic() ([]Pane, error) {
 	return panes, nil
 }
 
+// ListPanesBasic returns panes with StatusIdle (no enrichment or heuristics).
+// Used for instant initial display before async status detection kicks in.
+func ListPanesBasic() ([]Pane, error) {
+	return fetchPanes()
+}
+
 // ListPanes returns all tmux panes running a registered agent with full
-// status detection. Runs tmux list-panes, history read, and process table
-// snapshot in parallel, then checks attention heuristics per pane.
+// attention heuristics and git enrichment.
 func ListPanes() ([]Pane, error) {
-	var (
-		tmuxOut []byte
-		tmuxErr error
-		history map[string]time.Time
-		pt      provider.ProcessTable
-	)
-	var wg sync.WaitGroup
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
-		tmuxOut, tmuxErr = listTmuxPanes()
-	}()
-	go func() {
-		defer wg.Done()
-		history = LastActiveByProject()
-	}()
-	go func() {
-		defer wg.Done()
-		pt = loadProcessTable()
-	}()
-	wg.Wait()
-
-	if tmuxErr != nil {
-		return nil, fmt.Errorf("tmux list-panes: %w", tmuxErr)
-	}
-
-	raw := resolveAgentPanes(parseTmuxPanes(tmuxOut), &pt)
-
-	panes := make([]Pane, len(raw))
-	for i, r := range raw {
-		panes[i] = Pane{
-			Target:         r.target,
-			Session:        r.session,
-			Window:         r.window,
-			WindowName:     r.windowName,
-			Pane:           r.pane,
-			Path:           r.path,
-			PID:            r.pid,
-			Status:         StatusIdle,
-			WindowActivity: r.windowActivity,
-			LastActive:     history[r.path],
-		}
+	panes, err := fetchPanes()
+	if err != nil {
+		return nil, err
 	}
 
 	// Run attention heuristics and git enrichment concurrently.
-	var allWg sync.WaitGroup
-	allWg.Go(func() {
+	var wg sync.WaitGroup
+	wg.Go(func() {
 		EnrichPanes(panes)
 	})
 	for i := range panes {
-		allWg.Go(func() {
+		wg.Go(func() {
 			panes[i].HeuristicAttention = checkAttention(panes[i].Target)
 		})
 	}
-	allWg.Wait()
+	wg.Wait()
 	return panes, nil
 }
 
