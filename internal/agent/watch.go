@@ -44,9 +44,11 @@ func Watch(ctx context.Context) error {
 		if panes, err := ListPanes(); err == nil {
 			r.Reconcile(panes)
 
-			// Preserve stashed state from the previous save.
-			stashed := make(map[string]bool, len(state.Panes))
-			for _, cp := range state.Panes {
+			// Re-read state right before saving to pick up any stashed
+			// changes the TUI wrote while ListPanes was running.
+			fresh, _ := LoadState()
+			stashed := make(map[string]bool, len(fresh.Panes))
+			for _, cp := range fresh.Panes {
 				if cp.Stashed {
 					stashed[cp.Target] = true
 				}
