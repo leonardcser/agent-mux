@@ -456,7 +456,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if p := m.resolvePane(m.cursor); p != nil {
 				if p.Status == agent.StatusUnread {
 					p.Status = agent.StatusIdle
-					m.reconciler.ClearTarget(p.Target)
+					m.reconciler.SetOverride(p.Target, agent.StatusIdle, p.WindowActivity)
 				}
 				_ = agent.SwitchToPane(p.Target)
 			}

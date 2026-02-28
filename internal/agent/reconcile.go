@@ -136,10 +136,12 @@ func (r *Reconciler) MergeOverrides(state State) {
 		if _, exists := r.overrides[cp.Target]; exists {
 			continue
 		}
-		r.overrides[cp.Target] = StatusOverride{
+		ov := StatusOverride{
 			Status:         PaneStatus(*cp.StatusOverride),
 			WindowActivity: cp.WindowActivity,
 		}
+		r.overrides[cp.Target] = ov
+		r.prevStatuses[cp.Target] = ov.Status
 	}
 }
 

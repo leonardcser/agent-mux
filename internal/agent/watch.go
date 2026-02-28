@@ -54,8 +54,9 @@ func Watch(ctx context.Context) error {
 			r.Reconcile(panes)
 
 			// Re-read state right before saving to pick up any stashed
-			// changes the TUI wrote while ListPanes was running.
+			// or override changes the TUI wrote while ListPanes was running.
 			fresh, _ := LoadState()
+			r.MergeOverrides(fresh)
 			stashed := make(map[string]bool, len(fresh.Panes))
 			for _, cp := range fresh.Panes {
 				if cp.Stashed {
