@@ -17,6 +17,7 @@ import (
 type rawPane struct {
 	target, session, window, windowName, pane, path, cmd string
 	pid                                                  int
+	windowFocused                                        bool
 }
 
 // parseTmuxPanes parses tmux list-panes output into rawPane structs.
@@ -26,14 +27,14 @@ func parseTmuxPanes(out []byte) []rawPane {
 		if line == "" {
 			continue
 		}
-		fields := strings.SplitN(line, "\t", 5)
-		if len(fields) < 5 {
+		fields := strings.SplitN(line, "\t", 6)
+		if len(fields) < 6 {
 			continue
 		}
-		target, cmd, path, pidStr, windowName := fields[0], fields[1], fields[2], fields[3], fields[4]
+		target, cmd, path, pidStr, windowName, focused := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
 		pid, _ := strconv.Atoi(pidStr)
 		session, window, pane := ParseTarget(target)
-		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid})
+		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid, focused == "11"})
 	}
 	return raw
 }
@@ -60,7 +61,7 @@ var attentionRe = regexp.MustCompile(`Do you want to proceed\?|Do you want to al
 // listTmuxPanes runs tmux list-panes and returns raw output.
 func listTmuxPanes() ([]byte, error) {
 	return exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}").Output()
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{session_attached}").Output()
 }
 
 // loadProcessTable snapshots the process tree via a single ps call.
@@ -109,15 +110,16 @@ func fetchPanes() ([]Pane, error) {
 	panes := make([]Pane, len(raw))
 	for i, r := range raw {
 		panes[i] = Pane{
-			Target:     r.target,
-			Session:    r.session,
-			Window:     r.window,
-			WindowName: r.windowName,
-			Pane:       r.pane,
-			Path:       r.path,
-			PID:        r.pid,
-			Status:     StatusIdle,
-			LastActive: history[r.path],
+			Target:       r.target,
+			Session:      r.session,
+			Window:       r.window,
+			WindowName:   r.windowName,
+			Pane:         r.pane,
+			Path:         r.path,
+			PID:          r.pid,
+			Status:       StatusIdle,
+			WindowActive: r.windowFocused,
+			LastActive:   history[r.path],
 		}
 	}
 	return panes, nil

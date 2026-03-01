@@ -10,7 +10,8 @@ type StatusOverride struct {
 // Reconciler tracks per-pane activity and drives the status state machine:
 //
 //	Idle → Busy (content changed)
-//	Busy → Unread (content unchanged for 2 consecutive polls)
+//	Busy → Idle (content settled + user viewing window)
+//	Busy → Unread (content settled + user on different window)
 //	Busy → NeedsAttention (heuristic match)
 //	* → NeedsAttention (heuristic match, when not busy)
 //
@@ -104,6 +105,8 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 			if r.unchangedCount[p.Target] >= 2 {
 				if p.HeuristicAttention {
 					p.Status = StatusNeedsAttention
+				} else if p.WindowActive {
+					p.Status = StatusIdle
 				} else {
 					p.Status = StatusUnread
 				}
@@ -112,9 +115,14 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 			}
 		} else if p.HeuristicAttention {
 			p.Status = StatusNeedsAttention
-		} else if r.prevStatuses[p.Target] == StatusNeedsAttention ||
-			r.prevStatuses[p.Target] == StatusUnread {
-			p.Status = r.prevStatuses[p.Target]
+		} else if r.prevStatuses[p.Target] == StatusNeedsAttention {
+			p.Status = StatusNeedsAttention
+		} else if r.prevStatuses[p.Target] == StatusUnread {
+			if p.WindowActive {
+				p.Status = StatusIdle
+			} else {
+				p.Status = StatusUnread
+			}
 		}
 
 		if p.ContentHash != "" {

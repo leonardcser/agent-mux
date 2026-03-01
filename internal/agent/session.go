@@ -34,6 +34,7 @@ type Pane struct {
 	Status             PaneStatus
 	ContentHash        string
 	HeuristicAttention bool
+	WindowActive       bool
 	LastActive         time.Time
 	Stashed            bool
 }
