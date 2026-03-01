@@ -17,7 +17,7 @@ type CachedPane struct {
 	GitDirty       bool       `json:"gitDirty,omitempty"`
 	Stashed        bool       `json:"stashed"`
 	StatusOverride *int       `json:"statusOverride,omitempty"`
-	WindowActivity int64      `json:"windowActivity,omitempty"`
+	ContentHash    string     `json:"contentHash,omitempty"`
 	LastStatus     *int       `json:"lastStatus,omitempty"`
 	LastActive     *time.Time `json:"lastActive,omitempty"`
 }

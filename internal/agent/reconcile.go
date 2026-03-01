@@ -3,45 +3,47 @@ package agent
 // StatusOverride captures a user-toggled status that persists until the pane
 // produces new output.
 type StatusOverride struct {
-	Status         PaneStatus
-	WindowActivity int64
+	Status      PaneStatus
+	ContentHash string
 }
 
 // Reconciler tracks per-pane activity and drives the status state machine:
 //
-//	Idle → Busy (activity detected)
-//	Busy → Unread (activity stopped)
+//	Idle → Busy (content changed)
+//	Busy → Unread (content unchanged for 2 consecutive polls)
 //	Busy → NeedsAttention (heuristic match)
 //	* → NeedsAttention (heuristic match, when not busy)
 //
 // Both the TUI and the background watch daemon use this.
 type Reconciler struct {
-	prevActivity map[string]int64
-	prevStatuses map[string]PaneStatus
-	overrides    map[string]StatusOverride
+	prevContent    map[string]string
+	unchangedCount map[string]int
+	prevStatuses   map[string]PaneStatus
+	overrides      map[string]StatusOverride
 }
 
 func NewReconciler() *Reconciler {
 	return &Reconciler{
-		prevActivity: make(map[string]int64),
-		prevStatuses: make(map[string]PaneStatus),
-		overrides:    make(map[string]StatusOverride),
+		prevContent:    make(map[string]string),
+		unchangedCount: make(map[string]int),
+		prevStatuses:   make(map[string]PaneStatus),
+		overrides:      make(map[string]StatusOverride),
 	}
 }
 
 // SeedFromState restores tracking state from a persisted State.
 func (r *Reconciler) SeedFromState(state State) {
 	for _, cp := range state.Panes {
-		if cp.WindowActivity != 0 {
-			r.prevActivity[cp.Target] = cp.WindowActivity
+		if cp.ContentHash != "" {
+			r.prevContent[cp.Target] = cp.ContentHash
 		}
 		if cp.LastStatus != nil {
 			r.prevStatuses[cp.Target] = PaneStatus(*cp.LastStatus)
 		}
 		if cp.StatusOverride != nil {
 			r.overrides[cp.Target] = StatusOverride{
-				Status:         PaneStatus(*cp.StatusOverride),
-				WindowActivity: cp.WindowActivity,
+				Status:      PaneStatus(*cp.StatusOverride),
+				ContentHash: cp.ContentHash,
 			}
 		}
 	}
@@ -57,10 +59,10 @@ func (r *Reconciler) Status(target string) PaneStatus {
 
 // SetOverride records a user-toggled status that sticks until the pane
 // produces new output.
-func (r *Reconciler) SetOverride(target string, status PaneStatus, activity int64) {
+func (r *Reconciler) SetOverride(target string, status PaneStatus, contentHash string) {
 	r.overrides[target] = StatusOverride{
-		Status:         status,
-		WindowActivity: activity,
+		Status:      status,
+		ContentHash: contentHash,
 	}
 	r.prevStatuses[target] = status
 }
@@ -69,10 +71,11 @@ func (r *Reconciler) SetOverride(target string, status PaneStatus, activity int6
 func (r *Reconciler) ClearTarget(target string) {
 	delete(r.overrides, target)
 	delete(r.prevStatuses, target)
-	delete(r.prevActivity, target)
+	delete(r.prevContent, target)
+	delete(r.unchangedCount, target)
 }
 
-// Seed populates activity baselines from fresh panes without running the
+// Seed populates content baselines from fresh panes without running the
 // state machine. Preserves cached statuses so the first real Reconcile has
 // an accurate baseline. Called during the TUI's fast startup window.
 func (r *Reconciler) Seed(panes []Pane) {
@@ -80,7 +83,9 @@ func (r *Reconciler) Seed(panes []Pane) {
 	for i := range panes {
 		p := &panes[i]
 		alive[p.Target] = true
-		r.prevActivity[p.Target] = p.WindowActivity
+		if p.ContentHash != "" {
+			r.prevContent[p.Target] = p.ContentHash
+		}
 		if prev, ok := r.prevStatuses[p.Target]; ok {
 			p.Status = prev
 		}
@@ -96,30 +101,43 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 		p := &panes[i]
 		alive[p.Target] = true
 
+		contentChanged := p.ContentHash != "" && p.ContentHash != r.prevContent[p.Target]
+
 		if ov, ok := r.overrides[p.Target]; ok {
-			if p.WindowActivity > ov.WindowActivity {
+			if contentChanged {
 				delete(r.overrides, p.Target)
 			} else {
 				p.Status = ov.Status
-				r.prevActivity[p.Target] = p.WindowActivity
+				r.prevContent[p.Target] = p.ContentHash
 				r.prevStatuses[p.Target] = p.Status
 				continue
 			}
 		}
 
-		prev, seen := r.prevActivity[p.Target]
-		if seen && p.WindowActivity > prev {
+		if contentChanged {
 			p.Status = StatusBusy
+			r.unchangedCount[p.Target] = 0
+		} else if r.prevStatuses[p.Target] == StatusBusy {
+			r.unchangedCount[p.Target]++
+			if r.unchangedCount[p.Target] >= 2 {
+				if p.HeuristicAttention {
+					p.Status = StatusNeedsAttention
+				} else {
+					p.Status = StatusUnread
+				}
+			} else {
+				p.Status = StatusBusy
+			}
 		} else if p.HeuristicAttention {
 			p.Status = StatusNeedsAttention
-		} else if r.prevStatuses[p.Target] == StatusBusy {
-			p.Status = StatusUnread
 		} else if r.prevStatuses[p.Target] == StatusNeedsAttention ||
 			r.prevStatuses[p.Target] == StatusUnread {
 			p.Status = r.prevStatuses[p.Target]
 		}
 
-		r.prevActivity[p.Target] = p.WindowActivity
+		if p.ContentHash != "" {
+			r.prevContent[p.Target] = p.ContentHash
+		}
 		r.prevStatuses[p.Target] = p.Status
 	}
 	r.cleanup(alive)
@@ -137,15 +155,15 @@ func (r *Reconciler) MergeOverrides(state State) {
 			continue
 		}
 		ov := StatusOverride{
-			Status:         PaneStatus(*cp.StatusOverride),
-			WindowActivity: cp.WindowActivity,
+			Status:      PaneStatus(*cp.StatusOverride),
+			ContentHash: cp.ContentHash,
 		}
 		r.overrides[cp.Target] = ov
 		r.prevStatuses[cp.Target] = ov.Status
 	}
 }
 
-// ApplyToCache writes reconciler state (activity, statuses, overrides) onto
+// ApplyToCache writes reconciler state (content hash, statuses, overrides) onto
 // a slice of CachedPanes for persistence.
 func (r *Reconciler) ApplyToCache(panes []CachedPane) {
 	for i := range panes {
@@ -153,10 +171,10 @@ func (r *Reconciler) ApplyToCache(panes []CachedPane) {
 		if ov, ok := r.overrides[cp.Target]; ok {
 			s := int(ov.Status)
 			cp.StatusOverride = &s
-			cp.WindowActivity = ov.WindowActivity
+			cp.ContentHash = ov.ContentHash
 		}
-		if a, ok := r.prevActivity[cp.Target]; ok {
-			cp.WindowActivity = a
+		if h, ok := r.prevContent[cp.Target]; ok {
+			cp.ContentHash = h
 		}
 		if s, ok := r.prevStatuses[cp.Target]; ok {
 			v := int(s)
@@ -167,14 +185,14 @@ func (r *Reconciler) ApplyToCache(panes []CachedPane) {
 
 // cleanup removes tracking for panes that no longer exist.
 func (r *Reconciler) cleanup(alive map[string]bool) {
-	for target := range r.prevActivity {
+	for target := range r.prevContent {
 		if !alive[target] {
-			delete(r.prevActivity, target)
+			delete(r.prevContent, target)
+			delete(r.unchangedCount, target)
 			delete(r.prevStatuses, target)
 			delete(r.overrides, target)
 		}
 	}
-	// Catch orphaned overrides (e.g., merged from disk before the pane appeared).
 	for target := range r.overrides {
 		if !alive[target] {
 			delete(r.overrides, target)

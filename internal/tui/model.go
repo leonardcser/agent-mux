@@ -394,7 +394,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			default:
 				return m, nil
 			}
-			m.reconciler.SetOverride(p.Target, p.Status, p.WindowActivity)
+			m.reconciler.SetOverride(p.Target, p.Status, p.ContentHash)
 		}
 		return m, nil
 
@@ -456,7 +456,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if p := m.resolvePane(m.cursor); p != nil {
 				if p.Status == agent.StatusUnread {
 					p.Status = agent.StatusIdle
-					m.reconciler.SetOverride(p.Target, agent.StatusIdle, p.WindowActivity)
+					m.reconciler.SetOverride(p.Target, agent.StatusIdle, p.ContentHash)
 				}
 				_ = agent.SwitchToPane(p.Target)
 			}

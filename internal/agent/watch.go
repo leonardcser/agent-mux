@@ -40,7 +40,7 @@ func Watch(ctx context.Context) error {
 		r.SeedFromState(state)
 	}
 
-	const interval = 1 * time.Second
+	const interval = 500 * time.Millisecond
 
 	for {
 		start := time.Now()

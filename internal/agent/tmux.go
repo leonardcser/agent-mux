@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -15,7 +16,6 @@ import (
 type rawPane struct {
 	target, session, window, windowName, pane, path, cmd string
 	pid                                                  int
-	windowActivity                                       int64
 	heuristicAttention                                   bool
 }
 
@@ -26,17 +26,16 @@ func parseTmuxPanes(out []byte) []rawPane {
 		if line == "" {
 			continue
 		}
-		fields := strings.SplitN(line, "\t", 7)
-		if len(fields) < 7 {
+		fields := strings.SplitN(line, "\t", 6)
+		if len(fields) < 6 {
 			continue
 		}
-		target, cmd, path, pidStr, windowName, actStr, attnStr := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]
+		target, cmd, path, pidStr, windowName, attnStr := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
 		pid, _ := strconv.Atoi(pidStr)
-		activity, _ := strconv.ParseInt(actStr, 10, 64)
 		// #{C/r:...} returns "0" when not found, or a line number when found.
 		attention := attnStr != "" && attnStr != "0"
 		session, window, pane := ParseTarget(target)
-		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid, activity, attention})
+		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid, attention})
 	}
 	return raw
 }
@@ -71,7 +70,7 @@ const attentionPattern = `Do you want to proceed\?|Do you want to allow|Allow on
 // heuristics, eliminating the need for per-pane capture-pane calls.
 func listTmuxPanes() ([]byte, error) {
 	return exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_activity}\t#{C/r:"+attentionPattern+"}").Output()
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{C/r:"+attentionPattern+"}").Output()
 }
 
 // loadProcessTable snapshots the process tree via a single ps call.
@@ -128,11 +127,23 @@ func fetchPanes() ([]Pane, error) {
 			Path:               r.path,
 			PID:                r.pid,
 			Status:             StatusIdle,
-			WindowActivity:     r.windowActivity,
 			LastActive:         history[r.path],
 			HeuristicAttention: r.heuristicAttention,
 		}
 	}
+
+	// Capture last 10 lines of each pane in parallel for content-based
+	// activity detection.
+	var cwg sync.WaitGroup
+	for i := range panes {
+		cwg.Add(1)
+		go func(idx int) {
+			defer cwg.Done()
+			panes[idx].ContentHash = capturePaneHash(panes[idx].Target)
+		}(i)
+	}
+	cwg.Wait()
+
 	return panes, nil
 }
 
@@ -156,6 +167,17 @@ func ListPanes() ([]Pane, error) {
 	return panes, nil
 }
 
+
+// capturePaneHash captures the last 10 lines of a tmux pane and returns a
+// SHA-256 hash of the content. Used for content-based activity detection.
+func capturePaneHash(target string) string {
+	out, err := exec.Command("tmux", "capture-pane", "-t", target, "-p", "-S", "-10").Output()
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(out)
+	return fmt.Sprintf("%x", h[:8])
+}
 
 // CapturePane captures the visible content of a tmux pane.
 func CapturePane(target string, lines int) (string, error) {
