@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,7 +17,6 @@ import (
 type rawPane struct {
 	target, session, window, windowName, pane, path, cmd string
 	pid                                                  int
-	heuristicAttention                                   bool
 }
 
 // parseTmuxPanes parses tmux list-panes output into rawPane structs.
@@ -26,16 +26,14 @@ func parseTmuxPanes(out []byte) []rawPane {
 		if line == "" {
 			continue
 		}
-		fields := strings.SplitN(line, "\t", 6)
-		if len(fields) < 6 {
+		fields := strings.SplitN(line, "\t", 5)
+		if len(fields) < 5 {
 			continue
 		}
-		target, cmd, path, pidStr, windowName, attnStr := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
+		target, cmd, path, pidStr, windowName := fields[0], fields[1], fields[2], fields[3], fields[4]
 		pid, _ := strconv.Atoi(pidStr)
-		// #{C/r:...} returns "0" when not found, or a line number when found.
-		attention := attnStr != "" && attnStr != "0"
 		session, window, pane := ParseTarget(target)
-		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid, attention})
+		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid})
 	}
 	return raw
 }
@@ -56,21 +54,13 @@ func resolveAgentPanes(raw []rawPane, pt *provider.ProcessTable) []rawPane {
 	return agents
 }
 
-// attentionPattern is a combined regex for all attention heuristics, used
-// inline in the tmux format string via #{C/r:...} to avoid per-pane
-// capture-pane calls.
-// attentionPattern includes all fixed phrases plus a catch-all for lines
-// ending in "?" (the trailing-question heuristic). The original code excluded
-// lines starting with "❯" but #{C/r:...} searches the full history; this is
-// an acceptable trade-off since false positives from prompt lines are rare.
-const attentionPattern = `Do you want to proceed\?|Do you want to allow|Allow once|press Enter to approve|Enter to select|Type something|Esc to cancel|I'll wait for your|waiting for your response|Let me know when|Please let me know|What would you like|How would you like|Should I proceed|Would you like me to|please provide|please specify|I need more information|Could you clarify|awaiting your|ready when you are|let me know if you'd like|Feel free to ask|Is there anything else|What else can I help|Want me to|Shall I|Do you want me to|Ready to proceed`
+// attentionRe matches attention heuristic phrases in captured pane content.
+var attentionRe = regexp.MustCompile(`Do you want to proceed\?|Do you want to allow|Allow once|press Enter to approve|Enter to select|Type something|Esc to cancel|I'll wait for your|waiting for your response|Let me know when|Please let me know|What would you like|How would you like|Should I proceed|Would you like me to|please provide|please specify|I need more information|Could you clarify|awaiting your|ready when you are|let me know if you'd like|Feel free to ask|Is there anything else|What else can I help|Want me to|Shall I|Do you want me to|Ready to proceed`)
 
 // listTmuxPanes runs tmux list-panes and returns raw output.
-// The format includes an inline content search (#{C/r:...}) for attention
-// heuristics, eliminating the need for per-pane capture-pane calls.
 func listTmuxPanes() ([]byte, error) {
 	return exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{C/r:"+attentionPattern+"}").Output()
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}").Output()
 }
 
 // loadProcessTable snapshots the process tree via a single ps call.
@@ -119,64 +109,61 @@ func fetchPanes() ([]Pane, error) {
 	panes := make([]Pane, len(raw))
 	for i, r := range raw {
 		panes[i] = Pane{
-			Target:             r.target,
-			Session:            r.session,
-			Window:             r.window,
-			WindowName:         r.windowName,
-			Pane:               r.pane,
-			Path:               r.path,
-			PID:                r.pid,
-			Status:             StatusIdle,
-			LastActive:         history[r.path],
-			HeuristicAttention: r.heuristicAttention,
+			Target:     r.target,
+			Session:    r.session,
+			Window:     r.window,
+			WindowName: r.windowName,
+			Pane:       r.pane,
+			Path:       r.path,
+			PID:        r.pid,
+			Status:     StatusIdle,
+			LastActive: history[r.path],
 		}
 	}
-
-	// Capture last 10 lines of each pane in parallel for content-based
-	// activity detection.
-	var cwg sync.WaitGroup
-	for i := range panes {
-		cwg.Add(1)
-		go func(idx int) {
-			defer cwg.Done()
-			panes[idx].ContentHash = capturePaneHash(panes[idx].Target)
-		}(i)
-	}
-	cwg.Wait()
-
 	return panes, nil
 }
 
-// ListPanesBasic returns panes with StatusIdle (no enrichment or heuristics).
+// capturePaneContent captures the last 10 lines of a tmux pane and returns
+// a content hash and whether the content matches attention heuristics.
+func capturePaneContent(target string) (hash string, attention bool) {
+	out, err := exec.Command("tmux", "capture-pane", "-t", target, "-p", "-S", "-10").Output()
+	if err != nil {
+		return "", false
+	}
+	h := sha256.Sum256(out)
+	return fmt.Sprintf("%x", h[:8]), attentionRe.Match(out)
+}
+
+// CaptureContent populates ContentHash and HeuristicAttention on each pane
+// by capturing the last 10 lines in parallel.
+func CaptureContent(panes []Pane) {
+	var wg sync.WaitGroup
+	for i := range panes {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			panes[idx].ContentHash, panes[idx].HeuristicAttention = capturePaneContent(panes[idx].Target)
+		}(i)
+	}
+	wg.Wait()
+}
+
+// ListPanesBasic returns panes with StatusIdle (no content capture or enrichment).
 // Used for instant initial display before async status detection kicks in.
 func ListPanesBasic() ([]Pane, error) {
 	return fetchPanes()
 }
 
-// ListPanes returns all tmux panes running a registered agent with full
-// attention heuristics and git enrichment.
+// ListPanes returns all tmux panes running a registered agent with content
+// capture, attention heuristics, and git enrichment.
 func ListPanes() ([]Pane, error) {
 	panes, err := fetchPanes()
 	if err != nil {
 		return nil, err
 	}
-
-	// Attention heuristics are now resolved inline via #{C/r:...} in the
-	// tmux format string (see listTmuxPanes), so only git enrichment remains.
+	CaptureContent(panes)
 	EnrichPanes(panes)
 	return panes, nil
-}
-
-
-// capturePaneHash captures the last 10 lines of a tmux pane and returns a
-// SHA-256 hash of the content. Used for content-based activity detection.
-func capturePaneHash(target string) string {
-	out, err := exec.Command("tmux", "capture-pane", "-t", target, "-p", "-S", "-10").Output()
-	if err != nil {
-		return ""
-	}
-	h := sha256.Sum256(out)
-	return fmt.Sprintf("%x", h[:8])
 }
 
 // CapturePane captures the visible content of a tmux pane.

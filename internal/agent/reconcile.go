@@ -75,24 +75,6 @@ func (r *Reconciler) ClearTarget(target string) {
 	delete(r.unchangedCount, target)
 }
 
-// Seed populates content baselines from fresh panes without running the
-// state machine. Preserves cached statuses so the first real Reconcile has
-// an accurate baseline. Called during the TUI's fast startup window.
-func (r *Reconciler) Seed(panes []Pane) {
-	alive := make(map[string]bool, len(panes))
-	for i := range panes {
-		p := &panes[i]
-		alive[p.Target] = true
-		if p.ContentHash != "" {
-			r.prevContent[p.Target] = p.ContentHash
-		}
-		if prev, ok := r.prevStatuses[p.Target]; ok {
-			p.Status = prev
-		}
-	}
-	r.cleanup(alive)
-}
-
 // Reconcile runs the status state machine on a fresh set of panes.
 // Pane statuses are updated in place.
 func (r *Reconciler) Reconcile(panes []Pane) {

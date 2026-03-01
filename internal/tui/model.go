@@ -137,7 +137,9 @@ func NewModel(tmuxSession string) Model {
 	}
 	m.rebuildItems()
 
-	if stateOK && state.LastPosition.PaneTarget != "" {
+	if att := m.firstAttentionPane(); att >= 0 {
+		m.cursor = att
+	} else if stateOK && state.LastPosition.PaneTarget != "" {
 		if pos := m.findPaneByTarget(state.LastPosition.PaneTarget); pos >= 0 {
 			m.cursor = pos
 			m.scrollStart = state.LastPosition.ScrollStart
@@ -238,15 +240,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Seed during the fast startup window (500ms polls) instead of
-		// running the full state machine. window_activity has 1-second
-		// granularity, so sub-second polls would see identical timestamps
-		// and falsely transition Busy → Unread.
-		if m.refreshCount <= 3 {
-			m.reconciler.Seed(msg.panes)
-		} else {
-			m.reconciler.Reconcile(msg.panes)
-		}
+		m.reconciler.Reconcile(msg.panes)
 
 		// Rebuild pane map from fresh data.
 		newPanes := make(map[string]*agent.Pane, len(msg.panes))
