@@ -14,6 +14,7 @@ type StatusOverride struct {
 //	Busy → NeedsAttention (content settled + user not viewing, or heuristic match)
 //	* → NeedsAttention (heuristic match, when not busy)
 //
+// All maps are keyed by PaneID (tmux's stable pane identifier).
 // Both the TUI and the background watch daemon use this.
 type Reconciler struct {
 	prevContent    map[string]string
@@ -34,14 +35,15 @@ func NewReconciler() *Reconciler {
 // SeedFromState restores tracking state from a persisted State.
 func (r *Reconciler) SeedFromState(state State) {
 	for _, cp := range state.Panes {
+		id := cp.paneKey()
 		if cp.ContentHash != "" {
-			r.prevContent[cp.Target] = cp.ContentHash
+			r.prevContent[id] = cp.ContentHash
 		}
 		if cp.LastStatus != nil {
-			r.prevStatuses[cp.Target] = PaneStatus(*cp.LastStatus)
+			r.prevStatuses[id] = PaneStatus(*cp.LastStatus)
 		}
 		if cp.StatusOverride != nil {
-			r.overrides[cp.Target] = StatusOverride{
+			r.overrides[id] = StatusOverride{
 				Status:      PaneStatus(*cp.StatusOverride),
 				ContentHash: cp.ContentHash,
 			}
@@ -49,9 +51,9 @@ func (r *Reconciler) SeedFromState(state State) {
 	}
 }
 
-// Status returns the reconciler's tracked status for target, or StatusIdle.
-func (r *Reconciler) Status(target string) PaneStatus {
-	if s, ok := r.prevStatuses[target]; ok {
+// Status returns the reconciler's tracked status for a pane, or StatusIdle.
+func (r *Reconciler) Status(paneID string) PaneStatus {
+	if s, ok := r.prevStatuses[paneID]; ok {
 		return s
 	}
 	return StatusIdle
@@ -59,26 +61,26 @@ func (r *Reconciler) Status(target string) PaneStatus {
 
 // SetOverride records a user-toggled status. Unread overrides persist through
 // content changes; others clear on new output.
-func (r *Reconciler) SetOverride(target string, status PaneStatus, contentHash string) {
-	r.overrides[target] = StatusOverride{
+func (r *Reconciler) SetOverride(paneID string, status PaneStatus, contentHash string) {
+	r.overrides[paneID] = StatusOverride{
 		Status:      status,
 		ContentHash: contentHash,
 	}
-	r.prevStatuses[target] = status
+	r.prevStatuses[paneID] = status
 }
 
 // HasOverride reports whether target has an active user-set override.
-func (r *Reconciler) HasOverride(target string) bool {
-	_, ok := r.overrides[target]
+func (r *Reconciler) HasOverride(paneID string) bool {
+	_, ok := r.overrides[paneID]
 	return ok
 }
 
-// ClearTarget removes all tracking state for a pane (used when marking as read).
-func (r *Reconciler) ClearTarget(target string) {
-	delete(r.overrides, target)
-	delete(r.prevStatuses, target)
-	delete(r.prevContent, target)
-	delete(r.unchangedCount, target)
+// ClearPane removes all tracking state for a pane (used when marking as read).
+func (r *Reconciler) ClearPane(paneID string) {
+	delete(r.overrides, paneID)
+	delete(r.prevStatuses, paneID)
+	delete(r.prevContent, paneID)
+	delete(r.unchangedCount, paneID)
 }
 
 // Reconcile runs the status state machine on a fresh set of panes.
@@ -87,27 +89,28 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 	alive := make(map[string]bool, len(panes))
 	for i := range panes {
 		p := &panes[i]
-		alive[p.Target] = true
+		id := p.PaneID
+		alive[id] = true
 
-		contentChanged := p.ContentHash != "" && p.ContentHash != r.prevContent[p.Target]
+		contentChanged := p.ContentHash != "" && p.ContentHash != r.prevContent[id]
 
-		if ov, ok := r.overrides[p.Target]; ok {
+		if ov, ok := r.overrides[id]; ok {
 			if contentChanged && ov.Status != StatusUnread {
-				delete(r.overrides, p.Target)
+				delete(r.overrides, id)
 			} else {
 				p.Status = ov.Status
-				r.prevContent[p.Target] = p.ContentHash
-				r.prevStatuses[p.Target] = p.Status
+				r.prevContent[id] = p.ContentHash
+				r.prevStatuses[id] = p.Status
 				continue
 			}
 		}
 
 		if contentChanged {
 			p.Status = StatusBusy
-			r.unchangedCount[p.Target] = 0
-		} else if r.prevStatuses[p.Target] == StatusBusy {
-			r.unchangedCount[p.Target]++
-			if r.unchangedCount[p.Target] >= 2 {
+			r.unchangedCount[id] = 0
+		} else if r.prevStatuses[id] == StatusBusy {
+			r.unchangedCount[id]++
+			if r.unchangedCount[id] >= 2 {
 				if p.HeuristicAttention {
 					p.Status = StatusNeedsAttention
 				} else if p.WindowActive {
@@ -120,9 +123,9 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 			}
 		} else if p.HeuristicAttention {
 			p.Status = StatusNeedsAttention
-		} else if r.prevStatuses[p.Target] == StatusNeedsAttention {
+		} else if r.prevStatuses[id] == StatusNeedsAttention {
 			p.Status = StatusNeedsAttention
-		} else if r.prevStatuses[p.Target] == StatusUnread {
+		} else if r.prevStatuses[id] == StatusUnread {
 			if p.WindowActive {
 				p.Status = StatusIdle
 			} else {
@@ -131,9 +134,9 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 		}
 
 		if p.ContentHash != "" {
-			r.prevContent[p.Target] = p.ContentHash
+			r.prevContent[id] = p.ContentHash
 		}
-		r.prevStatuses[p.Target] = p.Status
+		r.prevStatuses[id] = p.Status
 	}
 	r.cleanup(alive)
 }
@@ -145,12 +148,41 @@ func (r *Reconciler) MergeOverrides(state State) {
 		if cp.StatusOverride == nil {
 			continue
 		}
+		id := cp.paneKey()
 		ov := StatusOverride{
 			Status:      PaneStatus(*cp.StatusOverride),
 			ContentHash: cp.ContentHash,
 		}
-		r.overrides[cp.Target] = ov
-		r.prevStatuses[cp.Target] = ov.Status
+		r.overrides[id] = ov
+		r.prevStatuses[id] = ov.Status
+	}
+}
+
+// MergeNewOverrides merges only overrides that appeared between two state reads.
+// Overrides already present in prev were processed by Reconcile; re-applying
+// them would undo cleared overrides (e.g. an Idle override cleared by content
+// change would be re-applied from the stale state file).
+func (r *Reconciler) MergeNewOverrides(prev, fresh State) {
+	existing := make(map[string]int, len(prev.Panes))
+	for _, cp := range prev.Panes {
+		if cp.StatusOverride != nil {
+			existing[cp.paneKey()] = *cp.StatusOverride
+		}
+	}
+	for _, cp := range fresh.Panes {
+		if cp.StatusOverride == nil {
+			continue
+		}
+		id := cp.paneKey()
+		if old, had := existing[id]; had && old == *cp.StatusOverride {
+			continue
+		}
+		ov := StatusOverride{
+			Status:      PaneStatus(*cp.StatusOverride),
+			ContentHash: cp.ContentHash,
+		}
+		r.overrides[id] = ov
+		r.prevStatuses[id] = ov.Status
 	}
 }
 
@@ -159,15 +191,16 @@ func (r *Reconciler) MergeOverrides(state State) {
 func (r *Reconciler) ApplyToCache(panes []CachedPane) {
 	for i := range panes {
 		cp := &panes[i]
-		if ov, ok := r.overrides[cp.Target]; ok {
+		id := cp.paneKey()
+		if ov, ok := r.overrides[id]; ok {
 			s := int(ov.Status)
 			cp.StatusOverride = &s
 			cp.ContentHash = ov.ContentHash
 		}
-		if h, ok := r.prevContent[cp.Target]; ok {
+		if h, ok := r.prevContent[id]; ok {
 			cp.ContentHash = h
 		}
-		if s, ok := r.prevStatuses[cp.Target]; ok {
+		if s, ok := r.prevStatuses[id]; ok {
 			v := int(s)
 			cp.LastStatus = &v
 		}
@@ -176,17 +209,17 @@ func (r *Reconciler) ApplyToCache(panes []CachedPane) {
 
 // cleanup removes tracking for panes that no longer exist.
 func (r *Reconciler) cleanup(alive map[string]bool) {
-	for target := range r.prevContent {
-		if !alive[target] {
-			delete(r.prevContent, target)
-			delete(r.unchangedCount, target)
-			delete(r.prevStatuses, target)
-			delete(r.overrides, target)
+	for id := range r.prevContent {
+		if !alive[id] {
+			delete(r.prevContent, id)
+			delete(r.unchangedCount, id)
+			delete(r.prevStatuses, id)
+			delete(r.overrides, id)
 		}
 	}
-	for target := range r.overrides {
-		if !alive[target] {
-			delete(r.overrides, target)
+	for id := range r.overrides {
+		if !alive[id] {
+			delete(r.overrides, id)
 		}
 	}
 }

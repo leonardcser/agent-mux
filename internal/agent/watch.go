@@ -53,20 +53,22 @@ func Watch(ctx context.Context) error {
 		if panes, err := ListPanes(); err == nil {
 			r.Reconcile(panes)
 
-			// Re-read state right before saving to pick up any stashed
-			// or override changes the TUI wrote while ListPanes was running.
+			// Re-read state to pick up stashed changes and any NEW overrides
+			// the TUI wrote while ListPanes was running. Only merge overrides
+			// that weren't in the first read—those were already processed by
+			// Reconcile and re-applying them would undo cleared overrides.
 			fresh, _ := LoadState()
-			r.MergeOverrides(fresh)
+			r.MergeNewOverrides(state, fresh)
 			stashed := make(map[string]bool, len(fresh.Panes))
 			for _, cp := range fresh.Panes {
 				if cp.Stashed {
-					stashed[cp.Target] = true
+					stashed[cp.paneKey()] = true
 				}
 			}
 
 			paneRefs := make([]*Pane, len(panes))
 			for i := range panes {
-				panes[i].Stashed = stashed[panes[i].Target]
+				panes[i].Stashed = stashed[panes[i].PaneID]
 				paneRefs[i] = &panes[i]
 			}
 			state.Panes = CachePanes(paneRefs)

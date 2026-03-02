@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"os/exec"
@@ -15,9 +16,9 @@ import (
 
 // rawPane holds parsed tmux pane info before status detection.
 type rawPane struct {
-	target, session, window, windowName, pane, path, cmd string
-	pid                                                  int
-	windowFocused                                        bool
+	paneID, target, session, window, windowName, pane, path, cmd string
+	pid                                                          int
+	windowFocused                                                bool
 }
 
 // parseTmuxPanes parses tmux list-panes output into rawPane structs.
@@ -27,14 +28,14 @@ func parseTmuxPanes(out []byte) []rawPane {
 		if line == "" {
 			continue
 		}
-		fields := strings.SplitN(line, "\t", 6)
-		if len(fields) < 6 {
+		fields := strings.SplitN(line, "\t", 7)
+		if len(fields) < 7 {
 			continue
 		}
-		target, cmd, path, pidStr, windowName, focused := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
+		target, cmd, path, pidStr, windowName, focused, paneID := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]
 		pid, _ := strconv.Atoi(pidStr)
 		session, window, pane := ParseTarget(target)
-		raw = append(raw, rawPane{target, session, window, windowName, pane, path, cmd, pid, focused == "11"})
+		raw = append(raw, rawPane{paneID, target, session, window, windowName, pane, path, cmd, pid, focused == "11"})
 	}
 	return raw
 }
@@ -61,7 +62,7 @@ var attentionRe = regexp.MustCompile(`Do you want to proceed\?|Do you want to al
 // listTmuxPanes runs tmux list-panes and returns raw output.
 func listTmuxPanes() ([]byte, error) {
 	return exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{session_attached}").Output()
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{session_attached}\t#{pane_id}").Output()
 }
 
 // loadProcessTable snapshots the process tree via a single ps call.
@@ -110,6 +111,7 @@ func fetchPanes() ([]Pane, error) {
 	panes := make([]Pane, len(raw))
 	for i, r := range raw {
 		panes[i] = Pane{
+			PaneID:       r.paneID,
 			Target:       r.target,
 			Session:      r.session,
 			Window:       r.window,
@@ -132,8 +134,9 @@ func capturePaneContent(target string) (hash string, attention bool) {
 	if err != nil {
 		return "", false
 	}
-	h := sha256.Sum256(out)
-	return fmt.Sprintf("%x", h[:8]), attentionRe.Match(out)
+	content := bytes.TrimRight(out, "\n")
+	h := sha256.Sum256(content)
+	return fmt.Sprintf("%x", h[:8]), attentionRe.Match(content)
 }
 
 // CaptureContent populates ContentHash and HeuristicAttention on each pane

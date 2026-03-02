@@ -20,7 +20,7 @@ const (
 // TreeItem is one visible row in the flattened tree.
 type TreeItem struct {
 	Kind        ItemKind
-	Target      string // pane target (KindPane) or first pane target in workspace (KindWorkspace)
+	PaneID      string // stable tmux pane id (KindPane) or first pane id in workspace (KindWorkspace)
 	HeaderTitle string // for KindSectionHeader
 }
 
@@ -162,7 +162,7 @@ func (m Model) renderTreeItem(item TreeItem, selected bool, width int) string {
 		return stashedSectionStyle.Render("─" + label + strings.Repeat("─", lineLen))
 	}
 
-	p := m.panes[item.Target]
+	p := m.panes[item.PaneID]
 	if p == nil {
 		return ""
 	}

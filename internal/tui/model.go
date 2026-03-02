@@ -17,7 +17,7 @@ type panesLoadedMsg struct {
 }
 
 type previewLoadedMsg struct {
-	target  string
+	paneID  string
 	content string
 	gen     int
 }
@@ -51,13 +51,13 @@ func loadPanes() tea.Msg {
 	return panesLoadedMsg{panes: panes, err: err}
 }
 
-func loadPreview(target string, lines int, gen int) tea.Cmd {
+func loadPreview(target, paneID string, lines, gen int) tea.Cmd {
 	return func() tea.Msg {
 		content, err := agent.CapturePane(target, lines)
 		if err != nil {
 			content = "error: " + err.Error()
 		}
-		return previewLoadedMsg{target: target, content: content, gen: gen}
+		return previewLoadedMsg{paneID: paneID, content: content, gen: gen}
 	}
 }
 
@@ -102,8 +102,13 @@ func NewModel(tmuxSession string) Model {
 	if stateOK {
 		m.reconciler.SeedFromState(state)
 		for _, cp := range state.Panes {
+			id := cp.PaneID
+			if id == "" {
+				id = cp.Target // backward compat with old state files
+			}
 			session, window, pane := agent.ParseTarget(cp.Target)
 			p := &agent.Pane{
+				PaneID:     id,
 				Target:     cp.Target,
 				Session:    session,
 				Window:     window,
@@ -118,8 +123,8 @@ func NewModel(tmuxSession string) Model {
 			if cp.LastActive != nil {
 				p.LastActive = *cp.LastActive
 			}
-			p.Status = m.reconciler.Status(cp.Target)
-			m.panes[cp.Target] = p
+			p.Status = m.reconciler.Status(id)
+			m.panes[id] = p
 		}
 		m.loaded = true
 	} else {
@@ -131,7 +136,7 @@ func NewModel(tmuxSession string) Model {
 		}
 		agent.EnrichPanes(panes)
 		for i := range panes {
-			m.panes[panes[i].Target] = &panes[i]
+			m.panes[panes[i].PaneID] = &panes[i]
 		}
 		m.loaded = true
 	}
@@ -139,8 +144,12 @@ func NewModel(tmuxSession string) Model {
 
 	if att := m.firstAttentionPane(); att >= 0 {
 		m.cursor = att
-	} else if stateOK && state.LastPosition.PaneTarget != "" {
-		if pos := m.findPaneByTarget(state.LastPosition.PaneTarget); pos >= 0 {
+	} else if stateOK && (state.LastPosition.PaneID != "" || state.LastPosition.PaneTarget != "") {
+		posID := state.LastPosition.PaneID
+		if posID == "" {
+			posID = state.LastPosition.PaneTarget
+		}
+		if pos := m.findPaneByID(posID); pos >= 0 {
 			m.cursor = pos
 			m.scrollStart = state.LastPosition.ScrollStart
 		} else {
@@ -183,9 +192,9 @@ func (m *Model) rebuildItems() {
 		}
 		if p.Path != prevPath {
 			prevPath = p.Path
-			items = append(items, TreeItem{Kind: KindWorkspace, Target: p.Target})
+			items = append(items, TreeItem{Kind: KindWorkspace, PaneID: p.PaneID})
 		}
-		items = append(items, TreeItem{Kind: KindPane, Target: p.Target})
+		items = append(items, TreeItem{Kind: KindPane, PaneID: p.PaneID})
 	}
 	m.items = items
 }
@@ -195,13 +204,13 @@ func (m Model) resolvePane(idx int) *agent.Pane {
 	if idx < 0 || idx >= len(m.items) || m.items[idx].Kind != KindPane {
 		return nil
 	}
-	return m.panes[m.items[idx].Target]
+	return m.panes[m.items[idx].PaneID]
 }
 
-// findPaneByTarget returns the item index for the given target, or -1.
-func (m Model) findPaneByTarget(target string) int {
+// findPaneByID returns the item index for the given pane ID, or -1.
+func (m Model) findPaneByID(paneID string) int {
 	for i, item := range m.items {
-		if item.Kind == KindPane && item.Target == target {
+		if item.Kind == KindPane && item.PaneID == paneID {
 			return i
 		}
 	}
@@ -234,9 +243,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Preserve stashed state before reconciliation.
 		stashed := make(map[string]bool, len(m.panes))
-		for target, p := range m.panes {
+		for id, p := range m.panes {
 			if p.Stashed {
-				stashed[target] = true
+				stashed[id] = true
 			}
 		}
 
@@ -246,8 +255,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		newPanes := make(map[string]*agent.Pane, len(msg.panes))
 		for i := range msg.panes {
 			p := &msg.panes[i]
-			p.Stashed = stashed[p.Target]
-			newPanes[p.Target] = p
+			p.Stashed = stashed[p.PaneID]
+			newPanes[p.PaneID] = p
 		}
 		m.panes = newPanes
 
@@ -267,7 +276,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen != m.previewGen {
 			return m, nil
 		}
-		m.previewFor = msg.target
+		m.previewFor = msg.paneID
 		content := strings.TrimRight(msg.content, "\n")
 		if content != m.lastPreviewContent {
 			m.lastPreviewContent = content
@@ -388,7 +397,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			default:
 				return m, nil
 			}
-			m.reconciler.SetOverride(p.Target, p.Status, p.ContentHash)
+			m.reconciler.SetOverride(p.PaneID, p.Status, p.ContentHash)
 		}
 		return m, nil
 
@@ -448,9 +457,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", "q", "esc", "ctrl+c":
 		if key == "enter" {
 			if p := m.resolvePane(m.cursor); p != nil {
-				if p.Status == agent.StatusUnread && !m.reconciler.HasOverride(p.Target) {
+				if p.Status == agent.StatusUnread && !m.reconciler.HasOverride(p.PaneID) {
 					p.Status = agent.StatusIdle
-					m.reconciler.SetOverride(p.Target, agent.StatusIdle, p.ContentHash)
+					m.reconciler.SetOverride(p.PaneID, agent.StatusIdle, p.ContentHash)
 				}
 				_ = agent.SwitchToPane(p.Target)
 			}
@@ -535,11 +544,13 @@ func (m *Model) saveState() {
 		cursor = att
 		scrollStart = 0
 	}
-	var paneTarget string
+	var paneID, paneTarget string
 	if p := m.resolvePane(cursor); p != nil {
+		paneID = p.PaneID
 		paneTarget = p.Target
 	}
 	m.state.LastPosition = agent.LastPosition{
+		PaneID:      paneID,
 		PaneTarget:  paneTarget,
 		Cursor:      cursor,
 		ScrollStart: scrollStart,
@@ -554,7 +565,7 @@ func (m Model) firstAttentionPane() int {
 		if item.Kind != KindPane {
 			continue
 		}
-		p := m.panes[item.Target]
+		p := m.panes[item.PaneID]
 		if p != nil && !p.Stashed && (p.Status == agent.StatusNeedsAttention || p.Status == agent.StatusUnread) {
 			return i
 		}
@@ -674,12 +685,12 @@ func (m Model) previewCmd() tea.Cmd {
 	if p == nil {
 		return nil
 	}
-	if p.Target == m.previewFor {
+	if p.PaneID == m.previewFor {
 		return nil
 	}
 	lines := m.height
 	if lines <= 0 {
 		lines = 50
 	}
-	return loadPreview(p.Target, lines, m.previewGen)
+	return loadPreview(p.Target, p.PaneID, lines, m.previewGen)
 }

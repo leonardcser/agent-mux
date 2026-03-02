@@ -21,6 +21,7 @@ const (
 
 // Pane represents a tmux pane running an AI coding agent.
 type Pane struct {
+	PaneID             string // stable tmux pane id, e.g. "%42"
 	Target             string // e.g. "main:2.1"
 	Session            string
 	Window             string

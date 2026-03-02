@@ -9,6 +9,7 @@ import (
 )
 
 type CachedPane struct {
+	PaneID         string     `json:"paneID,omitempty"`
 	Target         string     `json:"target"`
 	WindowName     string     `json:"windowName,omitempty"`
 	Path           string     `json:"path"`
@@ -30,9 +31,19 @@ type State struct {
 }
 
 type LastPosition struct {
+	PaneID      string `json:"pane_id,omitempty"`
 	PaneTarget  string `json:"pane_target"`
 	Cursor      int    `json:"cursor"`
 	ScrollStart int    `json:"scroll_start"`
+}
+
+// paneKey returns the stable identity key for a cached pane.
+// Uses PaneID when available, falling back to Target for old state files.
+func (cp CachedPane) paneKey() string {
+	if cp.PaneID != "" {
+		return cp.PaneID
+	}
+	return cp.Target
 }
 
 var stateDir sync.Once
@@ -77,6 +88,7 @@ func CachePanes(panes []*Pane) []CachedPane {
 	cached := make([]CachedPane, len(panes))
 	for i, p := range panes {
 		cp := CachedPane{
+			PaneID:     p.PaneID,
 			Target:     p.Target,
 			WindowName: p.WindowName,
 			Path:       p.Path,
