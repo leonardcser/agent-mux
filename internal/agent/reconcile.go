@@ -1,5 +1,7 @@
 package agent
 
+import "time"
+
 // StatusOverride captures a user-toggled status. Unread overrides persist
 // through content changes (manual bookmark); others clear on new output.
 type StatusOverride struct {
@@ -21,6 +23,7 @@ type Reconciler struct {
 	unchangedCount map[string]int
 	prevStatuses   map[string]PaneStatus
 	overrides      map[string]StatusOverride
+	lastActive     map[string]time.Time
 }
 
 func NewReconciler() *Reconciler {
@@ -29,6 +32,7 @@ func NewReconciler() *Reconciler {
 		unchangedCount: make(map[string]int),
 		prevStatuses:   make(map[string]PaneStatus),
 		overrides:      make(map[string]StatusOverride),
+		lastActive:     make(map[string]time.Time),
 	}
 }
 
@@ -47,6 +51,9 @@ func (r *Reconciler) SeedFromState(state State) {
 				Status:      PaneStatus(*cp.StatusOverride),
 				ContentHash: cp.ContentHash,
 			}
+		}
+		if cp.LastActive != nil {
+			r.lastActive[id] = *cp.LastActive
 		}
 	}
 }
@@ -86,6 +93,7 @@ func (r *Reconciler) ClearPane(paneID string) {
 // Reconcile runs the status state machine on a fresh set of panes.
 // Pane statuses are updated in place.
 func (r *Reconciler) Reconcile(panes []Pane) {
+	now := time.Now()
 	alive := make(map[string]bool, len(panes))
 	for i := range panes {
 		p := &panes[i]
@@ -93,6 +101,14 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 		alive[id] = true
 
 		contentChanged := p.ContentHash != "" && p.ContentHash != r.prevContent[id]
+
+		// Track per-pane activity: update on content change, apply if tracked.
+		if contentChanged {
+			r.lastActive[id] = now
+		}
+		if t, ok := r.lastActive[id]; ok {
+			p.LastActive = t
+		}
 
 		if ov, ok := r.overrides[id]; ok {
 			if contentChanged && ov.Status != StatusUnread {
@@ -204,6 +220,9 @@ func (r *Reconciler) ApplyToCache(panes []CachedPane) {
 			v := int(s)
 			cp.LastStatus = &v
 		}
+		if t, ok := r.lastActive[id]; ok {
+			cp.LastActive = &t
+		}
 	}
 }
 
@@ -215,6 +234,7 @@ func (r *Reconciler) cleanup(alive map[string]bool) {
 			delete(r.unchangedCount, id)
 			delete(r.prevStatuses, id)
 			delete(r.overrides, id)
+			delete(r.lastActive, id)
 		}
 	}
 	for id := range r.overrides {

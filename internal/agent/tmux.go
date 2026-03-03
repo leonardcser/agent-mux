@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/leo/agent-mux/internal/provider"
 )
@@ -78,24 +77,20 @@ func loadProcessTable() provider.ProcessTable {
 	return provider.ParseProcessTable(string(out))
 }
 
-// fetchPanes runs the tmux query, process table snapshot, and history read
-// in parallel, then resolves agent panes and builds the Pane slice.
+// fetchPanes runs the tmux query and process table snapshot in parallel,
+// then resolves agent panes and builds the Pane slice.
+// LastActive is not set here; the Reconciler tracks it per pane.
 func fetchPanes() ([]Pane, error) {
 	var (
 		tmuxOut []byte
 		tmuxErr error
-		history map[string]time.Time
 		pt      provider.ProcessTable
 	)
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		tmuxOut, tmuxErr = listTmuxPanes()
-	}()
-	go func() {
-		defer wg.Done()
-		history = LastActiveByProject()
 	}()
 	go func() {
 		defer wg.Done()
@@ -121,7 +116,6 @@ func fetchPanes() ([]Pane, error) {
 			PID:          r.pid,
 			Status:       StatusIdle,
 			WindowActive: r.windowFocused,
-			LastActive:   history[r.path],
 		}
 	}
 	return panes, nil

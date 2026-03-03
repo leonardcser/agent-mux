@@ -221,7 +221,7 @@ func renderPaneRow(p *agent.Pane, selected bool, width int) string {
 
 	prefix := "   "
 	right := ""
-	if !p.LastActive.IsZero() {
+	if !p.LastActive.IsZero() && p.Status != agent.StatusBusy {
 		right = " " + formatElapsed(time.Since(p.LastActive)) + " "
 	}
 	middle := label
