@@ -34,7 +34,7 @@ func parseTmuxPanes(out []byte) []rawPane {
 		target, cmd, path, pidStr, windowName, focused, paneID := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]
 		pid, _ := strconv.Atoi(pidStr)
 		session, window, pane := ParseTarget(target)
-		raw = append(raw, rawPane{paneID, target, session, window, windowName, pane, path, cmd, pid, focused == "11"})
+		raw = append(raw, rawPane{paneID, target, session, window, windowName, pane, path, cmd, pid, focused == "111"})
 	}
 	return raw
 }
@@ -61,7 +61,7 @@ var attentionRe = regexp.MustCompile(`Do you want to proceed\?|Do you want to al
 // listTmuxPanes runs tmux list-panes and returns raw output.
 func listTmuxPanes() ([]byte, error) {
 	return exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{session_attached}\t#{pane_id}").Output()
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{session_attached}#{pane_active}\t#{pane_id}").Output()
 }
 
 // loadProcessTable snapshots the process tree via a single ps call.

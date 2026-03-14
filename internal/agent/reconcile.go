@@ -121,8 +121,11 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 			}
 		}
 
-		if contentChanged {
+		if contentChanged && !p.WindowActive {
 			p.Status = StatusBusy
+			r.unchangedCount[id] = 0
+		} else if contentChanged {
+			// Active pane: content changed but user is viewing it, stay idle.
 			r.unchangedCount[id] = 0
 		} else if r.prevStatuses[id] == StatusBusy {
 			r.unchangedCount[id]++
