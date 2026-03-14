@@ -111,7 +111,7 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 		}
 
 		if ov, ok := r.overrides[id]; ok {
-			if contentChanged && ov.Status != StatusUnread {
+			if contentChanged {
 				delete(r.overrides, id)
 			} else {
 				p.Status = ov.Status

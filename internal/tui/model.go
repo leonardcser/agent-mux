@@ -398,6 +398,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.reconciler.SetOverride(p.PaneID, p.Status, p.ContentHash)
+			m.saveState()
 		}
 		return m, nil
 
