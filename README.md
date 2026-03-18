@@ -3,20 +3,40 @@
 A TUI for multiplexing AI coding agent sessions in tmux.
 
 Lists all active agent panes (Claude Code, Open Code, Gemini CLI, Codex CLI)
-grouped by workspace,
-with a live preview panel showing each session's output. Select a session and
-press enter to jump to it.
+grouped by workspace, with a live preview panel showing each session's output.
+Select a session and press enter to jump to it.
+
+<p align="center">
+  <img src="assets/demo.gif" alt="agent-mux demo" />
+</p>
 
 ## Requirements
 
 - Go 1.25+
 - tmux (must be run inside a tmux session)
 
-## Install
+## Setup
+
+### Install
 
 ```
 go install
 ```
+
+### Configure tmux
+
+Add to your `~/.tmux.conf` to start the background watcher and set up a key
+binding:
+
+```tmux
+run-shell -b "agent-mux watch"
+bind j run-shell "tmux neww agent-mux"
+```
+
+The watcher polls session statuses every 2s, so the TUI opens instantly with
+accurate statuses.
+
+Reload tmux: `tmux source-file ~/.tmux.conf`
 
 ## Usage
 
@@ -26,25 +46,7 @@ From inside tmux:
 agent-mux
 ```
 
-### Background watcher
-
-`agent-mux watch` runs a background daemon that polls session statuses every 2s
-and writes them to disk. This means the TUI opens instantly with accurate
-statuses instead of needing a few seconds to detect activity.
-
-Add to your `~/.tmux.conf` to start the watcher automatically with tmux:
-
-```tmux
-run-shell -b "agent-mux watch"
-```
-
-### tmux binding
-
-Add to your `~/.tmux.conf` to open agent-mux with `prefix + j`:
-
-```tmux
-bind j run-shell "tmux neww agent-mux"
-```
+Or use the key binding: `prefix + j`
 
 ### Keys
 
