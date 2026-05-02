@@ -8,57 +8,85 @@ import (
 // ProcessTable holds a snapshot of the system process tree.
 type ProcessTable struct {
 	Children map[int][]int  // ppid -> child pids
-	Comm     map[int]string // pid -> command basename
-	Args     map[int]string // pid -> full command line args
+	Comm     map[int]string // pid -> executable/command string
+	Args     map[int]string // pid -> full command line
 }
 
 var registry = map[string]bool{}
 
 func init() {
-	for _, cmd := range []string{"smelt", "claude", "codex", "gemini", "opencode", "ralph"} {
+	for _, cmd := range []string{"smelt", "claude", "codex", "gemini", "opencode", "ralph", "kimi"} {
 		Register(cmd)
 	}
 }
 
 // Register adds an agent command name to the global registry.
 func Register(cmd string) {
-	registry[cmd] = true
+	normalized := normalize(cmd)
+	if normalized != "" {
+		registry[normalized] = true
+	}
 }
 
 // IsAgent returns true if the command matches a registered provider.
 func IsAgent(cmd string) bool {
-	return registry[cmd]
+	return resolveRegistered(cmd) != ""
 }
 
 // Resolve returns the provider command name for a tmux pane. It first checks
 // the direct command, then falls back to inspecting children of the shell
 // process via the process table (handles cases like gemini running as "node").
 func Resolve(cmd string, shellPID int, pt *ProcessTable) string {
-	if registry[cmd] {
-		return cmd
+	if matched := resolveRegistered(cmd); matched != "" {
+		return matched
 	}
 	for _, childPID := range pt.Children[shellPID] {
 		comm := pt.Comm[childPID]
-		base := comm
-		if idx := strings.LastIndex(comm, "/"); idx >= 0 {
-			base = comm[idx+1:]
+		if matched := resolveRegistered(comm); matched != "" {
+			return matched
 		}
-		if registry[base] {
-			return base
+		args := pt.Args[childPID]
+		if matched := resolveRegistered(args); matched != "" {
+			return matched
 		}
-		for arg := range strings.SplitSeq(pt.Args[childPID], " ") {
+		for arg := range strings.SplitSeq(args, " ") {
 			if idx := strings.LastIndex(arg, "/"); idx >= 0 {
 				arg = arg[idx+1:]
 			}
-			if registry[arg] {
-				return arg
+			if matched := resolveRegistered(arg); matched != "" {
+				return matched
 			}
 		}
 	}
 	return ""
 }
 
-// ParseProcessTable builds a ProcessTable from raw `ps -eo pid,ppid,comm,args` output.
+func normalize(cmd string) string {
+	return strings.ToLower(strings.TrimSpace(cmd))
+}
+
+func resolveRegistered(cmd string) string {
+	normalized := normalize(cmd)
+	if normalized == "" {
+		return ""
+	}
+	for registered := range registry {
+		if strings.Contains(normalized, registered) {
+			return registered
+		}
+	}
+	if idx := strings.LastIndex(normalized, "/"); idx >= 0 {
+		base := normalized[idx+1:]
+		for registered := range registry {
+			if strings.Contains(base, registered) {
+				return registered
+			}
+		}
+	}
+	return ""
+}
+
+// ParseProcessTable builds a ProcessTable from raw `ps -eo pid=,ppid=,command=` output.
 func ParseProcessTable(out string) ProcessTable {
 	pt := ProcessTable{
 		Children: make(map[int][]int),
@@ -66,6 +94,10 @@ func ParseProcessTable(out string) ProcessTable {
 		Args:     make(map[int]string),
 	}
 	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
 			continue
@@ -75,11 +107,11 @@ func ParseProcessTable(out string) ProcessTable {
 		if err1 != nil || err2 != nil {
 			continue
 		}
+		cmdline := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+		cmdline = strings.TrimSpace(strings.TrimPrefix(cmdline, fields[1]))
 		pt.Children[ppid] = append(pt.Children[ppid], pid)
+		pt.Args[pid] = cmdline
 		pt.Comm[pid] = fields[2]
-		if len(fields) > 3 {
-			pt.Args[pid] = strings.Join(fields[3:], " ")
-		}
 	}
 	return pt
 }

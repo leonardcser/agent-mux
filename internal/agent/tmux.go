@@ -66,7 +66,7 @@ func listTmuxPanes() ([]byte, error) {
 
 // loadProcessTable snapshots the process tree via a single ps call.
 func loadProcessTable() provider.ProcessTable {
-	out, err := exec.Command("ps", "-eo", "pid,ppid,comm,args").Output()
+	out, err := exec.Command("ps", "-eo", "pid=,ppid=,command=").Output()
 	if err != nil {
 		return provider.ProcessTable{
 			Children: make(map[int][]int),

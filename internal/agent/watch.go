@@ -108,11 +108,24 @@ func RestartWatch() error {
 	lockPath := watchLockPath()
 
 	// Kill existing watcher by reading its PID from the lock file.
+	var oldProc *os.Process
 	if data, err := os.ReadFile(lockPath); err == nil {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
 			if proc, err := os.FindProcess(pid); err == nil {
 				_ = proc.Signal(syscall.SIGTERM)
+				oldProc = proc
 			}
+		}
+	}
+
+	// Wait briefly for the old process to exit so it can't race with us
+	// and overwrite state after we've started.
+	if oldProc != nil {
+		for i := 0; i < 20; i++ {
+			if err := oldProc.Signal(syscall.Signal(0)); err != nil {
+				break // process is gone
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 
