@@ -70,6 +70,8 @@ pub fn refresh_once() -> Result<()> {
 }
 
 fn refresh_once_with(reconciler: &mut Reconciler, enrich_git: bool) -> Result<()> {
+    write_heartbeat()?;
+
     let previous = load_snapshot();
     let ui_state = load_ui_state();
     reconciler.merge_overrides(&ui_state);

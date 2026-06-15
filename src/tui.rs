@@ -29,6 +29,7 @@ const SEPARATOR: PaintId = PaintId(2);
 const PREVIEW: PaintId = PaintId(3);
 const MIN_SIDEBAR: u16 = 20;
 const MIN_PREVIEW: u16 = 20;
+const SYNCING_MSG: &str = "syncing agent-mux snapshot";
 
 #[derive(Clone, Debug)]
 enum Hit {
@@ -116,7 +117,13 @@ fn run_loop(
                 } => {
                     panes_pending = false;
                     if let Some(err) = err {
-                        app.err = Some(err);
+                        if err == SYNCING_MSG && app.has_display_snapshot() {
+                            if app.err.as_deref() == Some(SYNCING_MSG) {
+                                app.err = None;
+                            }
+                        } else {
+                            app.err = Some(err);
+                        }
                     } else {
                         app.err = None;
                         app.hide_pending_kills(&mut panes);
@@ -229,7 +236,7 @@ fn spawn_load_panes(tx: &mpsc::Sender<Msg>) {
                 panes: Vec::new(),
                 snapshot_generation: 0,
                 ui_state,
-                err: Some("syncing agent-mux snapshot".into()),
+                err: Some(SYNCING_MSG.into()),
             });
             return;
         };
@@ -389,9 +396,7 @@ impl App {
             pending_d: false,
             pending_g: false,
             count: 0,
-            err: snapshot
-                .is_none()
-                .then(|| "syncing agent-mux snapshot".to_string()),
+            err: snapshot.is_none().then(|| SYNCING_MSG.to_string()),
             ui_state,
             pending_overrides: HashMap::new(),
             pending_kills: HashMap::new(),
@@ -525,6 +530,10 @@ impl App {
             (!p.stashed && matches!(p.status, PaneStatus::NeedsAttention | PaneStatus::Unread))
                 .then_some(i)
         })
+    }
+
+    fn has_display_snapshot(&self) -> bool {
+        self.snapshot_generation > 0 || !self.panes.is_empty() || !self.pending_kills.is_empty()
     }
 
     fn remove_current_pane(&mut self) -> Option<(String, String)> {
