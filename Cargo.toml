@@ -1,0 +1,18 @@
+[package]
+name = "agent-mux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = { version = "0.4.45", features = ["serde"] }
+crossterm = "0.29.0"
+ctrlc = "3.5.2"
+fs2 = "0.4.3"
+regex = "1.12.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+smelt-ansi = "0.1.0"
+smelt-term = "0.2.0"
+unicode-width = "0.2.2"

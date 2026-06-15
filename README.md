@@ -12,7 +12,7 @@ Select a session and press enter to jump to it.
 
 ## Requirements
 
-- Go 1.25+
+- Rust 1.85+
 - tmux (must be run inside a tmux session)
 
 ## Setup
@@ -20,7 +20,19 @@ Select a session and press enter to jump to it.
 ### Install
 
 ```
-go install
+cargo install --path .
+```
+
+### Run from source
+
+```
+cargo run --release
+```
+
+Run the watcher directly:
+
+```
+cargo run --release -- watch
 ```
 
 ### Configure tmux
