@@ -43,6 +43,8 @@ func main() {
 	tmux := os.Getenv("TMUX")
 	sessionID := filepath.Base(tmux)
 
+	_ = agent.StartWatch()
+
 	p := tea.NewProgram(tui.NewModel(sessionID), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

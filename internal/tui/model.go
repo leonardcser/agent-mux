@@ -12,8 +12,10 @@ import (
 )
 
 type panesLoadedMsg struct {
-	panes []agent.Pane
-	err   error
+	panes   []agent.Pane
+	state   agent.State
+	stateOK bool
+	err     error
 }
 
 type previewLoadedMsg struct {
@@ -34,10 +36,7 @@ func previewTickCmd(gen int) tea.Cmd {
 }
 
 func (m Model) pollInterval() time.Duration {
-	if m.refreshCount <= 2 {
-		return 500 * time.Millisecond
-	}
-	return 2 * time.Second
+	return 500 * time.Millisecond
 }
 
 func panesTickCmd(d time.Duration) tea.Cmd {
@@ -47,7 +46,16 @@ func panesTickCmd(d time.Duration) tea.Cmd {
 }
 
 func loadPanes() tea.Msg {
-	panes, err := agent.ListPanes()
+	if state, ok := agent.LoadState(); ok {
+		panes := agent.PanesFromState(state)
+		if len(panes) > 0 {
+			return panesLoadedMsg{panes: panes, state: state, stateOK: true}
+		}
+	}
+	panes, err := agent.ListPanesBasic()
+	if err == nil {
+		agent.EnrichPanes(panes)
+	}
 	return panesLoadedMsg{panes: panes, err: err}
 }
 
@@ -64,7 +72,6 @@ func loadPreview(target, paneID string, lines, gen int) tea.Cmd {
 // Model is the top-level Bubble Tea model.
 type Model struct {
 	panes              map[string]*agent.Pane
-	reconciler         *agent.Reconciler
 	items              []TreeItem
 	cursor             int
 	scrollStart        int
@@ -85,56 +92,29 @@ type Model struct {
 	dragging           bool
 	tmuxSession        string
 	state              agent.State
-	refreshCount       int
 	projectWinWidth    map[string]int
+	pendingOverrides   map[string]agent.PaneStatus
 }
 
 func NewModel(tmuxSession string) Model {
 	m := Model{
-		preview:     viewport.New(40, 20),
-		tmuxSession: tmuxSession,
-		panes:       make(map[string]*agent.Pane),
-		reconciler:  agent.NewReconciler(),
+		preview:          viewport.New(40, 20),
+		tmuxSession:      tmuxSession,
+		panes:            make(map[string]*agent.Pane),
+		pendingOverrides: make(map[string]agent.PaneStatus),
 	}
 
 	state, stateOK := agent.LoadState()
 	m.state = state
 	m.sidebarWidth = state.SidebarWidth
-	if stateOK {
-		m.reconciler.SeedFromState(state)
-		panes := make([]agent.Pane, 0, len(state.Panes))
-		lastActive := make(map[string]time.Time, len(state.Panes))
-		for _, cp := range state.Panes {
-			id := cp.PaneID
-			if id == "" {
-				id = cp.Target // backward compat with old state files
-			}
-			session, window, pane := agent.ParseTarget(cp.Target)
-			panes = append(panes, agent.Pane{
-				PaneID:     id,
-				Target:     cp.Target,
-				Session:    session,
-				Window:     window,
-				WindowName: cp.WindowName,
-				Pane:       pane,
-				Path:       cp.Path,
-				Stashed:    cp.Stashed,
-				Provider:   cp.Provider,
-			})
-			if cp.LastActive != nil {
-				lastActive[id] = *cp.LastActive
-			}
-		}
+	if stateOK && len(state.Panes) > 0 {
+		panes := agent.PanesFromState(state)
 		// Re-enrich from disk so the first paint matches what the live tick
 		// will produce; otherwise old caches (missing ProjectRoot, stale
 		// worktree branches) cause a visible reshuffle on first refresh.
 		agent.EnrichPanes(panes)
 		for i := range panes {
 			p := &panes[i]
-			p.Status = m.reconciler.Status(p.PaneID)
-			if t, ok := lastActive[p.PaneID]; ok {
-				p.LastActive = t
-			}
 			m.panes[p.PaneID] = p
 		}
 		m.loaded = true
@@ -279,28 +259,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		firstLoad := !m.firstRefreshDone
 		m.firstRefreshDone = true
 		m.loaded = true
-		m.refreshCount++
 		if msg.err != nil {
 			m.err = msg.err
 			return m, panesTickCmd(m.pollInterval())
 		}
 		m.err = nil
 
-		// Preserve stashed state before reconciliation.
-		stashed := make(map[string]bool, len(m.panes))
-		for id, p := range m.panes {
-			if p.Stashed {
-				stashed[id] = true
-			}
+		if msg.stateOK {
+			m.state = msg.state
 		}
 
-		m.reconciler.Reconcile(msg.panes)
-
-		// Rebuild pane map from fresh data.
 		newPanes := make(map[string]*agent.Pane, len(msg.panes))
 		for i := range msg.panes {
 			p := &msg.panes[i]
-			p.Stashed = stashed[p.PaneID]
 			newPanes[p.PaneID] = p
 		}
 		m.panes = newPanes
@@ -442,7 +413,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			default:
 				return m, nil
 			}
-			m.reconciler.SetOverride(p.PaneID, p.Status, p.ContentHash)
+			m.pendingOverrides[p.PaneID] = p.Status
 			m.saveState()
 		}
 		return m, nil
@@ -453,6 +424,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			p.Stashed = !p.Stashed
 			m.rebuildItems()
 			m.clampCursorInSection(m.cursor, wasStashed)
+			m.saveState()
 		}
 		return m, nil
 
@@ -461,6 +433,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			p.Stashed = false
 			m.rebuildItems()
 			m.clampCursorInSection(m.cursor, true)
+			m.saveState()
 		}
 		return m, nil
 
@@ -503,9 +476,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", "q", "esc", "ctrl+c":
 		if key == "enter" {
 			if p := m.resolvePane(m.cursor); p != nil {
-				if p.Status == agent.StatusUnread && !m.reconciler.HasOverride(p.PaneID) {
+				if p.Status == agent.StatusUnread && !agent.HasStatusOverride(m.state, p.PaneID) {
 					p.Status = agent.StatusIdle
-					m.reconciler.SetOverride(p.PaneID, agent.StatusIdle, p.ContentHash)
+					m.pendingOverrides[p.PaneID] = agent.StatusIdle
 				}
 				_ = agent.SwitchToPane(p.Target)
 			}
@@ -578,12 +551,6 @@ func (m Model) stashedSectionBounds() (int, int) {
 }
 
 func (m *Model) saveState() {
-	paneList := make([]*agent.Pane, 0, len(m.panes))
-	for _, p := range m.panes {
-		paneList = append(paneList, p)
-	}
-	m.state.Panes = agent.CachePanes(paneList)
-	m.reconciler.ApplyToCache(m.state.Panes)
 	cursor := m.cursor
 	scrollStart := m.scrollStart
 	if att := m.firstAttentionPane(); att >= 0 {
@@ -595,14 +562,48 @@ func (m *Model) saveState() {
 		paneID = p.PaneID
 		paneTarget = p.Target
 	}
-	m.state.LastPosition = agent.LastPosition{
-		PaneID:      paneID,
-		PaneTarget:  paneTarget,
-		Cursor:      cursor,
-		ScrollStart: scrollStart,
+
+	err := agent.UpdateState(func(state *agent.State) {
+		if len(state.Panes) == 0 {
+			paneList := make([]*agent.Pane, 0, len(m.panes))
+			for _, p := range m.panes {
+				paneList = append(paneList, p)
+			}
+			state.Panes = agent.CachePanes(paneList)
+		}
+
+		for i := range state.Panes {
+			cp := &state.Panes[i]
+			id := cp.PaneID
+			if id == "" {
+				id = cp.Target
+			}
+			p := m.panes[id]
+			if p != nil {
+				cp.Stashed = p.Stashed
+			}
+			if status, ok := m.pendingOverrides[id]; ok {
+				s := int(status)
+				cp.StatusOverride = &s
+				cp.LastStatus = &s
+				if p != nil {
+					cp.ContentHash = p.ContentHash
+				}
+			}
+		}
+
+		state.LastPosition = agent.LastPosition{
+			PaneID:      paneID,
+			PaneTarget:  paneTarget,
+			Cursor:      cursor,
+			ScrollStart: scrollStart,
+		}
+		state.SidebarWidth = m.sidebarWidth
+		m.state = *state
+	})
+	if err == nil {
+		m.pendingOverrides = make(map[string]agent.PaneStatus)
 	}
-	m.state.SidebarWidth = m.sidebarWidth
-	_ = agent.SaveState(m.state)
 }
 
 // firstAttentionPane returns the index of the first non-stashed pane needing attention, or -1.

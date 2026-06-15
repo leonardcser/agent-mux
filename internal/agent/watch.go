@@ -45,37 +45,34 @@ func Watch(ctx context.Context) error {
 	for {
 		start := time.Now()
 
-		// Read state once per cycle: merge TUI overrides and preserve
-		// TUI-owned fields (LastPosition, SidebarWidth) for the save.
+		// Read state once per cycle to merge TUI overrides before reconciliation.
 		state, _ := LoadState()
 		r.MergeOverrides(state)
 
 		if panes, err := ListPanes(); err == nil {
 			r.Reconcile(panes)
 
-			// Re-read state to pick up stashed changes and any NEW overrides
-			// the TUI wrote while ListPanes was running. Only merge overrides
-			// that weren't in the first read—those were already processed by
-			// Reconcile and re-applying them would undo cleared overrides.
-			fresh, _ := LoadState()
-			r.MergeNewOverrides(state, fresh)
-			state.LastPosition = fresh.LastPosition
-			state.SidebarWidth = fresh.SidebarWidth
-			stashed := make(map[string]bool, len(fresh.Panes))
-			for _, cp := range fresh.Panes {
-				if cp.Stashed {
-					stashed[cp.paneKey()] = true
-				}
-			}
+			_ = UpdateState(func(current *State) {
+				// Pick up stashed changes and any NEW overrides the TUI wrote
+				// while ListPanes was running. Only merge overrides that weren't
+				// in the first read—those were already processed by Reconcile.
+				r.MergeNewOverrides(state, *current)
 
-			paneRefs := make([]*Pane, len(panes))
-			for i := range panes {
-				panes[i].Stashed = stashed[panes[i].PaneID]
-				paneRefs[i] = &panes[i]
-			}
-			state.Panes = CachePanes(paneRefs)
-			r.ApplyToCache(state.Panes)
-			_ = SaveState(state)
+				stashed := make(map[string]bool, len(current.Panes))
+				for _, cp := range current.Panes {
+					if cp.Stashed {
+						stashed[cp.paneKey()] = true
+					}
+				}
+
+				paneRefs := make([]*Pane, len(panes))
+				for i := range panes {
+					panes[i].Stashed = stashed[panes[i].PaneID]
+					paneRefs[i] = &panes[i]
+				}
+				current.Panes = CachePanes(paneRefs)
+				r.ApplyToCache(current.Panes)
+			})
 		}
 
 		// Sleep for the remainder of the interval, accounting for work time.
@@ -101,6 +98,18 @@ func Watch(ctx context.Context) error {
 func watchLockPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".local", "state", "agent-mux", "watch.lock")
+}
+
+// StartWatch spawns a background watcher. If another watcher is already
+// running, the new process exits after failing to acquire the watch lock.
+func StartWatch() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("start watch: %w", err)
+	}
+	cmd := exec.Command(exe, "watch")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return cmd.Start()
 }
 
 // RestartWatch kills the running watch process (if any) and spawns a new one.
@@ -130,11 +139,5 @@ func RestartWatch() error {
 	}
 
 	// Spawn a new watcher. Use our own executable.
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("restart watch: %w", err)
-	}
-	cmd := exec.Command(exe, "watch")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	return cmd.Start()
+	return StartWatch()
 }

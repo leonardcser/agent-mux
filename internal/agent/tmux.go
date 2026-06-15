@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/leo/agent-mux/internal/provider"
 )
@@ -124,26 +125,37 @@ func fetchPanes() ([]Pane, error) {
 }
 
 // capturePaneContent captures the last 10 lines of a tmux pane and returns
-// a content hash and whether the content matches attention heuristics.
-func capturePaneContent(target string) (hash string, attention bool) {
+// the latest content hash, whether the content changed during capture, and
+// whether either sample matches attention heuristics.
+func capturePaneContent(target string) (hash string, moving bool, attention bool) {
 	out, err := exec.Command("tmux", "capture-pane", "-t", target, "-p", "-S", "-10").Output()
 	if err != nil {
-		return "", false
+		return "", false, false
 	}
-	content := bytes.TrimRight(out, "\n")
-	h := sha256.Sum256(content)
-	return fmt.Sprintf("%x", h[:8]), attentionRe.Match(content)
+	first := bytes.TrimRight(out, "\n")
+	firstHash := sha256.Sum256(first)
+	firstAttention := attentionRe.Match(first)
+
+	time.Sleep(100 * time.Millisecond)
+
+	out, err = exec.Command("tmux", "capture-pane", "-t", target, "-p", "-S", "-10").Output()
+	if err != nil {
+		return fmt.Sprintf("%x", firstHash[:8]), false, firstAttention
+	}
+	second := bytes.TrimRight(out, "\n")
+	secondHash := sha256.Sum256(second)
+	return fmt.Sprintf("%x", secondHash[:8]), !bytes.Equal(first, second), firstAttention || attentionRe.Match(second)
 }
 
-// CaptureContent populates ContentHash and HeuristicAttention on each pane
-// by capturing the last 10 lines in parallel.
+// CaptureContent populates ContentHash, ContentMoving, and HeuristicAttention
+// on each pane by capturing the last 10 lines in parallel.
 func CaptureContent(panes []Pane) {
 	var wg sync.WaitGroup
 	for i := range panes {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			panes[idx].ContentHash, panes[idx].HeuristicAttention = capturePaneContent(panes[idx].Target)
+			panes[idx].ContentHash, panes[idx].ContentMoving, panes[idx].HeuristicAttention = capturePaneContent(panes[idx].Target)
 		}(i)
 	}
 	wg.Wait()

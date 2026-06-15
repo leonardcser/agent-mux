@@ -38,6 +38,7 @@ type Pane struct {
 	PID                int
 	Status             PaneStatus
 	ContentHash        string
+	ContentMoving      bool
 	HeuristicAttention bool
 	WindowActive       bool
 	LastActive         time.Time

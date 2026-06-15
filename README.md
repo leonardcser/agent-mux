@@ -33,7 +33,7 @@ run-shell -b "agent-mux watch"
 bind j run-shell "tmux neww agent-mux"
 ```
 
-The watcher polls session statuses every 2s, so the TUI opens instantly with
+The watcher polls session statuses every 500ms, so the TUI opens instantly with
 accurate statuses.
 
 Reload tmux: `tmux source-file ~/.tmux.conf`

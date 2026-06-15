@@ -3,7 +3,8 @@ package agent
 import "time"
 
 // StatusOverride captures a user-toggled status. Unread overrides persist
-// through content changes (manual bookmark); others clear on new output.
+// through content changes (manual bookmark); idle overrides clear on new
+// background output.
 type StatusOverride struct {
 	Status      PaneStatus
 	ContentHash string
@@ -11,13 +12,14 @@ type StatusOverride struct {
 
 // Reconciler tracks per-pane activity and drives the status state machine:
 //
-//	Idle → Busy (content changed)
+//	Idle → Busy (new output while not focused)
+//	Idle → Idle (new output while focused; user is already watching/typing)
 //	Busy → Idle (content settled + user viewing window)
-//	Busy → NeedsAttention (content settled + user not viewing, or heuristic match)
+//	Busy → Unread (content settled + user not viewing)
 //	* → NeedsAttention (heuristic match, when not busy)
 //
 // All maps are keyed by PaneID (tmux's stable pane identifier).
-// Both the TUI and the background watch daemon use this.
+// The background watch daemon owns reconciliation; the TUI writes overrides.
 type Reconciler struct {
 	prevContent    map[string]string
 	unchangedCount map[string]int
@@ -67,7 +69,7 @@ func (r *Reconciler) Status(paneID string) PaneStatus {
 }
 
 // SetOverride records a user-toggled status. Unread overrides persist through
-// content changes; others clear on new output.
+// content changes; idle overrides clear on new background output.
 func (r *Reconciler) SetOverride(paneID string, status PaneStatus, contentHash string) {
 	r.overrides[paneID] = StatusOverride{
 		Status:      status,
@@ -88,6 +90,7 @@ func (r *Reconciler) ClearPane(paneID string) {
 	delete(r.prevStatuses, paneID)
 	delete(r.prevContent, paneID)
 	delete(r.unchangedCount, paneID)
+	delete(r.lastActive, paneID)
 }
 
 // Reconcile runs the status state machine on a fresh set of panes.
@@ -100,38 +103,56 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 		id := p.PaneID
 		alive[id] = true
 
+		prevStatus, hadStatus := r.prevStatuses[id]
+		if !hadStatus {
+			prevStatus = StatusIdle
+		}
 		contentChanged := p.ContentHash != "" && p.ContentHash != r.prevContent[id]
+		activeNow := contentChanged || p.ContentMoving
 
-		// Track per-pane activity: update on content change, apply if tracked.
-		if contentChanged {
+		if activeNow {
 			r.lastActive[id] = now
+			r.unchangedCount[id] = 0
+		} else if prevStatus == StatusBusy {
+			r.unchangedCount[id]++
 		}
 		if t, ok := r.lastActive[id]; ok {
 			p.LastActive = t
 		}
 
 		if ov, ok := r.overrides[id]; ok {
-			if contentChanged {
-				delete(r.overrides, id)
-			} else {
+			switch ov.Status {
+			case StatusUnread:
+				p.Status = StatusUnread
+				r.trackPane(p)
+				continue
+			case StatusIdle:
+				if activeNow && !p.WindowActive {
+					delete(r.overrides, id)
+					break
+				}
+				p.Status = StatusIdle
+				r.trackPane(p)
+				continue
+			default:
+				if activeNow {
+					delete(r.overrides, id)
+					break
+				}
 				p.Status = ov.Status
-				r.prevContent[id] = p.ContentHash
-				r.prevStatuses[id] = p.Status
+				r.trackPane(p)
 				continue
 			}
 		}
 
-		if contentChanged {
-			if !p.WindowActive {
-				p.Status = StatusBusy
+		switch {
+		case activeNow:
+			if p.WindowActive && prevStatus == StatusIdle {
+				p.Status = StatusIdle
 			} else {
-				// Active window: preserve previous status so the settling
-				// logic can still fire (Busy stays Busy until content settles).
-				p.Status = r.prevStatuses[id]
+				p.Status = StatusBusy
 			}
-			r.unchangedCount[id] = 0
-		} else if r.prevStatuses[id] == StatusBusy {
-			r.unchangedCount[id]++
+		case prevStatus == StatusBusy:
 			if r.unchangedCount[id] >= 2 {
 				if p.HeuristicAttention {
 					p.Status = StatusNeedsAttention
@@ -143,24 +164,31 @@ func (r *Reconciler) Reconcile(panes []Pane) {
 			} else {
 				p.Status = StatusBusy
 			}
-		} else if p.HeuristicAttention {
+		case p.HeuristicAttention:
 			p.Status = StatusNeedsAttention
-		} else if r.prevStatuses[id] == StatusNeedsAttention {
+		case prevStatus == StatusNeedsAttention:
 			p.Status = StatusNeedsAttention
-		} else if r.prevStatuses[id] == StatusUnread {
+		case prevStatus == StatusUnread:
 			if p.WindowActive {
 				p.Status = StatusIdle
 			} else {
 				p.Status = StatusUnread
 			}
+		default:
+			p.Status = StatusIdle
 		}
 
-		if p.ContentHash != "" {
-			r.prevContent[id] = p.ContentHash
-		}
-		r.prevStatuses[id] = p.Status
+		r.trackPane(p)
 	}
 	r.cleanup(alive)
+}
+
+func (r *Reconciler) trackPane(p *Pane) {
+	id := p.PaneID
+	if p.ContentHash != "" {
+		r.prevContent[id] = p.ContentHash
+	}
+	r.prevStatuses[id] = p.Status
 }
 
 // MergeOverrides picks up overrides written by another process (e.g., the TUI

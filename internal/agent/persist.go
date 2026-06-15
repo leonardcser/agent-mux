@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -21,6 +22,7 @@ type CachedPane struct {
 	GitBranch      string     `json:"gitBranch,omitempty"`
 	GitDirty       bool       `json:"gitDirty,omitempty"`
 	Stashed        bool       `json:"stashed"`
+	Order          int        `json:"order,omitempty"`
 	Provider       string     `json:"provider,omitempty"`
 	StatusOverride *int       `json:"statusOverride,omitempty"`
 	ContentHash    string     `json:"contentHash,omitempty"`
@@ -33,6 +35,7 @@ type State struct {
 	Panes        []CachedPane `json:"panes"`
 	LastPosition LastPosition `json:"lastPosition"`
 	SidebarWidth int          `json:"sidebarWidth,omitempty"`
+	UpdatedAt    *time.Time   `json:"updatedAt,omitempty"`
 }
 
 type LastPosition struct {
@@ -53,15 +56,26 @@ func (cp CachedPane) paneKey() string {
 
 var stateDir sync.Once
 
-func statePath() string {
+func stateDirPath() string {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".local", "state", "agent-mux")
 	stateDir.Do(func() { os.MkdirAll(dir, 0755) })
-	return filepath.Join(dir, "state.json")
+	return dir
+}
+
+func statePath() string {
+	return filepath.Join(stateDirPath(), "state.json")
+}
+
+func stateWriteLockPath() string {
+	return filepath.Join(stateDirPath(), "state.lock")
 }
 
 func LoadState() (State, bool) {
-	path := statePath()
+	return loadStateFile(statePath())
+}
+
+func loadStateFile(path string) (State, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return State{}, false
@@ -79,17 +93,64 @@ func LoadState() (State, bool) {
 }
 
 func SaveState(state State) error {
+	unlock, err := lockStateFile()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return writeStateFile(state)
+}
+
+func UpdateState(fn func(*State)) error {
+	unlock, err := lockStateFile()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	state, _ := loadStateFile(statePath())
+	fn(&state)
+	return writeStateFile(state)
+}
+
+func lockStateFile() (func(), error) {
+	lockFile, err := os.OpenFile(stateWriteLockPath(), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		lockFile.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+	}, nil
+}
+
+func writeStateFile(state State) error {
 	path := statePath()
 	state.Version = 1
+	now := time.Now()
+	state.UpdatedAt = &now
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	tmp, err := os.CreateTemp(stateDirPath(), ".state-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // CachePanes converts live Pane structs into the cached format.
@@ -109,6 +170,7 @@ func CachePanes(panes []*Pane) []CachedPane {
 			GitBranch:     p.GitBranch,
 			GitDirty:      p.GitDirty,
 			Stashed:       p.Stashed,
+			Order:         p.Order,
 			Provider:      p.Provider,
 		}
 		if !p.LastActive.IsZero() {
@@ -118,4 +180,53 @@ func CachePanes(panes []*Pane) []CachedPane {
 		cached[i] = cp
 	}
 	return cached
+}
+
+// PanesFromState converts cached panes into live panes for display.
+func PanesFromState(state State) []Pane {
+	panes := make([]Pane, 0, len(state.Panes))
+	for _, cp := range state.Panes {
+		id := cp.PaneID
+		if id == "" {
+			id = cp.Target
+		}
+		session, window, pane := ParseTarget(cp.Target)
+		p := Pane{
+			PaneID:        id,
+			Target:        cp.Target,
+			Session:       session,
+			Window:        window,
+			WindowName:    cp.WindowName,
+			Pane:          pane,
+			Path:          cp.Path,
+			ShortPath:     cp.ShortPath,
+			ProjectRoot:   cp.ProjectRoot,
+			ProjectShort:  cp.ProjectShort,
+			ProjectBranch: cp.ProjectBranch,
+			ProjectDirty:  cp.ProjectDirty,
+			GitBranch:     cp.GitBranch,
+			GitDirty:      cp.GitDirty,
+			Stashed:       cp.Stashed,
+			Order:         cp.Order,
+			Provider:      cp.Provider,
+			ContentHash:   cp.ContentHash,
+		}
+		if cp.LastStatus != nil {
+			p.Status = PaneStatus(*cp.LastStatus)
+		}
+		if cp.LastActive != nil {
+			p.LastActive = *cp.LastActive
+		}
+		panes = append(panes, p)
+	}
+	return panes
+}
+
+func HasStatusOverride(state State, paneID string) bool {
+	for _, cp := range state.Panes {
+		if cp.paneKey() == paneID {
+			return cp.StatusOverride != nil
+		}
+	}
+	return false
 }
