@@ -57,6 +57,7 @@ enum Msg {
         preview_seq: u64,
     },
     PaneKilled {
+        pane_id: String,
         err: Option<String>,
     },
 }
@@ -118,6 +119,7 @@ fn run_loop(
                         app.err = Some(err);
                     } else {
                         app.err = None;
+                        app.hide_pending_kills(&mut panes);
                         let ui_is_older = ui_state_is_older_than(&ui_state, &app.ui_state);
                         let ui_changed =
                             !ui_is_older && ui_state.updated_at != app.ui_state.updated_at;
@@ -146,12 +148,14 @@ fn run_loop(
                         dirty = true;
                     }
                 }
-                Msg::PaneKilled { err } => {
+                Msg::PaneKilled { pane_id, err } => {
                     if let Some(err) = err {
                         app.err = Some(err);
+                        app.restore_pending_kill(&pane_id);
+                    } else {
+                        spawn_load_panes(&tx);
+                        panes_pending = true;
                     }
-                    spawn_load_panes(&tx);
-                    panes_pending = true;
                     dirty = true;
                 }
             }
@@ -348,6 +352,7 @@ struct App {
     err: Option<String>,
     ui_state: UiState,
     pending_overrides: HashMap<String, PaneStatus>,
+    pending_kills: HashMap<String, Pane>,
     hits: HitRegistry<Hit>,
     _tmux_session: String,
 }
@@ -389,6 +394,7 @@ impl App {
                 .then(|| "syncing agent-mux snapshot".to_string()),
             ui_state,
             pending_overrides: HashMap::new(),
+            pending_kills: HashMap::new(),
             hits: HitRegistry::new(),
             _tmux_session: tmux_session,
         };
@@ -521,6 +527,44 @@ impl App {
         })
     }
 
+    fn remove_current_pane(&mut self) -> Option<(String, String)> {
+        let pane = self.current_pane()?.clone();
+        let pane_id = pane.pane_id.clone();
+        let target = pane.target.clone();
+        self.pending_overrides.remove(&pane_id);
+        self.pending_kills.insert(pane_id.clone(), pane);
+        self.panes.remove(&pane_id);
+        self.rebuild_items();
+        self.cursor = nearest_pane(&self.items, self.cursor);
+        if self.preview_for == pane_id {
+            self.preview_for.clear();
+            self.preview_lines.clear();
+        }
+        self.preview_gen += 1;
+        Some((pane_id, target))
+    }
+
+    fn restore_pending_kill(&mut self, pane_id: &str) {
+        let Some(pane) = self.pending_kills.remove(pane_id) else {
+            return;
+        };
+        self.panes.insert(pane_id.to_string(), pane);
+        self.rebuild_items();
+        self.cursor = self
+            .find_pane_by_id(pane_id)
+            .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
+        self.preview_gen += 1;
+    }
+
+    fn hide_pending_kills(&mut self, panes: &mut Vec<Pane>) {
+        let alive: HashMap<String, bool> = panes
+            .iter()
+            .map(|pane| (pane.pane_id.clone(), true))
+            .collect();
+        self.pending_kills.retain(|id, _| alive.contains_key(id));
+        panes.retain(|pane| !self.pending_kills.contains_key(&pane.pane_id));
+    }
+
     fn handle_key(&mut self, key: KeyEvent, tx: &mpsc::Sender<Msg>) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if key.code == KeyCode::Esc
@@ -547,14 +591,13 @@ impl App {
             if self.pending_d {
                 self.pending_d = false;
                 self.pending_g = false;
-                if let Some(p) = self.current_pane() {
-                    let target = p.target.clone();
+                if let Some((pane_id, target)) = self.remove_current_pane() {
                     let tx = tx.clone();
                     thread::spawn(move || {
                         let err = kill_pane(&target).err().map(|e| e.to_string());
-                        let _ = tx.send(Msg::PaneKilled { err });
+                        let _ = tx.send(Msg::PaneKilled { pane_id, err });
                     });
-                    return Action::Redraw;
+                    return Action::Preview;
                 }
                 return Action::None;
             }
