@@ -116,6 +116,10 @@ fn run_loop(
                     } else {
                         app.err = None;
                         if let Some(state) = state {
+                            if state_is_older_than(&state, &app.state) {
+                                dirty = true;
+                                continue;
+                            }
                             app.state = state;
                         }
                         app.replace_panes(panes);
@@ -212,8 +216,7 @@ fn spawn_load_panes(tx: &mpsc::Sender<Msg>) {
         if let Some(state_ref) = state.as_ref()
             && !state_ref.panes.is_empty()
         {
-            let mut panes = panes_from_state(state_ref);
-            enrich_panes(&mut panes);
+            let panes = panes_from_state_filtered_by_live(state_ref);
             let _ = tx.send(Msg::PanesLoaded {
                 panes,
                 state,
@@ -258,6 +261,45 @@ fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) {
     });
 }
 
+fn panes_from_state_filtered_by_live(state: &State) -> Vec<Pane> {
+    let Ok(mut live) = list_panes_basic() else {
+        return panes_from_state(state);
+    };
+    enrich_panes(&mut live);
+
+    let cached_by_id: HashMap<String, Pane> = panes_from_state(state)
+        .into_iter()
+        .map(|p| (p.pane_id.clone(), p))
+        .collect();
+    let cached_by_target: HashMap<String, Pane> = cached_by_id
+        .values()
+        .map(|p| (p.target.clone(), p.clone()))
+        .collect();
+
+    for p in &mut live {
+        let Some(prev) = cached_by_id
+            .get(&p.pane_id)
+            .or_else(|| cached_by_target.get(&p.target))
+        else {
+            continue;
+        };
+        p.stashed = prev.stashed;
+        p.status = prev.status;
+        p.content_hash = prev.content_hash.clone();
+        p.last_active = prev.last_active;
+    }
+
+    live
+}
+
+fn state_is_older_than(incoming: &State, current: &State) -> bool {
+    match (incoming.updated_at, current.updated_at) {
+        (Some(incoming), Some(current)) => incoming < current,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 enum Action {
     None,
@@ -295,12 +337,13 @@ struct App {
 impl App {
     fn new(tmux_session: String) -> Self {
         let state = load_state().unwrap_or_default();
-        let mut panes = if !state.panes.is_empty() {
-            panes_from_state(&state)
+        let panes = if !state.panes.is_empty() {
+            panes_from_state_filtered_by_live(&state)
         } else {
-            list_panes_basic().unwrap_or_default()
+            let mut panes = list_panes_basic().unwrap_or_default();
+            enrich_panes(&mut panes);
+            panes
         };
-        enrich_panes(&mut panes);
         let mut app = Self {
             panes: panes.into_iter().map(|p| (p.pane_id.clone(), p)).collect(),
             items: Vec::new(),
@@ -358,9 +401,12 @@ impl App {
     }
 
     fn replace_panes(&mut self, panes: Vec<Pane>) {
+        let selected = self.current_pane().map(|p| p.pane_id.clone());
         self.panes = panes.into_iter().map(|p| (p.pane_id.clone(), p)).collect();
         self.rebuild_items();
-        self.cursor = nearest_pane(&self.items, self.cursor);
+        self.cursor = selected
+            .and_then(|id| self.find_pane_by_id(&id))
+            .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
     }
 
     fn rebuild_items(&mut self) {
@@ -535,21 +581,33 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('s') => {
+                let mut selected = None;
                 if let Some(p) = self.current_pane_mut() {
                     p.stashed = !p.stashed;
+                    selected = Some(p.pane_id.clone());
+                }
+                if let Some(id) = selected {
                     self.rebuild_items();
-                    self.cursor = nearest_pane(&self.items, self.cursor);
+                    self.cursor = self
+                        .find_pane_by_id(&id)
+                        .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
                     self.save_state();
                 }
                 Action::Redraw
             }
             KeyCode::Char('u') => {
+                let mut selected = None;
                 if let Some(p) = self.current_pane_mut()
                     && p.stashed
                 {
                     p.stashed = false;
+                    selected = Some(p.pane_id.clone());
+                }
+                if let Some(id) = selected {
                     self.rebuild_items();
-                    self.cursor = nearest_pane(&self.items, self.cursor);
+                    self.cursor = self
+                        .find_pane_by_id(&id)
+                        .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
                     self.save_state();
                     return Action::Redraw;
                 }
@@ -656,22 +714,52 @@ impl App {
             })
             .map(|p| (p.pane_id.clone(), p.target.clone()))
             .unwrap_or_default();
-        let panes: Vec<Pane> = self.panes.values().cloned().collect();
+        let panes: Vec<Pane> = self
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                TreeItem::Pane(id) => self.panes.get(id).cloned(),
+                _ => None,
+            })
+            .collect();
         let pending = self.pending_overrides.clone();
         let sidebar_width = self.sidebar_width;
         let _ = update_state(|state| {
-            if state.panes.is_empty() {
-                state.panes = cache_panes(&panes);
-            }
+            let existing: HashMap<String, _> = state
+                .panes
+                .iter()
+                .cloned()
+                .map(|cp| (cp.pane_key().to_string(), cp))
+                .collect();
+            let panes_by_id: HashMap<String, Pane> = panes
+                .iter()
+                .cloned()
+                .map(|p| (p.pane_id.clone(), p))
+                .collect();
+
+            state.panes = cache_panes(&panes);
             for cp in &mut state.panes {
                 let id = cp.pane_key().to_string();
-                if let Some(p) = panes.iter().find(|p| p.pane_id == id) {
+                if let Some(old) = existing.get(&id) {
+                    cp.status_override = old.status_override;
+                    cp.content_hash = old.content_hash.clone();
+                    cp.last_status = old.last_status;
+                    if cp.last_active.is_none() {
+                        cp.last_active = old.last_active;
+                    }
+                }
+                if let Some(p) = panes_by_id.get(&id) {
                     cp.stashed = p.stashed;
+                    cp.last_status = Some(p.status.as_i32());
+                    if !p.content_hash.is_empty() {
+                        cp.content_hash = p.content_hash.clone();
+                    }
+                    cp.last_active = p.last_active;
                 }
                 if let Some(status) = pending.get(&id) {
                     cp.status_override = Some(status.as_i32());
                     cp.last_status = Some(status.as_i32());
-                    if let Some(p) = panes.iter().find(|p| p.pane_id == id) {
+                    if let Some(p) = panes_by_id.get(&id) {
                         cp.content_hash = p.content_hash.clone();
                     }
                 }
