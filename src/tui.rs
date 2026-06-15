@@ -19,8 +19,8 @@ use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::persist::{
-    LastPosition, Snapshot, UiState, load_snapshot, load_ui_state, panes_from_snapshot,
-    update_ui_state,
+    LastPosition, Snapshot, UiState, load_heartbeat, load_snapshot, load_ui_state,
+    panes_from_snapshot, update_ui_state,
 };
 use crate::agent::{Pane, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane};
 
@@ -47,6 +47,7 @@ enum TreeItem {
 enum Msg {
     PanesLoaded {
         panes: Vec<Pane>,
+        snapshot_generation: u64,
         ui_state: UiState,
         err: Option<String>,
     },
@@ -107,7 +108,8 @@ fn run_loop(
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Msg::PanesLoaded {
-                    panes,
+                    mut panes,
+                    snapshot_generation,
                     ui_state,
                     err,
                 } => {
@@ -116,10 +118,18 @@ fn run_loop(
                         app.err = Some(err);
                     } else {
                         app.err = None;
-                        if !ui_state_is_older_than(&ui_state, &app.ui_state) {
+                        let ui_is_older = ui_state_is_older_than(&ui_state, &app.ui_state);
+                        let ui_changed =
+                            !ui_is_older && ui_state.updated_at != app.ui_state.updated_at;
+                        if ui_changed {
                             app.ui_state = ui_state;
+                        } else if ui_is_older {
+                            apply_ui_state(&mut panes, &app.ui_state);
                         }
-                        app.replace_panes(panes);
+                        if snapshot_generation != app.snapshot_generation || ui_changed {
+                            app.snapshot_generation = snapshot_generation;
+                            app.replace_panes(panes);
+                        }
                     }
                     dirty = true;
                 }
@@ -213,15 +223,18 @@ fn spawn_load_panes(tx: &mpsc::Sender<Msg>) {
         let Some(snapshot) = load_display_snapshot() else {
             let _ = tx.send(Msg::PanesLoaded {
                 panes: Vec::new(),
+                snapshot_generation: 0,
                 ui_state,
                 err: Some("syncing agent-mux snapshot".into()),
             });
             return;
         };
+        let snapshot_generation = snapshot.generation;
         let mut panes = panes_from_snapshot(&snapshot);
         apply_ui_state(&mut panes, &ui_state);
         let _ = tx.send(Msg::PanesLoaded {
             panes,
+            snapshot_generation,
             ui_state,
             err: None,
         });
@@ -257,19 +270,16 @@ fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) {
 }
 
 fn load_display_snapshot() -> Option<Snapshot> {
-    if let Some(snapshot) = load_snapshot()
-        && snapshot_is_fresh(&snapshot)
-    {
-        return Some(snapshot);
-    }
-
-    let _ = crate::agent::watch::refresh_once();
-    load_snapshot().filter(snapshot_is_fresh)
+    let snapshot = load_snapshot()?;
+    snapshot_is_fresh(&snapshot).then_some(snapshot)
 }
 
 fn snapshot_is_fresh(snapshot: &Snapshot) -> bool {
     const MAX_AGE_MS: i64 = 1_500;
-    let Some(updated_at) = snapshot.updated_at else {
+    let Some(updated_at) = load_heartbeat()
+        .and_then(|heartbeat| heartbeat.updated_at)
+        .or(snapshot.updated_at)
+    else {
         return false;
     };
     let age = chrono::Utc::now() - updated_at;
@@ -325,6 +335,7 @@ struct App {
     preview_lines: Vec<Vec<AnsiSpan>>,
     preview_gen: u64,
     preview_applied_gen: u64,
+    snapshot_generation: u64,
     project_win_width: HashMap<String, usize>,
     width: u16,
     height: u16,
@@ -344,8 +355,14 @@ struct App {
 impl App {
     fn new(tmux_session: String) -> Self {
         let ui_state = load_ui_state();
-        let mut panes = load_display_snapshot()
-            .map(|snapshot| panes_from_snapshot(&snapshot))
+        let snapshot = load_display_snapshot();
+        let snapshot_generation = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.generation)
+            .unwrap_or_default();
+        let mut panes = snapshot
+            .as_ref()
+            .map(panes_from_snapshot)
             .unwrap_or_default();
         apply_ui_state(&mut panes, &ui_state);
         let mut app = Self {
@@ -357,6 +374,7 @@ impl App {
             preview_lines: Vec::new(),
             preview_gen: 1,
             preview_applied_gen: 0,
+            snapshot_generation,
             project_win_width: HashMap::new(),
             width: 0,
             height: 0,
@@ -366,7 +384,9 @@ impl App {
             pending_d: false,
             pending_g: false,
             count: 0,
-            err: None,
+            err: snapshot
+                .is_none()
+                .then(|| "syncing agent-mux snapshot".to_string()),
             ui_state,
             pending_overrides: HashMap::new(),
             hits: HitRegistry::new(),

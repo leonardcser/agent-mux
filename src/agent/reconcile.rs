@@ -178,10 +178,6 @@ impl Reconciler {
     pub fn apply_to_cache(&self, panes: &mut [CachedPane]) {
         for cp in panes {
             let id = cp.pane_key().to_string();
-            if let Some(ov) = self.overrides.get(&id) {
-                cp.status_override = Some(ov.status.as_i32());
-                cp.content_hash = ov.content_hash.clone();
-            }
             if let Some(h) = self.prev_content.get(&id) {
                 cp.content_hash = h.clone();
             }

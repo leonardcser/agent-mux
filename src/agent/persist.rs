@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::agent::{Pane, PaneStatus, tmux::parse_target};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CachedPane {
     #[serde(rename = "paneID", default, skip_serializing_if = "String::is_empty")]
     pub pane_id: String,
@@ -103,12 +103,22 @@ pub struct Snapshot {
     #[serde(default)]
     pub version: i32,
     #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
     pub panes: Vec<CachedPane>,
     #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Heartbeat {
+    #[serde(default)]
+    pub version: i32,
+    #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default)]
     pub version: i32,
@@ -122,7 +132,7 @@ pub struct UiState {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UiPaneState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stashed: bool,
@@ -140,7 +150,7 @@ pub struct UiPaneState {
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LastPosition {
     #[serde(rename = "pane_id", default, skip_serializing_if = "String::is_empty")]
     pub pane_id: String,
@@ -181,15 +191,18 @@ pub fn load_state() -> Option<State> {
 }
 
 pub fn load_snapshot() -> Option<Snapshot> {
-    load_json_file(snapshot_path())
-        .filter(|snapshot: &Snapshot| snapshot.version == 1)
-        .or_else(|| {
-            load_state().map(|state| Snapshot {
-                version: state.version,
-                panes: state.panes,
-                updated_at: state.updated_at,
-            })
+    load_snapshot_file().or_else(|| {
+        load_state().map(|state| Snapshot {
+            version: state.version,
+            generation: 1,
+            panes: state.panes,
+            updated_at: state.updated_at,
         })
+    })
+}
+
+fn load_snapshot_file() -> Option<Snapshot> {
+    load_json_file(snapshot_path()).filter(|snapshot: &Snapshot| snapshot.version == 1)
 }
 
 pub fn load_ui_state() -> UiState {
@@ -197,6 +210,10 @@ pub fn load_ui_state() -> UiState {
         .filter(|state: &UiState| state.version == 1)
         .or_else(|| load_state().map(ui_state_from_legacy_state))
         .unwrap_or_default()
+}
+
+pub fn load_heartbeat() -> Option<Heartbeat> {
+    load_json_file(heartbeat_path()).filter(|heartbeat: &Heartbeat| heartbeat.version == 1)
 }
 
 fn ui_state_from_legacy_state(state: State) -> UiState {
@@ -222,13 +239,83 @@ fn ui_state_from_legacy_state(state: State) -> UiState {
     }
 }
 
-pub fn write_snapshot(mut snapshot: Snapshot) -> Result<()> {
+pub fn write_snapshot_if_changed(mut snapshot: Snapshot) -> Result<bool> {
     let lock_file = lock_file(snapshot_write_lock_path())?;
+    let previous = load_snapshot_file();
+    if previous
+        .as_ref()
+        .is_some_and(|previous| previous.generation > 0 && previous.panes == snapshot.panes)
+    {
+        drop(lock_file);
+        return Ok(false);
+    }
+
     snapshot.version = 1;
+    snapshot.generation = previous
+        .as_ref()
+        .map(|previous| {
+            let generation = previous.generation.max(1);
+            if panes_equal_for_generation(&previous.panes, &snapshot.panes) {
+                generation
+            } else {
+                generation + 1
+            }
+        })
+        .unwrap_or(1);
     snapshot.updated_at = Some(Utc::now());
     write_json_file(snapshot_path(), &snapshot)?;
     drop(lock_file);
+    Ok(true)
+}
+
+fn panes_equal_for_generation(a: &[CachedPane], b: &[CachedPane]) -> bool {
+    comparable_panes(a) == comparable_panes(b)
+}
+
+fn comparable_panes(panes: &[CachedPane]) -> Vec<CachedPane> {
+    panes
+        .iter()
+        .cloned()
+        .map(|mut pane| {
+            pane.stashed = false;
+            pane.status_override = None;
+            pane.content_hash.clear();
+            pane.last_active = None;
+            pane
+        })
+        .collect()
+}
+
+pub fn write_heartbeat() -> Result<()> {
+    let lock_file = lock_file(heartbeat_write_lock_path())?;
+    write_json_file(
+        heartbeat_path(),
+        &Heartbeat {
+            version: 1,
+            updated_at: Some(Utc::now()),
+        },
+    )?;
+    drop(lock_file);
     Ok(())
+}
+
+pub fn update_ui_state_if_changed(mut f: impl FnMut(&mut UiState)) -> Result<bool> {
+    let lock_file = lock_file(ui_state_write_lock_path())?;
+    let mut state = load_ui_state();
+    let mut previous = state.clone();
+    previous.updated_at = None;
+    f(&mut state);
+    let mut comparable = state.clone();
+    comparable.updated_at = None;
+    if comparable == previous {
+        drop(lock_file);
+        return Ok(false);
+    }
+    state.version = 1;
+    state.updated_at = Some(Utc::now());
+    write_json_file(ui_state_path(), &state)?;
+    drop(lock_file);
+    Ok(true)
 }
 
 pub fn update_ui_state(mut f: impl FnMut(&mut UiState)) -> Result<()> {
@@ -296,7 +383,6 @@ pub fn cache_panes(panes: &[Pane]) -> Vec<CachedPane> {
             project_dirty: p.project_dirty,
             git_branch: p.git_branch.clone(),
             git_dirty: p.git_dirty,
-            stashed: p.stashed,
             order: p.order,
             provider: p.provider.clone(),
             last_active: p.last_active,
@@ -365,10 +451,18 @@ pub fn ui_state_path() -> PathBuf {
     state_dir().join("ui_state.json")
 }
 
+pub fn heartbeat_path() -> PathBuf {
+    state_dir().join("heartbeat.json")
+}
+
 pub fn snapshot_write_lock_path() -> PathBuf {
     state_dir().join("snapshot.lock")
 }
 
 pub fn ui_state_write_lock_path() -> PathBuf {
     state_dir().join("ui_state.lock")
+}
+
+pub fn heartbeat_write_lock_path() -> PathBuf {
+    state_dir().join("heartbeat.lock")
 }

@@ -26,9 +26,14 @@ struct RawPane {
 }
 
 pub fn list_panes() -> Result<Vec<Pane>> {
+    let mut panes = list_panes_fast()?;
+    enrich_panes(&mut panes);
+    Ok(panes)
+}
+
+pub fn list_panes_fast() -> Result<Vec<Pane>> {
     let mut panes = fetch_panes()?;
     capture_content(&mut panes);
-    enrich_panes(&mut panes);
     Ok(panes)
 }
 

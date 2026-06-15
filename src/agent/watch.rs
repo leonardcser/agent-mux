@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 
+use crate::agent::git::enrich_panes;
 use crate::agent::persist::{
-    Snapshot, cache_panes, load_snapshot, load_ui_state, state_dir, update_ui_state, write_snapshot,
+    Snapshot, cache_panes, load_snapshot, load_ui_state, state_dir, update_ui_state_if_changed,
+    write_heartbeat, write_snapshot_if_changed,
 };
-use crate::agent::{Reconciler, list_panes};
+use crate::agent::{Pane, Reconciler, list_panes_fast};
 
 pub fn run() -> Result<()> {
     fs::create_dir_all(state_dir()).context("create state dir")?;
@@ -40,14 +42,19 @@ pub fn run() -> Result<()> {
         reconciler.seed_from_snapshot(&snapshot);
     }
 
-    let interval = Duration::from_millis(500);
+    let fast_interval = Duration::from_millis(500);
+    let slow_interval = Duration::from_secs(3);
+    let mut last_slow = Instant::now() - slow_interval;
     while !stopped.load(Ordering::SeqCst) {
         let start = Instant::now();
-        let _ = refresh_once_with(&mut reconciler);
+        let enrich_git = last_slow.elapsed() >= slow_interval;
+        if refresh_once_with(&mut reconciler, enrich_git).is_ok() && enrich_git {
+            last_slow = Instant::now();
+        }
 
         let elapsed = start.elapsed();
-        if elapsed < interval {
-            std::thread::sleep(interval - elapsed);
+        if elapsed < fast_interval {
+            std::thread::sleep(fast_interval - elapsed);
         }
     }
 
@@ -59,14 +66,15 @@ pub fn refresh_once() -> Result<()> {
     if let Some(snapshot) = load_snapshot() {
         reconciler.seed_from_snapshot(&snapshot);
     }
-    refresh_once_with(&mut reconciler)
+    refresh_once_with(&mut reconciler, true)
 }
 
-fn refresh_once_with(reconciler: &mut Reconciler) -> Result<()> {
+fn refresh_once_with(reconciler: &mut Reconciler, enrich_git: bool) -> Result<()> {
+    let previous = load_snapshot();
     let ui_state = load_ui_state();
     reconciler.merge_overrides(&ui_state);
 
-    let mut panes = list_panes()?;
+    let mut panes = list_panes_fast()?;
     for p in &mut panes {
         if let Some(ui) = ui_state
             .panes
@@ -76,18 +84,24 @@ fn refresh_once_with(reconciler: &mut Reconciler) -> Result<()> {
             p.stashed = ui.stashed;
         }
     }
-    reconciler.reconcile(&mut panes);
 
-    let mut cached = cache_panes(&panes);
-    reconciler.apply_to_cache(&mut cached);
-    write_snapshot(Snapshot {
-        version: 1,
-        panes: cached,
-        updated_at: None,
-    })?;
+    let should_enrich_git = enrich_git || metadata_missing_or_changed(&panes, previous.as_ref());
+    if let Some(snapshot) = previous.as_ref() {
+        apply_cached_metadata(&mut panes, snapshot);
+    }
+
+    reconciler.reconcile(&mut panes);
+    write_panes_snapshot(reconciler, &panes)?;
+    write_heartbeat()?;
+
+    if should_enrich_git {
+        enrich_panes(&mut panes);
+        write_panes_snapshot(reconciler, &panes)?;
+        write_heartbeat()?;
+    }
 
     let overrides = reconciler.override_entries();
-    update_ui_state(|state| {
+    update_ui_state_if_changed(|state| {
         let alive: std::collections::HashMap<String, bool> =
             panes.iter().map(|p| (p.pane_id.clone(), true)).collect();
         state.panes.retain(|id, _| alive.contains_key(id));
@@ -108,6 +122,58 @@ fn refresh_once_with(reconciler: &mut Reconciler) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+fn write_panes_snapshot(reconciler: &Reconciler, panes: &[Pane]) -> Result<()> {
+    let mut cached = cache_panes(panes);
+    reconciler.apply_to_cache(&mut cached);
+    let _ = write_snapshot_if_changed(Snapshot {
+        version: 1,
+        generation: 0,
+        panes: cached,
+        updated_at: None,
+    })?;
+    Ok(())
+}
+
+fn metadata_missing_or_changed(panes: &[Pane], snapshot: Option<&Snapshot>) -> bool {
+    let Some(snapshot) = snapshot else {
+        return true;
+    };
+    let cached: std::collections::HashMap<String, &crate::agent::persist::CachedPane> = snapshot
+        .panes
+        .iter()
+        .map(|cp| (cp.pane_key().to_string(), cp))
+        .collect();
+
+    panes.iter().any(|p| {
+        let cached = cached.get(&p.pane_id).or_else(|| cached.get(&p.target));
+        cached.is_none_or(|cached| cached.path != p.path || cached.project_root.is_empty())
+    })
+}
+
+fn apply_cached_metadata(panes: &mut [Pane], snapshot: &Snapshot) {
+    let cached: std::collections::HashMap<String, &crate::agent::persist::CachedPane> = snapshot
+        .panes
+        .iter()
+        .map(|cp| (cp.pane_key().to_string(), cp))
+        .collect();
+
+    for p in panes {
+        let Some(cached) = cached.get(&p.pane_id).or_else(|| cached.get(&p.target)) else {
+            continue;
+        };
+        if cached.path != p.path {
+            continue;
+        }
+        p.short_path = cached.short_path.clone();
+        p.project_root = cached.project_root.clone();
+        p.project_short = cached.project_short.clone();
+        p.project_branch = cached.project_branch.clone();
+        p.project_dirty = cached.project_dirty;
+        p.git_branch = cached.git_branch.clone();
+        p.git_dirty = cached.git_dirty;
+    }
 }
 
 pub fn lock_path() -> PathBuf {
