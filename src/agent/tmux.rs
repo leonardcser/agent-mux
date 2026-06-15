@@ -25,10 +25,6 @@ struct RawPane {
     window_focused: bool,
 }
 
-pub fn list_panes_basic() -> Result<Vec<Pane>> {
-    fetch_panes()
-}
-
 pub fn list_panes() -> Result<Vec<Pane>> {
     let mut panes = fetch_panes()?;
     capture_content(&mut panes);

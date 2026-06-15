@@ -18,14 +18,11 @@ use smelt_term::grid::{Color, GridSlice, Style};
 use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agent::git::enrich_panes;
 use crate::agent::persist::{
-    LastPosition, State, cache_panes, has_status_override, load_state, panes_from_state,
-    update_state,
+    LastPosition, Snapshot, UiState, load_snapshot, load_ui_state, panes_from_snapshot,
+    update_ui_state,
 };
-use crate::agent::{
-    Pane, PaneStatus, capture_pane, kill_pane, list_panes_basic, restart_watch, switch_to_pane,
-};
+use crate::agent::{Pane, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane};
 
 const SIDEBAR: PaintId = PaintId(1);
 const SEPARATOR: PaintId = PaintId(2);
@@ -50,7 +47,7 @@ enum TreeItem {
 enum Msg {
     PanesLoaded {
         panes: Vec<Pane>,
-        state: Option<State>,
+        ui_state: UiState,
         err: Option<String>,
     },
     PreviewLoaded {
@@ -100,27 +97,27 @@ fn run_loop(
     let mut dirty = true;
     let mut last_draw = Instant::now() - Duration::from_millis(33);
     let mut last_panes = Instant::now() - Duration::from_millis(500);
-    let mut last_preview = Instant::now() - Duration::from_millis(200);
+    let mut last_preview = Instant::now();
     let mut panes_pending = false;
-    let mut preview_pending = true;
+    let mut preview_pending = false;
 
-    spawn_preview(&tx, app);
+    load_preview(app);
 
     loop {
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                Msg::PanesLoaded { panes, state, err } => {
+                Msg::PanesLoaded {
+                    panes,
+                    ui_state,
+                    err,
+                } => {
                     panes_pending = false;
                     if let Some(err) = err {
                         app.err = Some(err);
                     } else {
                         app.err = None;
-                        if let Some(state) = state {
-                            if state_is_older_than(&state, &app.state) {
-                                dirty = true;
-                                continue;
-                            }
-                            app.state = state;
+                        if !ui_state_is_older_than(&ui_state, &app.ui_state) {
+                            app.ui_state = ui_state;
                         }
                         app.replace_panes(panes);
                     }
@@ -212,36 +209,34 @@ fn run_loop(
 fn spawn_load_panes(tx: &mpsc::Sender<Msg>) {
     let tx = tx.clone();
     thread::spawn(move || {
-        let state = load_state();
-        if let Some(state_ref) = state.as_ref()
-            && !state_ref.panes.is_empty()
-        {
-            let panes = panes_from_state_filtered_by_live(state_ref);
+        let ui_state = load_ui_state();
+        let Some(snapshot) = load_display_snapshot() else {
             let _ = tx.send(Msg::PanesLoaded {
-                panes,
-                state,
-                err: None,
+                panes: Vec::new(),
+                ui_state,
+                err: Some("syncing agent-mux snapshot".into()),
             });
             return;
-        }
-        match list_panes_basic() {
-            Ok(mut panes) => {
-                enrich_panes(&mut panes);
-                let _ = tx.send(Msg::PanesLoaded {
-                    panes,
-                    state,
-                    err: None,
-                });
-            }
-            Err(err) => {
-                let _ = tx.send(Msg::PanesLoaded {
-                    panes: Vec::new(),
-                    state,
-                    err: Some(err.to_string()),
-                });
-            }
-        }
+        };
+        let mut panes = panes_from_snapshot(&snapshot);
+        apply_ui_state(&mut panes, &ui_state);
+        let _ = tx.send(Msg::PanesLoaded {
+            panes,
+            ui_state,
+            err: None,
+        });
     });
+}
+
+fn load_preview(app: &mut App) {
+    let Some(p) = app.current_pane() else { return };
+    let target = p.target.clone();
+    let pane_id = p.pane_id.clone();
+    let lines = app.height.max(50) as usize;
+    let content = capture_pane(&target, lines).unwrap_or_else(|err| format!("error: {err}"));
+    app.preview_for = pane_id;
+    app.preview_applied_gen = app.preview_gen;
+    app.preview_lines = parse_ansi_lines(content.trim_end_matches('\n'));
 }
 
 fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) {
@@ -261,43 +256,55 @@ fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) {
     });
 }
 
-fn panes_from_state_filtered_by_live(state: &State) -> Vec<Pane> {
-    let Ok(mut live) = list_panes_basic() else {
-        return panes_from_state(state);
-    };
-    enrich_panes(&mut live);
-
-    let cached_by_id: HashMap<String, Pane> = panes_from_state(state)
-        .into_iter()
-        .map(|p| (p.pane_id.clone(), p))
-        .collect();
-    let cached_by_target: HashMap<String, Pane> = cached_by_id
-        .values()
-        .map(|p| (p.target.clone(), p.clone()))
-        .collect();
-
-    for p in &mut live {
-        let Some(prev) = cached_by_id
-            .get(&p.pane_id)
-            .or_else(|| cached_by_target.get(&p.target))
-        else {
-            continue;
-        };
-        p.stashed = prev.stashed;
-        p.status = prev.status;
-        p.content_hash = prev.content_hash.clone();
-        p.last_active = prev.last_active;
+fn load_display_snapshot() -> Option<Snapshot> {
+    if let Some(snapshot) = load_snapshot()
+        && snapshot_is_fresh(&snapshot)
+    {
+        return Some(snapshot);
     }
 
-    live
+    let _ = crate::agent::watch::refresh_once();
+    load_snapshot().filter(snapshot_is_fresh)
 }
 
-fn state_is_older_than(incoming: &State, current: &State) -> bool {
+fn snapshot_is_fresh(snapshot: &Snapshot) -> bool {
+    const MAX_AGE_MS: i64 = 1_500;
+    let Some(updated_at) = snapshot.updated_at else {
+        return false;
+    };
+    let age = chrono::Utc::now() - updated_at;
+    age.num_milliseconds() >= 0 && age.num_milliseconds() <= MAX_AGE_MS
+}
+
+fn apply_ui_state(panes: &mut [Pane], ui_state: &UiState) {
+    for p in panes {
+        if let Some(ui) = ui_state
+            .panes
+            .get(&p.pane_id)
+            .or_else(|| ui_state.panes.get(&p.target))
+        {
+            p.stashed = ui.stashed;
+            if let Some(status) = ui.status_override {
+                p.status = PaneStatus::from_i32(status);
+            }
+        }
+    }
+}
+
+fn ui_state_is_older_than(incoming: &UiState, current: &UiState) -> bool {
     match (incoming.updated_at, current.updated_at) {
         (Some(incoming), Some(current)) => incoming < current,
         (None, Some(_)) => true,
         _ => false,
     }
+}
+
+fn has_status_override(ui_state: &UiState, pane_id: &str) -> bool {
+    ui_state
+        .panes
+        .get(pane_id)
+        .and_then(|ui| ui.status_override)
+        .is_some()
 }
 
 #[derive(Debug)]
@@ -328,7 +335,7 @@ struct App {
     pending_g: bool,
     count: usize,
     err: Option<String>,
-    state: State,
+    ui_state: UiState,
     pending_overrides: HashMap<String, PaneStatus>,
     hits: HitRegistry<Hit>,
     _tmux_session: String,
@@ -336,14 +343,11 @@ struct App {
 
 impl App {
     fn new(tmux_session: String) -> Self {
-        let state = load_state().unwrap_or_default();
-        let panes = if !state.panes.is_empty() {
-            panes_from_state_filtered_by_live(&state)
-        } else {
-            let mut panes = list_panes_basic().unwrap_or_default();
-            enrich_panes(&mut panes);
-            panes
-        };
+        let ui_state = load_ui_state();
+        let mut panes = load_display_snapshot()
+            .map(|snapshot| panes_from_snapshot(&snapshot))
+            .unwrap_or_default();
+        apply_ui_state(&mut panes, &ui_state);
         let mut app = Self {
             panes: panes.into_iter().map(|p| (p.pane_id.clone(), p)).collect(),
             items: Vec::new(),
@@ -356,14 +360,14 @@ impl App {
             project_win_width: HashMap::new(),
             width: 0,
             height: 0,
-            sidebar_width: state.sidebar_width,
+            sidebar_width: ui_state.sidebar_width,
             dragging: false,
             show_help: false,
             pending_d: false,
             pending_g: false,
             count: 0,
             err: None,
-            state,
+            ui_state,
             pending_overrides: HashMap::new(),
             hits: HitRegistry::new(),
             _tmux_session: tmux_session,
@@ -371,18 +375,18 @@ impl App {
         app.rebuild_items();
         if let Some(att) = app.first_attention_pane() {
             app.cursor = att;
-        } else if !app.state.last_position.pane_id.is_empty()
-            || !app.state.last_position.pane_target.is_empty()
+        } else if !app.ui_state.last_position.pane_id.is_empty()
+            || !app.ui_state.last_position.pane_target.is_empty()
         {
-            let id = if app.state.last_position.pane_id.is_empty() {
-                app.state.last_position.pane_target.clone()
+            let id = if app.ui_state.last_position.pane_id.is_empty() {
+                app.ui_state.last_position.pane_target.clone()
             } else {
-                app.state.last_position.pane_id.clone()
+                app.ui_state.last_position.pane_id.clone()
             };
             app.cursor = app
                 .find_pane_by_id(&id)
                 .unwrap_or_else(|| first_pane(&app.items).unwrap_or(0));
-            app.scroll_start = app.state.last_position.scroll_start;
+            app.scroll_start = app.ui_state.last_position.scroll_start;
         } else {
             app.cursor = first_pane(&app.items).unwrap_or(0);
         }
@@ -657,7 +661,7 @@ impl App {
                     let pane_id = p.pane_id.clone();
                     let target = p.target.clone();
                     let was_unread = p.status == PaneStatus::Unread
-                        && !has_status_override(&self.state, &pane_id);
+                        && !has_status_override(&self.ui_state, &pane_id);
                     if was_unread {
                         self.pending_overrides.insert(pane_id, PaneStatus::Idle);
                     }
@@ -714,56 +718,33 @@ impl App {
             })
             .map(|p| (p.pane_id.clone(), p.target.clone()))
             .unwrap_or_default();
-        let panes: Vec<Pane> = self
+        let pane_ids: std::collections::HashMap<String, bool> = self
             .items
             .iter()
             .filter_map(|it| match it {
-                TreeItem::Pane(id) => self.panes.get(id).cloned(),
+                TreeItem::Pane(id) => Some((id.clone(), true)),
                 _ => None,
             })
             .collect();
+        let panes: Vec<Pane> = pane_ids
+            .keys()
+            .filter_map(|id| self.panes.get(id).cloned())
+            .collect();
         let pending = self.pending_overrides.clone();
         let sidebar_width = self.sidebar_width;
-        let _ = update_state(|state| {
-            let existing: HashMap<String, _> = state
-                .panes
-                .iter()
-                .cloned()
-                .map(|cp| (cp.pane_key().to_string(), cp))
-                .collect();
-            let panes_by_id: HashMap<String, Pane> = panes
-                .iter()
-                .cloned()
-                .map(|p| (p.pane_id.clone(), p))
-                .collect();
-
-            state.panes = cache_panes(&panes);
-            for cp in &mut state.panes {
-                let id = cp.pane_key().to_string();
-                if let Some(old) = existing.get(&id) {
-                    cp.status_override = old.status_override;
-                    cp.content_hash = old.content_hash.clone();
-                    cp.last_status = old.last_status;
-                    if cp.last_active.is_none() {
-                        cp.last_active = old.last_active;
-                    }
-                }
-                if let Some(p) = panes_by_id.get(&id) {
-                    cp.stashed = p.stashed;
-                    cp.last_status = Some(p.status.as_i32());
-                    if !p.content_hash.is_empty() {
-                        cp.content_hash = p.content_hash.clone();
-                    }
-                    cp.last_active = p.last_active;
-                }
-                if let Some(status) = pending.get(&id) {
-                    cp.status_override = Some(status.as_i32());
-                    cp.last_status = Some(status.as_i32());
-                    if let Some(p) = panes_by_id.get(&id) {
-                        cp.content_hash = p.content_hash.clone();
-                    }
+        let _ = update_ui_state(|state| {
+            state.panes.retain(|id, _| pane_ids.contains_key(id));
+            for p in &panes {
+                let entry = state.panes.entry(p.pane_id.clone()).or_default();
+                entry.stashed = p.stashed;
+                if let Some(status) = pending.get(&p.pane_id) {
+                    entry.status_override = Some(status.as_i32());
+                    entry.content_hash = p.content_hash.clone();
                 }
             }
+            state
+                .panes
+                .retain(|_, ui| ui.stashed || ui.status_override.is_some());
             state.last_position = LastPosition {
                 pane_id: pane_id.clone(),
                 pane_target: pane_target.clone(),
@@ -771,7 +752,7 @@ impl App {
                 scroll_start,
             };
             state.sidebar_width = sidebar_width;
-            self.state = state.clone();
+            self.ui_state = state.clone();
         });
         self.pending_overrides.clear();
     }
@@ -878,8 +859,16 @@ fn render_tree_item(
                     &p.short_path,
                     &p.git_branch,
                     p.git_dirty,
-                    Style::new().fg(Color::White).bold(),
-                    Style::new().fg(Color::Green),
+                    if p.stashed {
+                        Style::new().fg(Color::DarkGrey)
+                    } else {
+                        Style::new().fg(Color::White).bold()
+                    },
+                    if p.stashed {
+                        Style::new().fg(Color::AnsiValue(242))
+                    } else {
+                        Style::new().fg(Color::Green)
+                    },
                 );
             }
         }
@@ -897,8 +886,16 @@ fn render_tree_item(
                     name,
                     &p.project_branch,
                     p.project_dirty,
-                    Style::new().fg(Color::White).bold(),
-                    Style::new().fg(Color::Green),
+                    if p.stashed {
+                        Style::new().fg(Color::DarkGrey)
+                    } else {
+                        Style::new().fg(Color::White).bold()
+                    },
+                    if p.stashed {
+                        Style::new().fg(Color::AnsiValue(242))
+                    } else {
+                        Style::new().fg(Color::Green)
+                    },
                 );
             }
         }
@@ -1032,20 +1029,23 @@ fn render_pane_row(
     }
     let gap = remaining.saturating_sub(display_width(&worktree_rendered));
 
-    let icon_color = match p.status {
-        PaneStatus::Busy => Color::Rgb {
-            r: 217,
-            g: 119,
-            b: 6,
-        },
-        PaneStatus::NeedsAttention | PaneStatus::Unread => Color::Rgb {
-            r: 155,
-            g: 155,
-            b: 245,
-        },
-        PaneStatus::Idle if selected => Color::White,
-        PaneStatus::Idle if p.stashed => Color::AnsiValue(242),
-        PaneStatus::Idle => Color::DarkGrey,
+    let icon_color = if p.stashed && !selected {
+        Color::AnsiValue(242)
+    } else {
+        match p.status {
+            PaneStatus::Busy => Color::Rgb {
+                r: 217,
+                g: 119,
+                b: 6,
+            },
+            PaneStatus::NeedsAttention | PaneStatus::Unread => Color::Rgb {
+                r: 155,
+                g: 155,
+                b: 245,
+            },
+            PaneStatus::Idle if selected => Color::White,
+            PaneStatus::Idle => Color::DarkGrey,
+        }
     };
     let icon = if matches!(p.status, PaneStatus::Idle) {
         '○'

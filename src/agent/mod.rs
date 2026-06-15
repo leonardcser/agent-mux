@@ -6,10 +6,7 @@ pub mod tmux;
 pub mod watch;
 
 pub use reconcile::Reconciler;
-pub use tmux::{
-    capture_pane, kill_pane, list_panes, list_panes_basic, restart_watch, start_watch,
-    switch_to_pane,
-};
+pub use tmux::{capture_pane, kill_pane, list_panes, restart_watch, start_watch, switch_to_pane};
 
 use chrono::{DateTime, Utc};
 

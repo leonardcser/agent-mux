@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::agent::persist::{CachedPane, State};
+use crate::agent::persist::{CachedPane, Snapshot, UiState};
 use crate::agent::{Pane, PaneStatus};
 
 #[derive(Debug, Clone)]
@@ -25,8 +25,8 @@ impl Reconciler {
         Self::default()
     }
 
-    pub fn seed_from_state(&mut self, state: &State) {
-        for cp in &state.panes {
+    pub fn seed_from_snapshot(&mut self, snapshot: &Snapshot) {
+        for cp in &snapshot.panes {
             let id = cp.pane_key().to_string();
             if !cp.content_hash.is_empty() {
                 self.prev_content
@@ -36,58 +36,39 @@ impl Reconciler {
                 self.prev_statuses
                     .insert(id.clone(), PaneStatus::from_i32(s));
             }
-            if let Some(s) = cp.status_override {
-                self.overrides.insert(
-                    id.clone(),
-                    StatusOverride {
-                        status: PaneStatus::from_i32(s),
-                        content_hash: cp.content_hash.clone(),
-                    },
-                );
-            }
             if let Some(t) = cp.last_active {
                 self.last_active.insert(id, t);
             }
         }
     }
 
-    pub fn merge_overrides(&mut self, state: &State) {
-        for cp in &state.panes {
-            let Some(status) = cp.status_override else {
+    pub fn merge_overrides(&mut self, ui_state: &UiState) {
+        let override_ids: HashMap<String, bool> = ui_state
+            .panes
+            .iter()
+            .filter(|(_, ui)| ui.status_override.is_some())
+            .map(|(id, _)| (id.clone(), true))
+            .collect();
+        self.overrides.retain(|id, _| override_ids.contains_key(id));
+
+        for (id, ui) in &ui_state.panes {
+            let Some(status) = ui.status_override else {
                 continue;
             };
-            let id = cp.pane_key().to_string();
             let ov = StatusOverride {
                 status: PaneStatus::from_i32(status),
-                content_hash: cp.content_hash.clone(),
+                content_hash: ui.content_hash.clone(),
             };
             self.prev_statuses.insert(id.clone(), ov.status);
-            self.overrides.insert(id, ov);
+            self.overrides.insert(id.clone(), ov);
         }
     }
 
-    pub fn merge_new_overrides(&mut self, prev: &State, fresh: &State) {
-        let mut existing = HashMap::new();
-        for cp in &prev.panes {
-            if let Some(status) = cp.status_override {
-                existing.insert(cp.pane_key().to_string(), status);
-            }
-        }
-        for cp in &fresh.panes {
-            let Some(status) = cp.status_override else {
-                continue;
-            };
-            let id = cp.pane_key().to_string();
-            if existing.get(&id).is_some_and(|old| *old == status) {
-                continue;
-            }
-            let ov = StatusOverride {
-                status: PaneStatus::from_i32(status),
-                content_hash: cp.content_hash.clone(),
-            };
-            self.prev_statuses.insert(id.clone(), ov.status);
-            self.overrides.insert(id, ov);
-        }
+    pub fn override_entries(&self) -> Vec<(String, PaneStatus, String)> {
+        self.overrides
+            .iter()
+            .map(|(id, ov)| (id.clone(), ov.status, ov.content_hash.clone()))
+            .collect()
     }
 
     pub fn reconcile(&mut self, panes: &mut [Pane]) {

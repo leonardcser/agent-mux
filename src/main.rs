@@ -12,6 +12,9 @@ fn main() -> Result<()> {
     if args.iter().any(|arg| arg == "watch") {
         return agent::watch::run();
     }
+    if args.iter().any(|arg| arg == "refresh") {
+        return agent::watch::refresh_once();
+    }
 
     if args
         .iter()

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::agent::{Pane, PaneStatus, tmux::parse_target};
 
@@ -99,6 +99,48 @@ pub struct State {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    #[serde(default)]
+    pub version: i32,
+    #[serde(default)]
+    pub panes: Vec<CachedPane>,
+    #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiState {
+    #[serde(default)]
+    pub version: i32,
+    #[serde(default)]
+    pub panes: std::collections::HashMap<String, UiPaneState>,
+    #[serde(rename = "lastPosition", default)]
+    pub last_position: LastPosition,
+    #[serde(rename = "sidebarWidth", default, skip_serializing_if = "is_zero_u16")]
+    pub sidebar_width: u16,
+    #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiPaneState {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stashed: bool,
+    #[serde(
+        rename = "statusOverride",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub status_override: Option<i32>,
+    #[serde(
+        rename = "contentHash",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LastPosition {
     #[serde(rename = "pane_id", default, skip_serializing_if = "String::is_empty")]
     pub pane_id: String,
@@ -138,45 +180,104 @@ pub fn load_state() -> Option<State> {
     load_state_file(state_path())
 }
 
-fn load_state_file(path: PathBuf) -> Option<State> {
-    let data = fs::read(path).ok()?;
-    let state: State = serde_json::from_slice(&data).ok()?;
-    (state.version == 1).then_some(state)
+pub fn load_snapshot() -> Option<Snapshot> {
+    load_json_file(snapshot_path())
+        .filter(|snapshot: &Snapshot| snapshot.version == 1)
+        .or_else(|| {
+            load_state().map(|state| Snapshot {
+                version: state.version,
+                panes: state.panes,
+                updated_at: state.updated_at,
+            })
+        })
 }
 
-pub fn update_state(mut f: impl FnMut(&mut State)) -> Result<()> {
-    let lock_file = lock_state_file()?;
-    let mut state = load_state().unwrap_or_default();
-    f(&mut state);
-    write_state_file(state)?;
+pub fn load_ui_state() -> UiState {
+    load_json_file(ui_state_path())
+        .filter(|state: &UiState| state.version == 1)
+        .or_else(|| load_state().map(ui_state_from_legacy_state))
+        .unwrap_or_default()
+}
+
+fn ui_state_from_legacy_state(state: State) -> UiState {
+    let panes = state
+        .panes
+        .into_iter()
+        .filter_map(|cp| {
+            let key = cp.pane_key().to_string();
+            let ui = UiPaneState {
+                stashed: cp.stashed,
+                status_override: cp.status_override,
+                content_hash: cp.content_hash,
+            };
+            (ui.stashed || ui.status_override.is_some()).then_some((key, ui))
+        })
+        .collect();
+    UiState {
+        version: state.version,
+        panes,
+        last_position: state.last_position,
+        sidebar_width: state.sidebar_width,
+        updated_at: state.updated_at,
+    }
+}
+
+pub fn write_snapshot(mut snapshot: Snapshot) -> Result<()> {
+    let lock_file = lock_file(snapshot_write_lock_path())?;
+    snapshot.version = 1;
+    snapshot.updated_at = Some(Utc::now());
+    write_json_file(snapshot_path(), &snapshot)?;
     drop(lock_file);
     Ok(())
 }
 
-fn lock_state_file() -> Result<File> {
+pub fn update_ui_state(mut f: impl FnMut(&mut UiState)) -> Result<()> {
+    let lock_file = lock_file(ui_state_write_lock_path())?;
+    let mut state = load_ui_state();
+    f(&mut state);
+    state.version = 1;
+    state.updated_at = Some(Utc::now());
+    write_json_file(ui_state_path(), &state)?;
+    drop(lock_file);
+    Ok(())
+}
+
+fn load_state_file(path: PathBuf) -> Option<State> {
+    let state: State = load_json_file(path)?;
+    (state.version == 1).then_some(state)
+}
+
+fn load_json_file<T: DeserializeOwned>(path: PathBuf) -> Option<T> {
+    let data = fs::read(path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+fn lock_file(path: PathBuf) -> Result<File> {
     fs::create_dir_all(state_dir()).context("create state dir")?;
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
-        .open(state_write_lock_path())
+        .open(path)
         .context("open state lock")?;
     file.lock_exclusive().context("lock state")?;
     Ok(file)
 }
 
-fn write_state_file(mut state: State) -> Result<()> {
+fn write_json_file<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
     fs::create_dir_all(state_dir()).context("create state dir")?;
-    state.version = 1;
-    state.updated_at = Some(Utc::now());
-    let data = serde_json::to_vec_pretty(&state).context("encode state")?;
-    let tmp_path = state_dir().join(format!(".state-{}.tmp", std::process::id()));
+    let data = serde_json::to_vec_pretty(value).context("encode state")?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("state.json");
+    let tmp_path = state_dir().join(format!(".{file_name}-{}.tmp", std::process::id()));
     {
         let mut tmp = File::create(&tmp_path).context("create tmp state")?;
         tmp.write_all(&data).context("write tmp state")?;
         tmp.sync_all().ok();
     }
-    fs::rename(&tmp_path, state_path()).context("rename state")?;
+    fs::rename(&tmp_path, path).context("rename state")?;
     Ok(())
 }
 
@@ -204,9 +305,12 @@ pub fn cache_panes(panes: &[Pane]) -> Vec<CachedPane> {
         .collect()
 }
 
-pub fn panes_from_state(state: &State) -> Vec<Pane> {
-    state
-        .panes
+pub fn panes_from_snapshot(snapshot: &Snapshot) -> Vec<Pane> {
+    panes_from_cached(&snapshot.panes)
+}
+
+fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
+    panes
         .iter()
         .map(|cp| {
             let id = if cp.pane_id.is_empty() {
@@ -242,13 +346,6 @@ pub fn panes_from_state(state: &State) -> Vec<Pane> {
         .collect()
 }
 
-pub fn has_status_override(state: &State, pane_id: &str) -> bool {
-    state
-        .panes
-        .iter()
-        .any(|cp| cp.pane_key() == pane_id && cp.status_override.is_some())
-}
-
 pub fn state_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -260,6 +357,18 @@ pub fn state_path() -> PathBuf {
     state_dir().join("state.json")
 }
 
-pub fn state_write_lock_path() -> PathBuf {
-    state_dir().join("state.lock")
+pub fn snapshot_path() -> PathBuf {
+    state_dir().join("snapshot.json")
+}
+
+pub fn ui_state_path() -> PathBuf {
+    state_dir().join("ui_state.json")
+}
+
+pub fn snapshot_write_lock_path() -> PathBuf {
+    state_dir().join("snapshot.lock")
+}
+
+pub fn ui_state_write_lock_path() -> PathBuf {
+    state_dir().join("ui_state.lock")
 }

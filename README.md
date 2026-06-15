@@ -37,16 +37,24 @@ cargo run --release -- watch
 
 ### Configure tmux
 
-Add to your `~/.tmux.conf` to start the background watcher and set up a key
-binding:
+Add to your `~/.tmux.conf` to start the background watcher, keep its snapshot
+fresh on tmux topology changes, and set up a key binding. This assumes
+`agent-mux` resolves to the Rust binary in tmux's `PATH`.
 
 ```tmux
 run-shell -b "agent-mux watch"
 bind j run-shell "tmux neww agent-mux"
+
+set-hook -g after-kill-pane 'run-shell -b "agent-mux refresh"'
+set-hook -g window-unlinked 'run-shell -b "agent-mux refresh"'
+set-hook -g session-closed 'run-shell -b "agent-mux refresh"'
+set-hook -g after-new-window 'run-shell -b "agent-mux refresh"'
+set-hook -g after-split-window 'run-shell -b "agent-mux refresh"'
 ```
 
-The watcher polls session statuses every 500ms, so the TUI opens instantly with
-accurate statuses.
+The watcher owns the canonical pane snapshot used by the TUI. It polls session
+statuses every 500ms, while the hooks trigger an immediate refresh when panes,
+windows, or sessions are created or removed.
 
 Reload tmux: `tmux source-file ~/.tmux.conf`
 
