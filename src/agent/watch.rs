@@ -10,8 +10,8 @@ use fs2::FileExt;
 
 use crate::agent::git::enrich_panes;
 use crate::agent::persist::{
-    Snapshot, cache_panes, load_snapshot, load_ui_state, state_dir, update_ui_state_if_changed,
-    write_heartbeat, write_snapshot_if_changed,
+    Snapshot, cache_panes, load_snapshot, load_ui_state, state_dir, ui_pane_state_is_empty,
+    update_ui_state_if_changed, write_heartbeat, write_snapshot_if_changed,
 };
 use crate::agent::{Pane, Reconciler, list_panes_fast};
 
@@ -74,7 +74,6 @@ fn refresh_once_with(reconciler: &mut Reconciler, enrich_git: bool) -> Result<()
 
     let previous = load_snapshot();
     let ui_state = load_ui_state();
-    reconciler.merge_overrides(&ui_state);
 
     let mut panes = list_panes_fast()?;
     for p in &mut panes {
@@ -102,27 +101,21 @@ fn refresh_once_with(reconciler: &mut Reconciler, enrich_git: bool) -> Result<()
         write_heartbeat()?;
     }
 
-    let overrides = reconciler.override_entries();
-    update_ui_state_if_changed(|state| {
-        let alive: std::collections::HashMap<String, bool> =
-            panes.iter().map(|p| (p.pane_id.clone(), true)).collect();
-        state.panes.retain(|id, _| alive.contains_key(id));
-        for (id, status, content_hash) in &overrides {
-            let ui = state.panes.entry(id.clone()).or_default();
-            ui.status_override = Some(status.as_i32());
-            ui.content_hash = content_hash.clone();
-        }
-        for (id, ui) in &mut state.panes {
-            if !overrides
-                .iter()
-                .any(|(override_id, _, _)| override_id == id)
-            {
-                ui.status_override = None;
-                ui.content_hash.clear();
-            }
-        }
-    })?;
+    prune_ui_state(&panes)?;
 
+    Ok(())
+}
+
+fn prune_ui_state(panes: &[Pane]) -> Result<()> {
+    let alive: std::collections::HashMap<String, bool> = panes
+        .iter()
+        .flat_map(|p| [(p.pane_id.clone(), true), (p.target.clone(), true)])
+        .collect();
+    update_ui_state_if_changed(|state| {
+        state
+            .panes
+            .retain(|id, ui| alive.contains_key(id) && !ui_pane_state_is_empty(ui));
+    })?;
     Ok(())
 }
 

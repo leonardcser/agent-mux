@@ -19,8 +19,8 @@ use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::persist::{
-    LastPosition, Snapshot, UiState, load_heartbeat, load_snapshot, load_ui_state,
-    panes_from_snapshot, update_ui_state,
+    LastPosition, Snapshot, UiState, apply_ui_state, has_manual_status, load_heartbeat,
+    load_snapshot, load_ui_state, panes_from_snapshot, ui_pane_state_is_empty, update_ui_state,
 };
 use crate::agent::{Pane, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane};
 
@@ -297,35 +297,12 @@ fn snapshot_is_fresh(snapshot: &Snapshot) -> bool {
     age.num_milliseconds() >= 0 && age.num_milliseconds() <= MAX_AGE_MS
 }
 
-fn apply_ui_state(panes: &mut [Pane], ui_state: &UiState) {
-    for p in panes {
-        if let Some(ui) = ui_state
-            .panes
-            .get(&p.pane_id)
-            .or_else(|| ui_state.panes.get(&p.target))
-        {
-            p.stashed = ui.stashed;
-            if let Some(status) = ui.status_override {
-                p.status = PaneStatus::from_i32(status);
-            }
-        }
-    }
-}
-
 fn ui_state_is_older_than(incoming: &UiState, current: &UiState) -> bool {
     match (incoming.updated_at, current.updated_at) {
         (Some(incoming), Some(current)) => incoming < current,
         (None, Some(_)) => true,
         _ => false,
     }
-}
-
-fn has_status_override(ui_state: &UiState, pane_id: &str) -> bool {
-    ui_state
-        .panes
-        .get(pane_id)
-        .and_then(|ui| ui.status_override)
-        .is_some()
 }
 
 #[derive(Debug)]
@@ -358,7 +335,7 @@ struct App {
     count: usize,
     err: Option<String>,
     ui_state: UiState,
-    pending_overrides: HashMap<String, PaneStatus>,
+    pending_manual_statuses: HashMap<String, PaneStatus>,
     pending_kills: HashMap<String, Pane>,
     hits: HitRegistry<Hit>,
     _tmux_session: String,
@@ -398,7 +375,7 @@ impl App {
             count: 0,
             err: snapshot.is_none().then(|| SYNCING_MSG.to_string()),
             ui_state,
-            pending_overrides: HashMap::new(),
+            pending_manual_statuses: HashMap::new(),
             pending_kills: HashMap::new(),
             hits: HitRegistry::new(),
             _tmux_session: tmux_session,
@@ -540,7 +517,7 @@ impl App {
         let pane = self.current_pane()?.clone();
         let pane_id = pane.pane_id.clone();
         let target = pane.target.clone();
-        self.pending_overrides.remove(&pane_id);
+        self.pending_manual_statuses.remove(&pane_id);
         self.pending_kills.insert(pane_id.clone(), pane);
         self.panes.remove(&pane_id);
         self.rebuild_items();
@@ -651,7 +628,7 @@ impl App {
                     changed = Some((p.pane_id.clone(), p.status));
                 }
                 if let Some((id, status)) = changed {
-                    self.pending_overrides.insert(id, status);
+                    self.pending_manual_statuses.insert(id, status);
                     self.save_state();
                 }
                 Action::Redraw
@@ -733,9 +710,10 @@ impl App {
                     let pane_id = p.pane_id.clone();
                     let target = p.target.clone();
                     let was_unread = p.status == PaneStatus::Unread
-                        && !has_status_override(&self.ui_state, &pane_id);
+                        && !has_manual_status(&self.ui_state, &pane_id, &target);
                     if was_unread {
-                        self.pending_overrides.insert(pane_id, PaneStatus::Idle);
+                        self.pending_manual_statuses
+                            .insert(pane_id, PaneStatus::Idle);
                     }
                     let _ = switch_to_pane(&target);
                 }
@@ -802,21 +780,26 @@ impl App {
             .keys()
             .filter_map(|id| self.panes.get(id).cloned())
             .collect();
-        let pending = self.pending_overrides.clone();
+        let pending = self.pending_manual_statuses.clone();
         let sidebar_width = self.sidebar_width;
-        let _ = update_ui_state(|state| {
+        if update_ui_state(|state| {
+            for p in &panes {
+                if !state.panes.contains_key(&p.pane_id)
+                    && let Some(ui) = state.panes.remove(&p.target)
+                {
+                    state.panes.insert(p.pane_id.clone(), ui);
+                }
+            }
             state.panes.retain(|id, _| pane_ids.contains_key(id));
             for p in &panes {
                 let entry = state.panes.entry(p.pane_id.clone()).or_default();
                 entry.stashed = p.stashed;
                 if let Some(status) = pending.get(&p.pane_id) {
-                    entry.status_override = Some(status.as_i32());
-                    entry.content_hash = p.content_hash.clone();
+                    entry.manual_status = Some(status.as_i32());
+                    entry.manual_status_base_hash = p.content_hash.clone();
                 }
             }
-            state
-                .panes
-                .retain(|_, ui| ui.stashed || ui.status_override.is_some());
+            state.panes.retain(|_, ui| !ui_pane_state_is_empty(ui));
             state.last_position = LastPosition {
                 pane_id: pane_id.clone(),
                 pane_target: pane_target.clone(),
@@ -824,9 +807,12 @@ impl App {
                 scroll_start,
             };
             state.sidebar_width = sidebar_width;
-            self.ui_state = state.clone();
-        });
-        self.pending_overrides.clear();
+        })
+        .is_ok()
+        {
+            self.ui_state = load_ui_state();
+            self.pending_manual_statuses.clear();
+        }
     }
 }
 

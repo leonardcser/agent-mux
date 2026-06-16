@@ -2,21 +2,14 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::agent::persist::{CachedPane, Snapshot, UiState};
+use crate::agent::persist::{CachedPane, Snapshot};
 use crate::agent::{Pane, PaneStatus};
-
-#[derive(Debug, Clone)]
-pub struct StatusOverride {
-    status: PaneStatus,
-    content_hash: String,
-}
 
 #[derive(Debug, Default)]
 pub struct Reconciler {
     prev_content: HashMap<String, String>,
     unchanged_count: HashMap<String, usize>,
     prev_statuses: HashMap<String, PaneStatus>,
-    overrides: HashMap<String, StatusOverride>,
     last_active: HashMap<String, DateTime<Utc>>,
 }
 
@@ -40,35 +33,6 @@ impl Reconciler {
                 self.last_active.insert(id, t);
             }
         }
-    }
-
-    pub fn merge_overrides(&mut self, ui_state: &UiState) {
-        let override_ids: HashMap<String, bool> = ui_state
-            .panes
-            .iter()
-            .filter(|(_, ui)| ui.status_override.is_some())
-            .map(|(id, _)| (id.clone(), true))
-            .collect();
-        self.overrides.retain(|id, _| override_ids.contains_key(id));
-
-        for (id, ui) in &ui_state.panes {
-            let Some(status) = ui.status_override else {
-                continue;
-            };
-            let ov = StatusOverride {
-                status: PaneStatus::from_i32(status),
-                content_hash: ui.content_hash.clone(),
-            };
-            self.prev_statuses.insert(id.clone(), ov.status);
-            self.overrides.insert(id.clone(), ov);
-        }
-    }
-
-    pub fn override_entries(&self) -> Vec<(String, PaneStatus, String)> {
-        self.overrides
-            .iter()
-            .map(|(id, ov)| (id.clone(), ov.status, ov.content_hash.clone()))
-            .collect()
     }
 
     pub fn reconcile(&mut self, panes: &mut [Pane]) {
@@ -96,34 +60,6 @@ impl Reconciler {
                 *self.unchanged_count.entry(id.clone()).or_default() += 1;
             }
             p.last_active = self.last_active.get(&id).copied();
-
-            if let Some(ov) = self.overrides.get(&id).cloned() {
-                match ov.status {
-                    PaneStatus::Unread => {
-                        p.status = PaneStatus::Unread;
-                        self.track_pane(p);
-                        continue;
-                    }
-                    PaneStatus::Idle => {
-                        if active_now && !p.window_active {
-                            self.overrides.remove(&id);
-                        } else {
-                            p.status = PaneStatus::Idle;
-                            self.track_pane(p);
-                            continue;
-                        }
-                    }
-                    _ => {
-                        if active_now {
-                            self.overrides.remove(&id);
-                        } else {
-                            p.status = ov.status;
-                            self.track_pane(p);
-                            continue;
-                        }
-                    }
-                }
-            }
 
             p.status = if active_now {
                 if p.window_active && prev_status == PaneStatus::Idle {
@@ -163,7 +99,6 @@ impl Reconciler {
         self.prev_content.retain(|k, _| alive.contains_key(k));
         self.unchanged_count.retain(|k, _| alive.contains_key(k));
         self.prev_statuses.retain(|k, _| alive.contains_key(k));
-        self.overrides.retain(|k, _| alive.contains_key(k));
         self.last_active.retain(|k, _| alive.contains_key(k));
     }
 

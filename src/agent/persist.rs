@@ -137,17 +137,19 @@ pub struct UiPaneState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stashed: bool,
     #[serde(
-        rename = "statusOverride",
+        rename = "manualStatus",
+        alias = "statusOverride",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub status_override: Option<i32>,
+    pub manual_status: Option<i32>,
     #[serde(
-        rename = "contentHash",
+        rename = "manualStatusBaseHash",
+        alias = "contentHash",
         default,
         skip_serializing_if = "String::is_empty"
     )]
-    pub content_hash: String,
+    pub manual_status_base_hash: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -216,6 +218,60 @@ pub fn load_heartbeat() -> Option<Heartbeat> {
     load_json_file(heartbeat_path()).filter(|heartbeat: &Heartbeat| heartbeat.version == 1)
 }
 
+pub fn apply_ui_state(panes: &mut [Pane], ui_state: &UiState) {
+    for pane in panes {
+        if let Some(ui) = ui_state
+            .panes
+            .get(&pane.pane_id)
+            .or_else(|| ui_state.panes.get(&pane.target))
+        {
+            apply_pane_ui_state(pane, ui);
+        }
+    }
+}
+
+pub fn apply_pane_ui_state(pane: &mut Pane, ui: &UiPaneState) {
+    pane.stashed = ui.stashed;
+    if let Some(status) = ui.manual_status {
+        pane.status = display_status(
+            pane.status,
+            &pane.content_hash,
+            PaneStatus::from_i32(status),
+            &ui.manual_status_base_hash,
+        );
+    }
+}
+
+pub fn display_status(
+    observed_status: PaneStatus,
+    content_hash: &str,
+    manual_status: PaneStatus,
+    manual_status_base_hash: &str,
+) -> PaneStatus {
+    let same_content =
+        manual_status_base_hash.is_empty() || manual_status_base_hash == content_hash;
+    match manual_status {
+        PaneStatus::Unread => PaneStatus::Unread,
+        PaneStatus::Idle if same_content => PaneStatus::Idle,
+        PaneStatus::Idle => observed_status,
+        status if same_content => status,
+        _ => observed_status,
+    }
+}
+
+pub fn has_manual_status(ui_state: &UiState, pane_id: &str, pane_target: &str) -> bool {
+    ui_state
+        .panes
+        .get(pane_id)
+        .or_else(|| ui_state.panes.get(pane_target))
+        .and_then(|ui| ui.manual_status)
+        .is_some()
+}
+
+pub fn ui_pane_state_is_empty(ui: &UiPaneState) -> bool {
+    !ui.stashed && ui.manual_status.is_none()
+}
+
 fn ui_state_from_legacy_state(state: State) -> UiState {
     let panes = state
         .panes
@@ -224,10 +280,10 @@ fn ui_state_from_legacy_state(state: State) -> UiState {
             let key = cp.pane_key().to_string();
             let ui = UiPaneState {
                 stashed: cp.stashed,
-                status_override: cp.status_override,
-                content_hash: cp.content_hash,
+                manual_status: cp.status_override,
+                manual_status_base_hash: cp.content_hash,
             };
-            (ui.stashed || ui.status_override.is_some()).then_some((key, ui))
+            (ui.stashed || ui.manual_status.is_some()).then_some((key, ui))
         })
         .collect();
     UiState {
@@ -430,6 +486,64 @@ fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UiPaneState, UiState, apply_ui_state, display_status, has_manual_status};
+    use crate::agent::{Pane, PaneStatus};
+
+    fn pane(status: PaneStatus, content_hash: &str) -> Pane {
+        Pane {
+            pane_id: "%1".to_string(),
+            target: "s:1.1".to_string(),
+            status,
+            content_hash: content_hash.to_string(),
+            ..Pane::default()
+        }
+    }
+
+    fn ui(status: PaneStatus, content_hash: &str) -> UiPaneState {
+        UiPaneState {
+            manual_status: Some(status.as_i32()),
+            manual_status_base_hash: content_hash.to_string(),
+            ..UiPaneState::default()
+        }
+    }
+
+    #[test]
+    fn manual_unread_overrides_observed_idle() {
+        assert_eq!(
+            display_status(PaneStatus::Idle, "new", PaneStatus::Unread, "old"),
+            PaneStatus::Unread
+        );
+    }
+
+    #[test]
+    fn manual_read_holds_until_content_changes() {
+        assert_eq!(
+            display_status(PaneStatus::Unread, "same", PaneStatus::Idle, "same"),
+            PaneStatus::Idle
+        );
+        assert_eq!(
+            display_status(PaneStatus::Unread, "new", PaneStatus::Idle, "old"),
+            PaneStatus::Unread
+        );
+    }
+
+    #[test]
+    fn applies_user_state_as_display_layer() {
+        let mut panes = vec![pane(PaneStatus::Unread, "same")];
+        let mut state = UiState::default();
+        state
+            .panes
+            .insert("%1".to_string(), ui(PaneStatus::Idle, "same"));
+
+        apply_ui_state(&mut panes, &state);
+
+        assert_eq!(panes[0].status, PaneStatus::Idle);
+        assert!(has_manual_status(&state, "%1", "s:1.1"));
+    }
 }
 
 pub fn state_dir() -> PathBuf {
