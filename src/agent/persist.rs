@@ -58,6 +58,8 @@ pub struct CachedPane {
     pub order: usize,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
+    #[serde(rename = "windowActive", default, skip_serializing_if = "is_false")]
+    pub window_active: bool,
     #[serde(
         rename = "statusOverride",
         default,
@@ -331,6 +333,7 @@ fn comparable_panes(panes: &[CachedPane]) -> Vec<CachedPane> {
         .map(|mut pane| {
             pane.stashed = false;
             pane.status_override = None;
+            pane.window_active = false;
             pane.content_hash.clear();
             pane.last_active = None;
             pane
@@ -437,6 +440,7 @@ pub fn cache_panes(panes: &[Pane]) -> Vec<CachedPane> {
             git_dirty: p.git_dirty,
             order: p.order,
             provider: p.provider.clone(),
+            window_active: p.window_active,
             last_active: p.last_active,
             ..CachedPane::default()
         })
@@ -475,6 +479,7 @@ fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
                 stashed: cp.stashed,
                 order: cp.order,
                 provider: cp.provider.clone(),
+                window_active: cp.window_active,
                 content_hash: cp.content_hash.clone(),
                 status: cp.last_status.map(PaneStatus::from_i32).unwrap_or_default(),
                 last_active: cp.last_active,

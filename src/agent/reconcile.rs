@@ -10,6 +10,7 @@ pub struct Reconciler {
     prev_content: HashMap<String, String>,
     unchanged_count: HashMap<String, usize>,
     prev_statuses: HashMap<String, PaneStatus>,
+    prev_window_active: HashMap<String, bool>,
     last_active: HashMap<String, DateTime<Utc>>,
 }
 
@@ -29,6 +30,7 @@ impl Reconciler {
                 self.prev_statuses
                     .insert(id.clone(), PaneStatus::from_i32(s));
             }
+            self.prev_window_active.insert(id.clone(), cp.window_active);
             if let Some(t) = cp.last_active {
                 self.last_active.insert(id, t);
             }
@@ -46,11 +48,16 @@ impl Reconciler {
                 .get(&id)
                 .copied()
                 .unwrap_or(PaneStatus::Idle);
-            let content_changed = !p.content_hash.is_empty()
+            let raw_content_changed = !p.content_hash.is_empty()
                 && self
                     .prev_content
                     .get(&id)
                     .is_none_or(|prev| *prev != p.content_hash);
+            let focus_changed = self
+                .prev_window_active
+                .get(&id)
+                .is_some_and(|prev| *prev != p.window_active);
+            let content_changed = raw_content_changed && !focus_changed;
             let active_now = content_changed || p.content_moving;
 
             if active_now {
@@ -99,6 +106,7 @@ impl Reconciler {
         self.prev_content.retain(|k, _| alive.contains_key(k));
         self.unchanged_count.retain(|k, _| alive.contains_key(k));
         self.prev_statuses.retain(|k, _| alive.contains_key(k));
+        self.prev_window_active.retain(|k, _| alive.contains_key(k));
         self.last_active.retain(|k, _| alive.contains_key(k));
     }
 
@@ -107,7 +115,8 @@ impl Reconciler {
         if !p.content_hash.is_empty() {
             self.prev_content.insert(id.clone(), p.content_hash.clone());
         }
-        self.prev_statuses.insert(id, p.status);
+        self.prev_statuses.insert(id.clone(), p.status);
+        self.prev_window_active.insert(id, p.window_active);
     }
 
     pub fn apply_to_cache(&self, panes: &mut [CachedPane]) {
@@ -119,9 +128,65 @@ impl Reconciler {
             if let Some(s) = self.prev_statuses.get(&id) {
                 cp.last_status = Some(s.as_i32());
             }
+            if let Some(active) = self.prev_window_active.get(&id) {
+                cp.window_active = *active;
+            }
             if let Some(t) = self.last_active.get(&id) {
                 cp.last_active = Some(*t);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(status: PaneStatus, content_hash: &str, window_active: bool) -> Snapshot {
+        Snapshot {
+            version: 1,
+            panes: vec![CachedPane {
+                pane_id: "%1".to_string(),
+                target: "s:1.1".to_string(),
+                content_hash: content_hash.to_string(),
+                last_status: Some(status.as_i32()),
+                window_active,
+                ..CachedPane::default()
+            }],
+            ..Snapshot::default()
+        }
+    }
+
+    fn pane(content_hash: &str, window_active: bool, heuristic_attention: bool) -> Pane {
+        Pane {
+            pane_id: "%1".to_string(),
+            target: "s:1.1".to_string(),
+            content_hash: content_hash.to_string(),
+            window_active,
+            heuristic_attention,
+            ..Pane::default()
+        }
+    }
+
+    #[test]
+    fn content_change_without_focus_change_marks_busy() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::NeedsAttention, "old", false));
+        let mut panes = vec![pane("new", false, true)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::Busy);
+    }
+
+    #[test]
+    fn focus_change_content_redraw_does_not_mark_busy() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::NeedsAttention, "old", true));
+        let mut panes = vec![pane("new", false, true)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::NeedsAttention);
     }
 }
