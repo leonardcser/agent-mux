@@ -16,6 +16,7 @@ struct DirtyEntry {
 static DIRTY_CACHE: OnceLock<Mutex<HashMap<String, DirtyEntry>>> = OnceLock::new();
 
 pub fn enrich_panes(panes: &mut [Pane]) {
+    let _g = smelt_perf::perf::begin("git.enrich_panes");
     let mut unique: HashMap<String, WsInfo> = HashMap::new();
     for p in panes.iter() {
         unique.entry(p.path.clone()).or_insert_with(|| WsInfo {
@@ -27,6 +28,7 @@ pub fn enrich_panes(panes: &mut [Pane]) {
         });
     }
 
+    smelt_perf::perf::record_value("git.unique_paths", unique.len() as u64);
     for (path, info) in unique.iter_mut() {
         info.git_branch = git_branch(path);
         info.git_dirty = git_dirty(path);
@@ -138,6 +140,7 @@ fn clean_path(path: PathBuf) -> PathBuf {
 }
 
 fn git_branch(dir: &str) -> String {
+    let _g = smelt_perf::perf::begin("git.branch");
     let Some(gitdir) = resolve_git_dir(dir) else {
         return String::new();
     };
@@ -156,6 +159,7 @@ fn git_branch(dir: &str) -> String {
 }
 
 fn git_dirty(dir: &str) -> bool {
+    let _g = smelt_perf::perf::begin("git.dirty");
     let Some(gitdir) = resolve_git_dir(dir) else {
         return false;
     };
@@ -174,13 +178,16 @@ fn git_dirty(dir: &str) -> bool {
         return entry.dirty;
     }
 
-    let dirty = Command::new("git")
-        .arg("status")
-        .arg("--porcelain")
-        .current_dir(dir)
-        .output()
-        .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
-        .unwrap_or(false);
+    let dirty = {
+        let _g = smelt_perf::perf::begin("git.status");
+        Command::new("git")
+            .arg("status")
+            .arg("--porcelain")
+            .current_dir(dir)
+            .output()
+            .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+            .unwrap_or(false)
+    };
 
     if let Ok(mut cache) = cache.lock() {
         cache.insert(

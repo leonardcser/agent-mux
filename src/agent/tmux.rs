@@ -1,15 +1,24 @@
+use std::fs::OpenOptions;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
 
 use crate::agent::Pane;
 use crate::agent::git::enrich_panes;
 use crate::agent::provider::{ProcessTable, parse_process_table, resolve};
+
+const PROCESS_TABLE_TTL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone)]
+struct ProcessTableCache {
+    loaded_at: Instant,
+    table: ProcessTable,
+}
 
 #[derive(Debug, Clone)]
 struct RawPane {
@@ -26,21 +35,28 @@ struct RawPane {
 }
 
 pub fn list_panes() -> Result<Vec<Pane>> {
+    let _g = smelt_perf::perf::begin("agent.list_panes");
     let mut panes = list_panes_fast()?;
     enrich_panes(&mut panes);
     Ok(panes)
 }
 
 pub fn list_panes_fast() -> Result<Vec<Pane>> {
+    let _g = smelt_perf::perf::begin("agent.list_panes_fast");
     let mut panes = fetch_panes()?;
     capture_content(&mut panes);
     Ok(panes)
 }
 
 fn fetch_panes() -> Result<Vec<Pane>> {
+    let _g = smelt_perf::perf::begin("tmux.fetch_panes");
     let tmux_out = list_tmux_panes()?;
     let pt = load_process_table();
-    let raw = resolve_agent_panes(parse_tmux_panes(&tmux_out), &pt);
+    let raw = {
+        let _g = smelt_perf::perf::begin("provider.resolve_panes");
+        resolve_agent_panes(parse_tmux_panes(&tmux_out), &pt)
+    };
+    smelt_perf::perf::record_value("tmux.agent_panes", raw.len() as u64);
     Ok(raw
         .into_iter()
         .enumerate()
@@ -62,6 +78,7 @@ fn fetch_panes() -> Result<Vec<Pane>> {
 }
 
 fn list_tmux_panes() -> Result<String> {
+    let _g = smelt_perf::perf::begin("tmux.list_panes");
     let out = Command::new("tmux")
         .arg("list-panes")
         .arg("-a")
@@ -76,7 +93,8 @@ fn list_tmux_panes() -> Result<String> {
 }
 
 fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
-    out.trim()
+    let panes: Vec<RawPane> = out
+        .trim()
         .lines()
         .filter_map(|line| {
             if line.is_empty() {
@@ -100,9 +118,10 @@ fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
                 pane,
             })
         })
-        .collect()
+        .collect();
+    smelt_perf::perf::record_value("tmux.raw_panes", panes.len() as u64);
+    panes
 }
-
 fn resolve_agent_panes(raw: Vec<RawPane>, pt: &ProcessTable) -> Vec<RawPane> {
     raw.into_iter()
         .filter_map(|mut r| {
@@ -118,15 +137,36 @@ fn resolve_agent_panes(raw: Vec<RawPane>, pt: &ProcessTable) -> Vec<RawPane> {
 }
 
 fn load_process_table() -> ProcessTable {
-    Command::new("ps")
+    static CACHE: OnceLock<Mutex<Option<ProcessTableCache>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+
+    if let Ok(cache) = cache.lock()
+        && let Some(entry) = cache.as_ref()
+        && entry.loaded_at.elapsed() < PROCESS_TABLE_TTL
+    {
+        smelt_perf::perf::record_value("process.ps_cache_hit", 1);
+        return entry.table.clone();
+    }
+
+    let _g = smelt_perf::perf::begin("process.ps");
+    let table = Command::new("ps")
         .arg("-eo")
         .arg("pid=,ppid=,command=")
         .output()
         .map(|out| parse_process_table(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if let Ok(mut cache) = cache.lock() {
+        *cache = Some(ProcessTableCache {
+            loaded_at: Instant::now(),
+            table: table.clone(),
+        });
+    }
+    table
 }
 
 fn capture_content(panes: &mut [Pane]) {
+    let _g = smelt_perf::perf::begin("tmux.capture_content_all");
     thread::scope(|scope| {
         for pane in panes {
             scope.spawn(move || {
@@ -140,7 +180,8 @@ fn capture_content(panes: &mut [Pane]) {
 }
 
 fn capture_pane_content(target: &str) -> (String, bool, bool) {
-    let Ok(first) = Command::new("tmux")
+    let _g = smelt_perf::perf::begin("tmux.capture_pane_content");
+    let Ok(out) = Command::new("tmux")
         .arg("capture-pane")
         .arg("-t")
         .arg(target)
@@ -151,31 +192,11 @@ fn capture_pane_content(target: &str) -> (String, bool, bool) {
     else {
         return (String::new(), false, false);
     };
-    let first = trim_trailing_newlines(first.stdout);
-    let first_hash = short_hash(&first);
-    let first_attention = attention_re().is_match(&String::from_utf8_lossy(&first));
-
-    thread::sleep(Duration::from_millis(100));
-
-    let Ok(second) = Command::new("tmux")
-        .arg("capture-pane")
-        .arg("-t")
-        .arg(target)
-        .arg("-p")
-        .arg("-S")
-        .arg("-10")
-        .output()
-    else {
-        return (first_hash, false, first_attention);
-    };
-    let second = trim_trailing_newlines(second.stdout);
-    let second_hash = short_hash(&second);
-    let second_attention = attention_re().is_match(&String::from_utf8_lossy(&second));
-    (
-        second_hash,
-        first != second,
-        first_attention || second_attention,
-    )
+    let content = trim_trailing_newlines(out.stdout);
+    smelt_perf::perf::record_value("tmux.capture_bytes", content.len() as u64);
+    let hash = short_hash(&content);
+    let attention = attention_re().is_match(&String::from_utf8_lossy(&content));
+    (hash, false, attention)
 }
 
 fn trim_trailing_newlines(mut data: Vec<u8>) -> Vec<u8> {
@@ -196,6 +217,7 @@ fn attention_re() -> &'static Regex {
 }
 
 pub fn capture_pane(target: &str, lines: usize) -> Result<String> {
+    let _g = smelt_perf::perf::begin("tmux.capture_preview");
     let out = Command::new("tmux")
         .arg("capture-pane")
         .arg("-t")
@@ -246,18 +268,51 @@ fn run_tmux<const N: usize>(args: [&str; N]) -> Result<()> {
 }
 
 pub fn start_watch() -> Result<()> {
+    if crate::agent::watch::is_running() {
+        for _ in 0..5 {
+            if crate::agent::ipc::get_state().is_ok_and(|(snapshot, _)| snapshot.is_some()) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop_watch_process();
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    std::fs::create_dir_all(crate::agent::persist::state_dir()).context("create state dir")?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::agent::watch::log_path())
+        .context("open watch log")?;
+    let stderr = log.try_clone().context("clone watch log")?;
+
     let exe = std::env::current_exe().context("current executable")?;
     Command::new(exe)
         .arg("watch")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .context("start watch")?;
+
+    for _ in 0..10 {
+        if crate::agent::ipc::get_state().is_ok_and(|(snapshot, _)| snapshot.is_some()) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
     Ok(())
 }
 
 pub fn restart_watch() -> Result<()> {
+    stop_watch_process();
+    thread::sleep(Duration::from_millis(200));
+    start_watch()
+}
+
+fn stop_watch_process() {
     if let Ok(data) = std::fs::read_to_string(crate::agent::watch::lock_path())
         && let Ok(pid) = data.trim().parse::<i32>()
         && pid > 0
@@ -266,9 +321,7 @@ pub fn restart_watch() -> Result<()> {
             .arg("-TERM")
             .arg(pid.to_string())
             .status();
-        thread::sleep(Duration::from_millis(200));
     }
-    start_watch()
 }
 
 pub fn parse_target(s: &str) -> (String, String, String) {

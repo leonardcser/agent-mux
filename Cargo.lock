@@ -16,6 +16,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smelt-ansi",
+ "smelt-perf",
  "smelt-term",
  "unicode-width",
 ]
@@ -677,6 +678,12 @@ checksum = "fd843276b9a3ca129e9dc979bf9da6a6b10061dd3ac37416fa2b5dd2d8a67ff8"
 dependencies = [
  "smelt-style",
 ]
+
+[[package]]
+name = "smelt-perf"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eefb9cb602165406ceea4f2e9e9b2afa539c9e8bfe84678fe663dd3e1a22f9b0"
 
 [[package]]
 name = "smelt-style"

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::io::{self, BufWriter, Stdout, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Stdout, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,9 +19,10 @@ use smelt_term::grid::{Color, GridSlice, Style};
 use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::agent::ipc;
 use crate::agent::persist::{
-    LastPosition, UiState, apply_ui_state, has_manual_status, load_snapshot, load_ui_state,
-    panes_from_snapshot, ui_pane_state_is_empty, update_ui_state,
+    LastPosition, Snapshot, UiState, apply_ui_state, has_manual_status, load_snapshot,
+    load_ui_state, panes_from_snapshot, ui_pane_state_is_empty, update_ui_state,
 };
 use crate::agent::{Pane, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane};
 
@@ -51,6 +53,7 @@ enum Msg {
         snapshot_generation: u64,
         ui_state: UiState,
         err: Option<String>,
+        live: bool,
     },
     PreviewLoaded {
         pane_id: String,
@@ -61,6 +64,7 @@ enum Msg {
         pane_id: String,
         err: Option<String>,
     },
+    SubscriptionEnded,
 }
 
 pub fn run(tmux_session: String) -> Result<()> {
@@ -101,9 +105,13 @@ fn run_loop(
     let mut last_draw = Instant::now() - Duration::from_millis(33);
     let mut last_panes = Instant::now() - Duration::from_millis(500);
     let mut last_preview = Instant::now();
+    let mut last_subscribe = Instant::now() - Duration::from_secs(1);
     let mut panes_pending = false;
     let mut preview_pending = false;
+    let mut subscribed = false;
+    let mut subscribe_pending = true;
 
+    spawn_subscribe_panes(&tx);
     load_preview(app);
 
     loop {
@@ -114,18 +122,30 @@ fn run_loop(
                     snapshot_generation,
                     ui_state,
                     err,
+                    live,
                 } => {
-                    panes_pending = false;
+                    if live {
+                        subscribed = true;
+                        subscribe_pending = false;
+                    } else {
+                        panes_pending = false;
+                    }
+                    let mut changed = false;
                     if let Some(err) = err {
                         if err == SYNCING_MSG && app.has_display_snapshot() {
                             if app.err.as_deref() == Some(SYNCING_MSG) {
                                 app.err = None;
+                                changed = true;
                             }
-                        } else {
+                        } else if app.err.as_deref() != Some(&err) {
                             app.err = Some(err);
+                            changed = true;
                         }
                     } else {
-                        app.err = None;
+                        if app.err.is_some() {
+                            app.err = None;
+                            changed = true;
+                        }
                         app.hide_pending_kills(&mut panes);
                         let ui_is_older = ui_state_is_older_than(&ui_state, &app.ui_state);
                         let ui_changed =
@@ -138,9 +158,10 @@ fn run_loop(
                         if snapshot_generation != app.snapshot_generation || ui_changed {
                             app.snapshot_generation = snapshot_generation;
                             app.replace_panes(panes);
+                            changed = true;
                         }
                     }
-                    dirty = true;
+                    dirty |= changed;
                 }
                 Msg::PreviewLoaded {
                     pane_id,
@@ -165,16 +186,26 @@ fn run_loop(
                     }
                     dirty = true;
                 }
+                Msg::SubscriptionEnded => {
+                    subscribed = false;
+                    subscribe_pending = false;
+                }
             }
         }
 
-        if last_panes.elapsed() >= Duration::from_millis(500) && !panes_pending {
+        if !subscribed && !subscribe_pending && last_subscribe.elapsed() >= Duration::from_secs(1) {
+            spawn_subscribe_panes(&tx);
+            subscribe_pending = true;
+            last_subscribe = Instant::now();
+        }
+
+        if !subscribed && last_panes.elapsed() >= Duration::from_millis(500) && !panes_pending {
             spawn_load_panes(&tx);
             panes_pending = true;
             last_panes = Instant::now();
         }
 
-        if last_preview.elapsed() >= Duration::from_millis(200) && !preview_pending {
+        if last_preview.elapsed() >= Duration::from_millis(100) && !preview_pending {
             app.preview_for.clear();
             spawn_preview(&tx, app);
             preview_pending = true;
@@ -227,28 +258,85 @@ fn run_loop(
     }
 }
 
+fn load_pane_state() -> (Option<Snapshot>, UiState) {
+    match ipc::get_state() {
+        Ok((Some(snapshot), ui_state)) => (Some(snapshot), ui_state),
+        Ok((None, ui_state)) => (load_snapshot(), ui_state),
+        Err(_) => (load_snapshot(), load_ui_state()),
+    }
+}
+
+fn spawn_subscribe_panes(tx: &mpsc::Sender<Msg>) {
+    let tx = tx.clone();
+    thread::spawn(move || {
+        let result = subscribe_panes(&tx);
+        if result.is_err() {
+            let _ = tx.send(Msg::SubscriptionEnded);
+        }
+    });
+}
+
+fn subscribe_panes(tx: &mpsc::Sender<Msg>) -> Result<()> {
+    let mut stream = UnixStream::connect(ipc::socket_path())?;
+    let request = serde_json::to_string(&ipc::Request::Subscribe)?;
+    writeln!(stream, "{request}")?;
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        match serde_json::from_str::<ipc::Response>(&line)? {
+            ipc::Response::State { snapshot, ui_state } => {
+                send_panes_loaded(tx, snapshot, ui_state, true);
+            }
+            ipc::Response::Error { message } => {
+                let _ = tx.send(Msg::PanesLoaded {
+                    panes: Vec::new(),
+                    snapshot_generation: 0,
+                    ui_state: load_ui_state(),
+                    err: Some(message),
+                    live: true,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn send_panes_loaded(
+    tx: &mpsc::Sender<Msg>,
+    snapshot: Option<Snapshot>,
+    ui_state: UiState,
+    live: bool,
+) {
+    let Some(snapshot) = snapshot else {
+        let _ = tx.send(Msg::PanesLoaded {
+            panes: Vec::new(),
+            snapshot_generation: 0,
+            ui_state,
+            err: Some(SYNCING_MSG.into()),
+            live,
+        });
+        return;
+    };
+    let snapshot_generation = snapshot.generation;
+    let mut panes = panes_from_snapshot(&snapshot);
+    apply_ui_state(&mut panes, &ui_state);
+    let _ = tx.send(Msg::PanesLoaded {
+        panes,
+        snapshot_generation,
+        ui_state,
+        err: None,
+        live,
+    });
+}
+
 fn spawn_load_panes(tx: &mpsc::Sender<Msg>) {
     let tx = tx.clone();
     thread::spawn(move || {
-        let ui_state = load_ui_state();
-        let Some(snapshot) = load_snapshot() else {
-            let _ = tx.send(Msg::PanesLoaded {
-                panes: Vec::new(),
-                snapshot_generation: 0,
-                ui_state,
-                err: Some(SYNCING_MSG.into()),
-            });
-            return;
-        };
-        let snapshot_generation = snapshot.generation;
-        let mut panes = panes_from_snapshot(&snapshot);
-        apply_ui_state(&mut panes, &ui_state);
-        let _ = tx.send(Msg::PanesLoaded {
-            panes,
-            snapshot_generation,
-            ui_state,
-            err: None,
-        });
+        let (snapshot, ui_state) = load_pane_state();
+        send_panes_loaded(&tx, snapshot, ui_state, false);
     });
 }
 
@@ -326,8 +414,7 @@ struct App {
 
 impl App {
     fn new(tmux_session: String) -> Self {
-        let ui_state = load_ui_state();
-        let snapshot = load_snapshot();
+        let (snapshot, ui_state) = load_pane_state();
         let snapshot_generation = snapshot
             .as_ref()
             .map(|snapshot| snapshot.generation)

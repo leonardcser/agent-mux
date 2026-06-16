@@ -1,4 +1,5 @@
 pub mod git;
+pub mod ipc;
 pub mod persist;
 pub mod provider;
 pub mod reconcile;
