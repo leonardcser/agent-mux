@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -290,6 +291,7 @@ pub fn start_watch() -> Result<()> {
     let exe = std::env::current_exe().context("current executable")?;
     Command::new(exe)
         .arg("watch")
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
