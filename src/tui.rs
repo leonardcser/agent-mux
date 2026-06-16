@@ -19,8 +19,8 @@ use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::persist::{
-    LastPosition, Snapshot, UiState, apply_ui_state, has_manual_status, load_heartbeat,
-    load_snapshot, load_ui_state, panes_from_snapshot, ui_pane_state_is_empty, update_ui_state,
+    LastPosition, UiState, apply_ui_state, has_manual_status, load_snapshot, load_ui_state,
+    panes_from_snapshot, ui_pane_state_is_empty, update_ui_state,
 };
 use crate::agent::{Pane, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane};
 
@@ -231,7 +231,7 @@ fn spawn_load_panes(tx: &mpsc::Sender<Msg>) {
     let tx = tx.clone();
     thread::spawn(move || {
         let ui_state = load_ui_state();
-        let Some(snapshot) = load_display_snapshot() else {
+        let Some(snapshot) = load_snapshot() else {
             let _ = tx.send(Msg::PanesLoaded {
                 panes: Vec::new(),
                 snapshot_generation: 0,
@@ -278,23 +278,6 @@ fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) {
             preview_seq,
         });
     });
-}
-
-fn load_display_snapshot() -> Option<Snapshot> {
-    let snapshot = load_snapshot()?;
-    snapshot_is_fresh(&snapshot).then_some(snapshot)
-}
-
-fn snapshot_is_fresh(snapshot: &Snapshot) -> bool {
-    const MAX_AGE_MS: i64 = 1_500;
-    let Some(updated_at) = load_heartbeat()
-        .and_then(|heartbeat| heartbeat.updated_at)
-        .or(snapshot.updated_at)
-    else {
-        return false;
-    };
-    let age = chrono::Utc::now() - updated_at;
-    age.num_milliseconds() >= 0 && age.num_milliseconds() <= MAX_AGE_MS
 }
 
 fn ui_state_is_older_than(incoming: &UiState, current: &UiState) -> bool {
@@ -344,7 +327,7 @@ struct App {
 impl App {
     fn new(tmux_session: String) -> Self {
         let ui_state = load_ui_state();
-        let snapshot = load_display_snapshot();
+        let snapshot = load_snapshot();
         let snapshot_generation = snapshot
             .as_ref()
             .map(|snapshot| snapshot.generation)
@@ -851,13 +834,12 @@ fn render_separator(slice: &mut GridSlice<'_>, app: &mut App) {
 
 fn render_sidebar(slice: &mut GridSlice<'_>, app: &App) {
     if let Some(err) = &app.err {
-        put_clipped(
-            slice,
-            0,
-            0,
-            &format!("Error: {err}"),
-            Style::new().fg(Color::Red),
-        );
+        let (message, style) = if err == SYNCING_MSG {
+            (err.clone(), Style::new().fg(Color::DarkGrey))
+        } else {
+            (format!("Error: {err}"), Style::new().fg(Color::Red))
+        };
+        put_clipped(slice, 0, 0, &message, style);
         return;
     }
     if app.items.is_empty() {

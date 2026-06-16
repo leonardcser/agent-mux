@@ -214,10 +214,6 @@ pub fn load_ui_state() -> UiState {
         .unwrap_or_default()
 }
 
-pub fn load_heartbeat() -> Option<Heartbeat> {
-    load_json_file(heartbeat_path()).filter(|heartbeat: &Heartbeat| heartbeat.version == 1)
-}
-
 pub fn apply_ui_state(panes: &mut [Pane], ui_state: &UiState) {
     for pane in panes {
         if let Some(ui) = ui_state
