@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 
-use crate::agent::git::enrich_panes;
+use crate::agent::git::{enrich_panes, enrich_panes_fast};
 use crate::agent::ipc::{Request, Response, socket_path};
 use crate::agent::persist::{
     Snapshot, cache_panes, load_snapshot, load_ui_state, panes_from_snapshot, state_dir,
@@ -102,6 +102,12 @@ fn refresh_once_with(
 
     if let Some(snapshot) = previous.as_ref() {
         apply_cached_metadata(&mut panes, snapshot);
+    }
+    if panes
+        .iter()
+        .any(|pane| pane.short_path.is_empty() || pane.project_root.is_empty())
+    {
+        enrich_panes_fast(&mut panes);
     }
 
     reconciler.reconcile(&mut panes);

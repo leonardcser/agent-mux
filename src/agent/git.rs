@@ -15,8 +15,17 @@ struct DirtyEntry {
 
 static DIRTY_CACHE: OnceLock<Mutex<HashMap<String, DirtyEntry>>> = OnceLock::new();
 
+pub fn enrich_panes_fast(panes: &mut [Pane]) {
+    let _g = smelt_perf::perf::begin("git.enrich_panes_fast");
+    enrich_panes_with(panes, false);
+}
+
 pub fn enrich_panes(panes: &mut [Pane]) {
     let _g = smelt_perf::perf::begin("git.enrich_panes");
+    enrich_panes_with(panes, true);
+}
+
+fn enrich_panes_with(panes: &mut [Pane], include_dirty: bool) {
     let mut unique: HashMap<String, WsInfo> = HashMap::new();
     for p in panes.iter() {
         unique.entry(p.path.clone()).or_insert_with(|| WsInfo {
@@ -24,26 +33,28 @@ pub fn enrich_panes(panes: &mut [Pane]) {
             project_root: String::new(),
             project_short: String::new(),
             git_branch: String::new(),
-            git_dirty: false,
+            git_dirty: None,
         });
     }
 
     smelt_perf::perf::record_value("git.unique_paths", unique.len() as u64);
     for (path, info) in unique.iter_mut() {
         info.git_branch = git_branch(path);
-        info.git_dirty = git_dirty(path);
+        if include_dirty {
+            info.git_dirty = Some(git_dirty(path));
+        }
         info.project_root = project_root(path);
         info.project_short = shorten(&info.project_root);
     }
 
-    let mut projects: HashMap<String, (String, bool)> = HashMap::new();
+    let mut projects: HashMap<String, (String, Option<bool>)> = HashMap::new();
     for info in unique.values() {
         projects
             .entry(info.project_root.clone())
             .or_insert_with(|| {
                 (
                     git_branch(&info.project_root),
-                    git_dirty(&info.project_root),
+                    include_dirty.then(|| git_dirty(&info.project_root)),
                 )
             });
     }
@@ -54,10 +65,14 @@ pub fn enrich_panes(panes: &mut [Pane]) {
             p.project_root = info.project_root.clone();
             p.project_short = info.project_short.clone();
             p.git_branch = info.git_branch.clone();
-            p.git_dirty = info.git_dirty;
+            if let Some(dirty) = info.git_dirty {
+                p.git_dirty = dirty;
+            }
             if let Some((branch, dirty)) = projects.get(&info.project_root) {
                 p.project_branch = branch.clone();
-                p.project_dirty = *dirty;
+                if let Some(dirty) = dirty {
+                    p.project_dirty = *dirty;
+                }
             }
         }
     }
@@ -69,7 +84,7 @@ struct WsInfo {
     project_root: String,
     project_short: String,
     git_branch: String,
-    git_dirty: bool,
+    git_dirty: Option<bool>,
 }
 
 fn shorten(path: &str) -> String {
@@ -199,4 +214,54 @@ fn git_dirty(dir: &str) -> bool {
         );
     }
     dirty
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("agent-mux-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn fast_enriches_worktree_structure() -> std::io::Result<()> {
+        let root = temp_dir("worktree");
+        let repo = root.join("repo");
+        let worktree = root.join("repo-feature");
+        let worktree_git_dir = repo.join(".git/worktrees/repo-feature");
+        fs::create_dir_all(&worktree_git_dir)?;
+        fs::create_dir_all(&worktree)?;
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        fs::write(worktree_git_dir.join("HEAD"), "ref: refs/heads/feature\n")?;
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )?;
+
+        let mut panes = vec![Pane {
+            path: worktree.to_string_lossy().to_string(),
+            git_dirty: true,
+            project_dirty: true,
+            ..Pane::default()
+        }];
+
+        enrich_panes_fast(&mut panes);
+
+        assert_eq!(panes[0].short_path, "repo-feature");
+        assert_eq!(panes[0].project_root, repo.to_string_lossy());
+        assert_eq!(panes[0].project_short, "repo");
+        assert_eq!(panes[0].git_branch, "feature");
+        assert_eq!(panes[0].project_branch, "main");
+        assert!(panes[0].git_dirty);
+        assert!(panes[0].project_dirty);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }
