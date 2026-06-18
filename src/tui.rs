@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, BufWriter, Stdout, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
@@ -7,16 +7,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use smelt_ansi::{AnsiSpan, parse_ansi_lines};
 use smelt_term::grid::{Color, GridSlice, Style};
-use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface};
+use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface, TerminalSession};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::ipc;
@@ -68,38 +64,18 @@ enum Msg {
 }
 
 pub fn run(tmux_session: String) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        crossterm::cursor::Hide
-    )?;
-    let mut writer = BufWriter::with_capacity(128 * 1024, stdout);
-    let (w, h) = crossterm::terminal::size()?;
+    let mut term = TerminalSession::builder()
+        .buffer_capacity(128 * 1024)
+        .enter_stdout()?;
+    let (w, h) = term.size()?;
     let mut surface = Surface::new(w, h);
 
     let mut app = App::new(tmux_session);
     app.resize(w, h);
-    let result = run_loop(&mut surface, &mut writer, &mut app);
-
-    disable_raw_mode()?;
-    execute!(
-        writer,
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        crossterm::cursor::Show
-    )?;
-    writer.flush()?;
-    result.map_err(Into::into)
+    run_loop(&mut surface, term.writer(), &mut app).map_err(Into::into)
 }
 
-fn run_loop(
-    surface: &mut Surface,
-    writer: &mut BufWriter<Stdout>,
-    app: &mut App,
-) -> io::Result<()> {
+fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut dirty = true;
     let mut last_draw = Instant::now() - Duration::from_millis(33);
@@ -916,7 +892,7 @@ fn render_separator(slice: &mut GridSlice<'_>, app: &mut App) {
     for y in 0..slice.height() {
         slice.set(0, y, '│', style);
     }
-    app.hits.record(slice.screen_rect(), Hit::Separator);
+    app.hits.record(slice.grid_rect(), Hit::Separator);
 }
 
 fn render_sidebar(slice: &mut GridSlice<'_>, app: &App) {

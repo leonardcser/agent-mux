@@ -681,9 +681,9 @@ dependencies = [
 
 [[package]]
 name = "smelt-perf"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eefb9cb602165406ceea4f2e9e9b2afa539c9e8bfe84678fe663dd3e1a22f9b0"
+checksum = "d6cdb3f11da3c72045b8238447e6070b53931f8983ea824ebb8065c95c09283b"
 
 [[package]]
 name = "smelt-style"
@@ -693,9 +693,9 @@ checksum = "7ea657f94786c2bfed68979b51b0356c0b5874b3edb4da8a9081cf071f301bfa"
 
 [[package]]
 name = "smelt-term"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a08cc312d017850bcb7e6198caab05b9a9496cb13bfcd74f203597b483dd0f1d"
+checksum = "fca16c5f4d18bcef3b1aa749dfcf2c17b9a2a2a2e1881e5ea383e1cf5f9fe997"
 dependencies = [
  "crossterm",
  "smelt-ansi",
