@@ -465,6 +465,11 @@ impl App {
         self.cursor = selected
             .and_then(|id| self.find_pane_by_id(&id))
             .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
+        if self.current_pane().is_none() {
+            self.preview_for.clear();
+            self.preview_lines.clear();
+            self.preview_gen += 1;
+        }
     }
 
     fn rebuild_items(&mut self) {
@@ -1208,6 +1213,10 @@ fn render_preview(slice: &mut GridSlice<'_>, app: &App) {
         render_help(slice);
         return;
     }
+    if app.current_pane().is_none() {
+        render_empty_preview(slice, app);
+        return;
+    }
     if app.preview_lines.is_empty() {
         put_clipped(
             slice,
@@ -1223,6 +1232,17 @@ fn render_preview(slice: &mut GridSlice<'_>, app: &App) {
     for (row, line) in app.preview_lines.iter().skip(start).take(h).enumerate() {
         put_ansi_spans(slice, 0, row as u16, line);
     }
+}
+
+fn render_empty_preview(slice: &mut GridSlice<'_>, app: &App) {
+    let title = if app.err.as_deref() == Some(SYNCING_MSG) {
+        "Looking for sessions"
+    } else {
+        "No active sessions"
+    };
+    let detail = "Start a supported agent in tmux and it will appear here.";
+    put_clipped(slice, 2, 1, title, Style::new().fg(Color::White).bold());
+    put_clipped(slice, 2, 3, detail, Style::new().fg(Color::DarkGrey));
 }
 
 fn put_ansi_spans(slice: &mut GridSlice<'_>, mut x: u16, y: u16, spans: &[AnsiSpan]) -> u16 {
