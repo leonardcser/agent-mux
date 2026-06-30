@@ -3,6 +3,7 @@ pub mod ipc;
 pub mod persist;
 pub mod provider;
 pub mod reconcile;
+pub mod status;
 pub mod tmux;
 pub mod watch;
 
@@ -14,18 +15,13 @@ pub use tmux::{
 
 use chrono::{DateTime, Utc};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneStatus {
+    #[default]
     Idle = 0,
     Busy = 1,
     NeedsAttention = 2,
     Unread = 3,
-}
-
-impl Default for PaneStatus {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl PaneStatus {
@@ -61,7 +57,9 @@ pub struct Pane {
     pub git_dirty: bool,
     #[allow(dead_code)]
     pub pid: i32,
+    pub provider_pid: i32,
     pub status: PaneStatus,
+    pub observed_status: Option<PaneStatus>,
     pub content_hash: String,
     pub content_moving: bool,
     pub heuristic_attention: bool,

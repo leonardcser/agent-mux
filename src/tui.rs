@@ -791,12 +791,10 @@ impl App {
                     return true;
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.dragging {
-                    self.dragging = false;
-                    self.save_state();
-                    return true;
-                }
+            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
+                self.dragging = false;
+                self.save_state();
+                return true;
             }
             _ => {}
         }
@@ -964,18 +962,20 @@ fn render_tree_item(
                     slice,
                     row,
                     width,
-                    &p.short_path,
-                    &p.git_branch,
-                    p.git_dirty,
-                    if p.stashed {
-                        Style::new().fg(Color::DarkGrey)
-                    } else {
-                        Style::new().fg(Color::White).bold()
-                    },
-                    if p.stashed {
-                        Style::new().fg(Color::AnsiValue(242))
-                    } else {
-                        Style::new().fg(Color::Green)
+                    HeaderRow {
+                        name: &p.short_path,
+                        branch: &p.git_branch,
+                        dirty: p.git_dirty,
+                        style: if p.stashed {
+                            Style::new().fg(Color::DarkGrey)
+                        } else {
+                            Style::new().fg(Color::White).bold()
+                        },
+                        branch_style: if p.stashed {
+                            Style::new().fg(Color::AnsiValue(242))
+                        } else {
+                            Style::new().fg(Color::Green)
+                        },
                     },
                 );
             }
@@ -991,18 +991,20 @@ fn render_tree_item(
                     slice,
                     row,
                     width,
-                    name,
-                    &p.project_branch,
-                    p.project_dirty,
-                    if p.stashed {
-                        Style::new().fg(Color::DarkGrey)
-                    } else {
-                        Style::new().fg(Color::White).bold()
-                    },
-                    if p.stashed {
-                        Style::new().fg(Color::AnsiValue(242))
-                    } else {
-                        Style::new().fg(Color::Green)
+                    HeaderRow {
+                        name,
+                        branch: &p.project_branch,
+                        dirty: p.project_dirty,
+                        style: if p.stashed {
+                            Style::new().fg(Color::DarkGrey)
+                        } else {
+                            Style::new().fg(Color::White).bold()
+                        },
+                        branch_style: if p.stashed {
+                            Style::new().fg(Color::AnsiValue(242))
+                        } else {
+                            Style::new().fg(Color::Green)
+                        },
                     },
                 );
             }
@@ -1015,16 +1017,22 @@ fn render_tree_item(
     }
 }
 
-fn render_header_row(
-    slice: &mut GridSlice<'_>,
-    row: u16,
-    width: u16,
-    name: &str,
-    branch: &str,
+struct HeaderRow<'a> {
+    name: &'a str,
+    branch: &'a str,
     dirty: bool,
     style: Style,
     branch_style: Style,
-) {
+}
+
+fn render_header_row(slice: &mut GridSlice<'_>, row: u16, width: u16, header: HeaderRow<'_>) {
+    let HeaderRow {
+        name,
+        branch,
+        dirty,
+        style,
+        branch_style,
+    } = header;
     let avail = width.saturating_sub(2) as usize;
     let mut branch = branch.to_string();
     if !branch.is_empty() && dirty {
@@ -1380,9 +1388,7 @@ fn truncate_width(s: &str, max: usize) -> String {
 }
 
 fn visible_start(len: usize, cursor: usize, height: usize) -> usize {
-    if len <= height {
-        0
-    } else if cursor < height / 2 {
+    if len <= height || cursor < height / 2 {
         0
     } else if cursor + height / 2 >= len {
         len - height
@@ -1400,13 +1406,13 @@ fn last_pane(items: &[TreeItem]) -> Option<usize> {
 }
 
 fn next_pane(items: &[TreeItem], from: usize) -> usize {
-    for i in from + 1..items.len() {
-        if matches!(items[i], TreeItem::Pane(_)) {
+    for (i, item) in items.iter().enumerate().skip(from + 1) {
+        if matches!(item, TreeItem::Pane(_)) {
             return i;
         }
     }
-    for i in 0..from.min(items.len()) {
-        if matches!(items[i], TreeItem::Pane(_)) {
+    for (i, item) in items.iter().enumerate().take(from.min(items.len())) {
+        if matches!(item, TreeItem::Pane(_)) {
             return i;
         }
     }

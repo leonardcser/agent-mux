@@ -26,6 +26,7 @@ pub fn run() -> Result<()> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(lock_path())
         .context("open watch lock")?;
     if lock.try_lock_exclusive().is_err() {
@@ -188,10 +189,10 @@ fn publish_snapshot(
         was_empty = latest.is_none();
         *latest = Some(snapshot.clone());
     }
-    if changed || was_empty {
-        if let Some(subscribers) = subscribers {
-            broadcast_snapshot(subscribers, snapshot);
-        }
+    if (changed || was_empty)
+        && let Some(subscribers) = subscribers
+    {
+        broadcast_snapshot(subscribers, snapshot);
     }
 }
 

@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::agent::Pane;
 use crate::agent::git::enrich_panes;
 use crate::agent::provider::{ProcessTable, parse_process_table, resolve};
+use crate::agent::status::apply_provider_statuses;
 
 const PROCESS_TABLE_TTL: Duration = Duration::from_secs(1);
 
@@ -32,6 +33,7 @@ struct RawPane {
     path: String,
     cmd: String,
     pid: i32,
+    provider_pid: i32,
     window_focused: bool,
 }
 
@@ -46,6 +48,7 @@ pub fn list_panes_fast() -> Result<Vec<Pane>> {
     let _g = smelt_perf::perf::begin("agent.list_panes_fast");
     let mut panes = fetch_panes()?;
     capture_content(&mut panes);
+    apply_provider_statuses(&mut panes);
     Ok(panes)
 }
 
@@ -73,6 +76,7 @@ fn fetch_panes() -> Result<Vec<Pane>> {
             window_active: r.window_focused,
             order,
             provider: r.cmd,
+            provider_pid: r.provider_pid,
             ..Pane::default()
         })
         .collect())
@@ -111,6 +115,7 @@ fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
                 cmd: fields[1].to_string(),
                 path: fields[2].to_string(),
                 pid: fields[3].parse().unwrap_or(0),
+                provider_pid: 0,
                 window_name: fields[4].to_string(),
                 window_focused: fields[5] == "111",
                 pane_id: fields[6].to_string(),
@@ -126,13 +131,10 @@ fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
 fn resolve_agent_panes(raw: Vec<RawPane>, pt: &ProcessTable) -> Vec<RawPane> {
     raw.into_iter()
         .filter_map(|mut r| {
-            let cmd = resolve(&r.cmd, r.pid, pt);
-            if cmd.is_empty() {
-                None
-            } else {
-                r.cmd = cmd;
-                Some(r)
-            }
+            let matched = resolve(&r.cmd, r.pid, pt)?;
+            r.cmd = matched.name;
+            r.provider_pid = matched.pid;
+            Some(r)
         })
         .collect()
 }

@@ -400,6 +400,7 @@ fn lock_file(path: PathBuf) -> Result<File> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(path)
         .context("open state lock")?;
     file.lock_exclusive().context("lock state")?;
@@ -489,6 +490,41 @@ fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
         .collect()
 }
 
+pub fn state_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".local/state/agent-mux")
+}
+
+pub fn state_path() -> PathBuf {
+    state_dir().join("state.json")
+}
+
+pub fn snapshot_path() -> PathBuf {
+    state_dir().join("snapshot.json")
+}
+
+pub fn ui_state_path() -> PathBuf {
+    state_dir().join("ui_state.json")
+}
+
+pub fn heartbeat_path() -> PathBuf {
+    state_dir().join("heartbeat.json")
+}
+
+pub fn snapshot_write_lock_path() -> PathBuf {
+    state_dir().join("snapshot.lock")
+}
+
+pub fn ui_state_write_lock_path() -> PathBuf {
+    state_dir().join("ui_state.lock")
+}
+
+pub fn heartbeat_write_lock_path() -> PathBuf {
+    state_dir().join("heartbeat.lock")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{UiPaneState, UiState, apply_ui_state, display_status, has_manual_status};
@@ -545,39 +581,4 @@ mod tests {
         assert_eq!(panes[0].status, PaneStatus::Idle);
         assert!(has_manual_status(&state, "%1", "s:1.1"));
     }
-}
-
-pub fn state_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local/state/agent-mux")
-}
-
-pub fn state_path() -> PathBuf {
-    state_dir().join("state.json")
-}
-
-pub fn snapshot_path() -> PathBuf {
-    state_dir().join("snapshot.json")
-}
-
-pub fn ui_state_path() -> PathBuf {
-    state_dir().join("ui_state.json")
-}
-
-pub fn heartbeat_path() -> PathBuf {
-    state_dir().join("heartbeat.json")
-}
-
-pub fn snapshot_write_lock_path() -> PathBuf {
-    state_dir().join("snapshot.lock")
-}
-
-pub fn ui_state_write_lock_path() -> PathBuf {
-    state_dir().join("ui_state.lock")
-}
-
-pub fn heartbeat_write_lock_path() -> PathBuf {
-    state_dir().join("heartbeat.lock")
 }

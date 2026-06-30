@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone, Default)]
 pub struct ProcessTable {
@@ -7,35 +7,70 @@ pub struct ProcessTable {
     pub args: HashMap<i32, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderMatch {
+    pub name: String,
+    pub pid: i32,
+}
+
 const PROVIDERS: &[&str] = &[
     "smelt", "claude", "codex", "gemini", "opencode", "ralph", "kimi",
 ];
 
-pub fn resolve(cmd: &str, shell_pid: i32, pt: &ProcessTable) -> String {
-    if let Some(matched) = resolve_registered(cmd) {
-        return matched.to_string();
+pub fn resolve(cmd: &str, shell_pid: i32, pt: &ProcessTable) -> Option<ProviderMatch> {
+    let current = resolve_registered(cmd);
+    if let Some(matched) = resolve_descendant(shell_pid, pt) {
+        return Some(matched);
     }
+    current.map(|matched| ProviderMatch {
+        name: matched.to_string(),
+        pid: shell_pid,
+    })
+}
 
-    for child_pid in pt.children.get(&shell_pid).into_iter().flatten() {
-        if let Some(comm) = pt.comm.get(child_pid)
-            && let Some(matched) = resolve_registered(comm)
-        {
-            return matched.to_string();
+fn resolve_descendant(root_pid: i32, pt: &ProcessTable) -> Option<ProviderMatch> {
+    let mut queue = VecDeque::from([root_pid]);
+    let mut seen = HashMap::new();
+    while let Some(pid) = queue.pop_front() {
+        if seen.insert(pid, true).is_some() {
+            continue;
         }
-        if let Some(args) = pt.args.get(child_pid) {
-            if let Some(matched) = resolve_registered(args) {
-                return matched.to_string();
+        for child_pid in pt.children.get(&pid).into_iter().flatten() {
+            if let Some(matched) = resolve_process(*child_pid, pt) {
+                return Some(matched);
             }
-            for arg in args.split_whitespace() {
-                let base = arg.rsplit('/').next().unwrap_or(arg);
-                if let Some(matched) = resolve_registered(base) {
-                    return matched.to_string();
-                }
-            }
+            queue.push_back(*child_pid);
         }
     }
+    None
+}
 
-    String::new()
+fn resolve_process(pid: i32, pt: &ProcessTable) -> Option<ProviderMatch> {
+    if let Some(comm) = pt.comm.get(&pid)
+        && let Some(name) = resolve_registered(comm)
+    {
+        return Some(ProviderMatch {
+            name: name.to_string(),
+            pid,
+        });
+    }
+    let args = pt.args.get(&pid)?;
+    if let Some(name) = resolve_registered(args) {
+        return Some(ProviderMatch {
+            name: name.to_string(),
+            pid,
+        });
+    }
+    for arg in args.split_whitespace() {
+        let base = arg.rsplit('/').next().unwrap_or(arg);
+        if let Some(name) = resolve_registered(base) {
+            return Some(ProviderMatch {
+                name: name.to_string(),
+                pid,
+            });
+        }
+    }
+    None
 }
 
 fn resolve_registered(cmd: &str) -> Option<&'static str> {
@@ -82,4 +117,35 @@ pub fn parse_process_table(out: &str) -> ProcessTable {
         pt.args.insert(pid, cmdline.to_string());
     }
     pt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_provider_descendant_pid_when_tmux_reports_shell() {
+        let mut pt = ProcessTable::default();
+        pt.children.insert(10, vec![20]);
+        pt.children.insert(20, vec![30]);
+        pt.comm.insert(20, "bash".to_string());
+        pt.args.insert(20, "bash wrapper".to_string());
+        pt.comm.insert(30, "smelt".to_string());
+        pt.args.insert(30, "smelt".to_string());
+
+        let matched = resolve("bash", 10, &pt).unwrap();
+
+        assert_eq!(matched.name, "smelt");
+        assert_eq!(matched.pid, 30);
+    }
+
+    #[test]
+    fn falls_back_to_pane_pid_for_direct_provider_process() {
+        let pt = ProcessTable::default();
+
+        let matched = resolve("smelt", 10, &pt).unwrap();
+
+        assert_eq!(matched.name, "smelt");
+        assert_eq!(matched.pid, 10);
+    }
 }

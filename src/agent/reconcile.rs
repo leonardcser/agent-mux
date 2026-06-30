@@ -57,6 +57,18 @@ impl Reconciler {
                 .prev_window_active
                 .get(&id)
                 .is_some_and(|prev| *prev != p.window_active);
+
+            if let Some(observed_status) = p.observed_status {
+                if observed_status == PaneStatus::Busy {
+                    self.last_active.insert(id.clone(), now);
+                    self.unchanged_count.insert(id.clone(), 0);
+                }
+                p.last_active = self.last_active.get(&id).copied();
+                p.status = observed_status;
+                self.track_pane(p);
+                continue;
+            }
+
             let content_changed = raw_content_changed && !focus_changed;
             let active_now = content_changed || p.content_moving;
 
@@ -86,9 +98,7 @@ impl Reconciler {
                 } else {
                     PaneStatus::Busy
                 }
-            } else if p.heuristic_attention {
-                PaneStatus::NeedsAttention
-            } else if prev_status == PaneStatus::NeedsAttention {
+            } else if p.heuristic_attention || prev_status == PaneStatus::NeedsAttention {
                 PaneStatus::NeedsAttention
             } else if prev_status == PaneStatus::Unread {
                 if p.window_active {
