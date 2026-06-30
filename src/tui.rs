@@ -1317,11 +1317,6 @@ fn provider_style(provider: &str) -> Style {
             g: 182,
             b: 212,
         },
-        "ralph" => Color::Rgb {
-            r: 244,
-            g: 63,
-            b: 94,
-        },
         "smelt" => Color::Rgb {
             r: 234,
             g: 179,

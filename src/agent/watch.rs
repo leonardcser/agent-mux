@@ -24,9 +24,9 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(state_dir()).context("create state dir")?;
     let mut lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
-        .truncate(false)
         .open(lock_path())
         .context("open watch lock")?;
     if lock.try_lock_exclusive().is_err() {

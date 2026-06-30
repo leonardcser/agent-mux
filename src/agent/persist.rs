@@ -398,9 +398,9 @@ fn lock_file(path: PathBuf) -> Result<File> {
     fs::create_dir_all(state_dir()).context("create state dir")?;
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
-        .truncate(false)
         .open(path)
         .context("open state lock")?;
     file.lock_exclusive().context("lock state")?;

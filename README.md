@@ -2,7 +2,7 @@
 
 A TUI for multiplexing AI coding agent sessions in tmux.
 
-Lists all active agent panes (Claude Code, Open Code, Gemini CLI, Codex CLI)
+Lists all active agent panes (Claude Code, Open Code, Gemini CLI, Codex CLI, Kimi CLI)
 grouped by workspace, with a live preview panel showing each session's output.
 Select a session and press enter to jump to it.
 

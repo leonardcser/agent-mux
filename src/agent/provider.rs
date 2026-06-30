@@ -13,8 +13,36 @@ pub struct ProviderMatch {
     pub pid: i32,
 }
 
-const PROVIDERS: &[&str] = &[
-    "smelt", "claude", "codex", "gemini", "opencode", "ralph", "kimi",
+struct ProviderPattern {
+    label: &'static str,
+    needles: &'static [&'static str],
+}
+
+const PROVIDERS: &[ProviderPattern] = &[
+    ProviderPattern {
+        label: "smelt",
+        needles: &["smelt"],
+    },
+    ProviderPattern {
+        label: "claude",
+        needles: &["claude"],
+    },
+    ProviderPattern {
+        label: "codex",
+        needles: &["codex"],
+    },
+    ProviderPattern {
+        label: "gemini",
+        needles: &["gemini"],
+    },
+    ProviderPattern {
+        label: "opencode",
+        needles: &["opencode"],
+    },
+    ProviderPattern {
+        label: "kimi",
+        needles: &["kimi", "kimi-code", "@moonshot-ai/kimi-code"],
+    },
 ];
 
 pub fn resolve(cmd: &str, shell_pid: i32, pt: &ProcessTable) -> Option<ProviderMatch> {
@@ -79,14 +107,18 @@ fn resolve_registered(cmd: &str) -> Option<&'static str> {
         return None;
     }
     for provider in PROVIDERS {
-        if normalized.contains(provider) {
-            return Some(provider);
+        if provider
+            .needles
+            .iter()
+            .any(|needle| normalized.contains(needle))
+        {
+            return Some(provider.label);
         }
     }
     if let Some(base) = normalized.rsplit('/').next() {
         for provider in PROVIDERS {
-            if base.contains(provider) {
-                return Some(provider);
+            if provider.needles.iter().any(|needle| base.contains(needle)) {
+                return Some(provider.label);
             }
         }
     }
@@ -147,5 +179,35 @@ mod tests {
 
         assert_eq!(matched.name, "smelt");
         assert_eq!(matched.pid, 10);
+    }
+
+    #[test]
+    fn resolves_kimi_binary_from_tmux_command() {
+        let matched = resolve("kimi", 10, &ProcessTable::default()).unwrap();
+
+        assert_eq!(matched.name, "kimi");
+        assert_eq!(matched.pid, 10);
+    }
+
+    #[test]
+    fn resolves_kimi_code_package_command_line() {
+        let pt = parse_process_table(
+            "42 10 node /home/user/.local/share/pnpm/global/5/node_modules/@moonshot-ai/kimi-code/dist/main.mjs\n",
+        );
+
+        let matched = resolve("node", 10, &pt).unwrap();
+
+        assert_eq!(matched.name, "kimi");
+        assert_eq!(matched.pid, 42);
+    }
+
+    #[test]
+    fn resolves_kimi_dev_entrypoint_path() {
+        let pt = parse_process_table("42 10 tsx /tmp/kimi-code/apps/kimi-code/src/main.ts\n");
+
+        let matched = resolve("tsx", 10, &pt).unwrap();
+
+        assert_eq!(matched.name, "kimi");
+        assert_eq!(matched.pid, 42);
     }
 }
