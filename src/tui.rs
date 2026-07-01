@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -473,23 +473,17 @@ impl App {
     }
 
     fn rebuild_items(&mut self) {
-        let mut sorted: Vec<&Pane> = self.panes.values().collect();
-        let mut grouped_projects = HashMap::new();
-        for p in &sorted {
+        let panes: Vec<&Pane> = self.panes.values().collect();
+        let mut grouped_projects = HashSet::new();
+        for p in &panes {
             if !p.project_root.is_empty() && p.path != p.project_root {
-                grouped_projects.insert(p.project_root.clone(), true);
+                grouped_projects.insert(p.project_root.clone());
             }
         }
-        sorted.sort_by(|a, b| {
-            a.stashed
-                .cmp(&b.stashed)
-                .then(a.order.cmp(&b.order))
-                .then(a.target.cmp(&b.target))
-        });
 
         let mut project_win_width: HashMap<String, usize> = HashMap::new();
-        for p in &sorted {
-            if grouped_projects.contains_key(&p.project_root) {
+        for p in &panes {
+            if grouped_projects.contains(&p.project_root) {
                 let label = pane_label(p);
                 let width = display_width(&label);
                 project_win_width
@@ -500,31 +494,71 @@ impl App {
         }
         self.project_win_width = project_win_width;
 
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        enum GroupKey {
+            Project(String),
+            Workspace(String),
+        }
+
+        struct Group<'a> {
+            key: GroupKey,
+            header_id: String,
+            sort_order: usize,
+            panes: Vec<&'a Pane>,
+        }
+
         let mut items = Vec::new();
-        let mut prev_path = String::new();
-        let mut prev_project = String::new();
-        let mut in_stashed = false;
-        for p in sorted {
-            if p.stashed && !in_stashed {
-                in_stashed = true;
+        for stashed in [false, true] {
+            let mut groups: Vec<Group<'_>> = Vec::new();
+            let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
+            for p in panes.iter().copied().filter(|p| p.stashed == stashed) {
+                let key = if grouped_projects.contains(&p.project_root) {
+                    GroupKey::Project(p.project_root.clone())
+                } else {
+                    GroupKey::Workspace(p.path.clone())
+                };
+                if let Some(&idx) = group_index.get(&key) {
+                    let group = &mut groups[idx];
+                    if p.order < group.sort_order {
+                        group.sort_order = p.order;
+                        group.header_id = p.pane_id.clone();
+                    }
+                    group.panes.push(p);
+                } else {
+                    group_index.insert(key.clone(), groups.len());
+                    groups.push(Group {
+                        key,
+                        header_id: p.pane_id.clone(),
+                        sort_order: p.order,
+                        panes: vec![p],
+                    });
+                }
+            }
+
+            if groups.is_empty() {
+                continue;
+            }
+            if stashed {
                 items.push(TreeItem::SectionHeader(None));
                 items.push(TreeItem::SectionHeader(Some("stashed".into())));
-                prev_path.clear();
-                prev_project.clear();
             }
-            if grouped_projects.contains_key(&p.project_root) {
-                if p.project_root != prev_project {
-                    items.push(TreeItem::ProjectGroup(p.pane_id.clone()));
-                    prev_project = p.project_root.clone();
+
+            groups.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.key.cmp(&b.key)));
+            for mut group in groups {
+                group
+                    .panes
+                    .sort_by(|a, b| a.order.cmp(&b.order).then(a.target.cmp(&b.target)));
+                if matches!(&group.key, GroupKey::Project(_)) {
+                    items.push(TreeItem::ProjectGroup(group.header_id));
+                } else {
+                    items.push(TreeItem::Workspace(group.header_id));
                 }
-                items.push(TreeItem::Pane(p.pane_id.clone()));
-            } else {
-                if p.path != prev_path {
-                    items.push(TreeItem::Workspace(p.pane_id.clone()));
-                    prev_path = p.path.clone();
-                }
-                items.push(TreeItem::Pane(p.pane_id.clone()));
-                prev_project.clear();
+                items.extend(
+                    group
+                        .panes
+                        .into_iter()
+                        .map(|p| TreeItem::Pane(p.pane_id.clone())),
+                );
             }
         }
         self.items = items;
