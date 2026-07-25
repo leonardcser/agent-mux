@@ -59,12 +59,21 @@ impl Reconciler {
                 .is_some_and(|prev| *prev != p.window_active);
 
             if let Some(observed_status) = p.observed_status {
-                if observed_status == PaneStatus::Busy {
+                let content_changed = raw_content_changed && !focus_changed;
+                let status = if observed_status == PaneStatus::Unread
+                    && prev_status == PaneStatus::Idle
+                    && !content_changed
+                {
+                    PaneStatus::Idle
+                } else {
+                    observed_status
+                };
+                if status == PaneStatus::Busy {
                     self.last_active.insert(id.clone(), now);
                     self.unchanged_count.insert(id.clone(), 0);
                 }
                 p.last_active = self.last_active.get(&id).copied();
-                p.status = observed_status;
+                p.status = status;
                 self.track_pane(p);
                 continue;
             }
@@ -176,6 +185,50 @@ mod tests {
             heuristic_attention,
             ..Pane::default()
         }
+    }
+
+    fn pane_with_observed(
+        content_hash: &str,
+        window_active: bool,
+        observed_status: PaneStatus,
+    ) -> Pane {
+        Pane {
+            observed_status: Some(observed_status),
+            ..pane(content_hash, window_active, false)
+        }
+    }
+
+    #[test]
+    fn observed_unread_from_idle_focus_change_stays_idle() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Idle, "old", true));
+        let mut panes = vec![pane_with_observed("new", false, PaneStatus::Unread)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::Idle);
+    }
+
+    #[test]
+    fn observed_unread_from_idle_content_change_marks_unread() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Idle, "old", false));
+        let mut panes = vec![pane_with_observed("new", false, PaneStatus::Unread)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::Unread);
+    }
+
+    #[test]
+    fn observed_unread_from_busy_marks_unread() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Busy, "old", false));
+        let mut panes = vec![pane_with_observed("old", false, PaneStatus::Unread)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::Unread);
     }
 
     #[test]
