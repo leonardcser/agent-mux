@@ -636,6 +636,24 @@ impl App {
         panes.retain(|pane| !self.pending_kills.contains_key(&pane.pane_id));
     }
 
+    fn toggle_current_stash(&mut self) -> Option<bool> {
+        let previous_cursor = self.cursor;
+        let (pane_id, stashed) = {
+            let pane = self.current_pane_mut()?;
+            pane.stashed = !pane.stashed;
+            (pane.pane_id.clone(), pane.stashed)
+        };
+
+        self.rebuild_items();
+        self.cursor = if stashed {
+            nearest_pane(&self.items, previous_cursor)
+        } else {
+            self.find_pane_by_id(&pane_id)
+                .unwrap_or_else(|| nearest_pane(&self.items, previous_cursor))
+        };
+        Some(stashed)
+    }
+
     fn handle_key(&mut self, key: KeyEvent, tx: &mpsc::Sender<Msg>) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if key.code == KeyCode::Esc
@@ -719,19 +737,18 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('s') => {
-                let mut selected = None;
-                if let Some(p) = self.current_pane_mut() {
-                    p.stashed = !p.stashed;
-                    selected = Some(p.pane_id.clone());
-                }
-                if let Some(id) = selected {
-                    self.rebuild_items();
-                    self.cursor = self
-                        .find_pane_by_id(&id)
-                        .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
+                if let Some(stashed) = self.toggle_current_stash() {
+                    if stashed {
+                        self.preview_gen += 1;
+                    }
                     self.save_state();
+                    return if stashed {
+                        Action::Preview
+                    } else {
+                        Action::Redraw
+                    };
                 }
-                Action::Redraw
+                Action::None
             }
             KeyCode::Char('u') => {
                 let mut selected = None;
@@ -1479,4 +1496,69 @@ fn nearest_pane(items: &[TreeItem], from: usize) -> usize {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(id: &str, order: usize) -> Pane {
+        Pane {
+            pane_id: id.to_string(),
+            target: format!("session:1.{order}"),
+            path: "/workspace".to_string(),
+            order,
+            ..Pane::default()
+        }
+    }
+
+    fn app_with_panes(panes: Vec<Pane>) -> App {
+        let mut app = App {
+            panes: panes
+                .into_iter()
+                .map(|pane| (pane.pane_id.clone(), pane))
+                .collect(),
+            items: Vec::new(),
+            cursor: 0,
+            scroll_start: 0,
+            preview_for: String::new(),
+            preview_lines: Vec::new(),
+            preview_gen: 0,
+            preview_applied_gen: 0,
+            snapshot_generation: 0,
+            project_win_width: HashMap::new(),
+            width: 0,
+            height: 0,
+            sidebar_width: 0,
+            dragging: false,
+            show_help: false,
+            pending_d: false,
+            pending_g: false,
+            count: 0,
+            err: None,
+            ui_state: UiState::default(),
+            pending_manual_statuses: HashMap::new(),
+            pending_kills: HashMap::new(),
+            hits: HitRegistry::new(),
+            _tmux_session: String::new(),
+        };
+        app.rebuild_items();
+        app
+    }
+
+    #[test]
+    fn stashing_keeps_cursor_row_instead_of_following_pane() {
+        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1), pane("c", 2)]);
+        app.cursor = app.find_pane_by_id("b").unwrap();
+        let previous_cursor = app.cursor;
+
+        assert_eq!(app.toggle_current_stash(), Some(true));
+
+        assert_eq!(app.cursor, previous_cursor);
+        assert_eq!(
+            app.current_pane().map(|pane| pane.pane_id.as_str()),
+            Some("c")
+        );
+        assert!(app.panes["b"].stashed);
+    }
 }
