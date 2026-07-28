@@ -53,7 +53,7 @@ pub fn run() -> Result<()> {
     start_socket_server(latest_snapshot.clone(), subscribers.clone());
     start_metadata_worker(latest_snapshot.clone(), subscribers.clone());
 
-    let fast_interval = Duration::from_millis(250);
+    let fast_interval = Duration::from_millis(500);
     while !stopped.load(Ordering::SeqCst) {
         let start = Instant::now();
         match refresh_once_with(&mut reconciler, Some(&latest_snapshot), Some(&subscribers)) {

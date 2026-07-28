@@ -5,6 +5,21 @@ use serde::Deserialize;
 
 use crate::agent::{Pane, PaneStatus};
 
+use super::ProviderAdapter;
+
+pub(super) struct SmeltAdapter;
+
+impl ProviderAdapter for SmeltAdapter {
+    fn observed_statuses(&self, _panes: &[Pane]) -> HashMap<u32, PaneStatus> {
+        smelt_statuses()
+            .into_iter()
+            .map(|(pid, status)| (pid, map_status(&status)))
+            .collect()
+    }
+}
+
+pub(super) static SMELT_ADAPTER: SmeltAdapter = SmeltAdapter;
+
 #[derive(Debug, Clone, Deserialize)]
 struct SmeltStatus {
     pid: u32,
@@ -43,22 +58,6 @@ enum SmeltFocus {
     Unknown,
 }
 
-pub fn apply_provider_statuses(panes: &mut [Pane]) {
-    if !panes.iter().any(|pane| pane.provider == "smelt") {
-        return;
-    }
-
-    let statuses = smelt_statuses();
-    for pane in panes.iter_mut().filter(|pane| pane.provider == "smelt") {
-        if pane.provider_pid <= 0 {
-            continue;
-        }
-        if let Some(status) = statuses.get(&(pane.provider_pid as u32)) {
-            pane.observed_status = Some(map_smelt_status(status));
-        }
-    }
-}
-
 fn smelt_statuses() -> HashMap<u32, SmeltStatus> {
     let _g = smelt_perf::perf::begin("provider.smelt_status_all");
     let Ok(out) = Command::new("smelt")
@@ -81,7 +80,7 @@ fn smelt_statuses() -> HashMap<u32, SmeltStatus> {
         .collect()
 }
 
-fn map_smelt_status(status: &SmeltStatus) -> PaneStatus {
+fn map_status(status: &SmeltStatus) -> PaneStatus {
     match status.state {
         SmeltState::Busy => PaneStatus::Busy,
         SmeltState::Idle => PaneStatus::Idle,
@@ -113,13 +112,13 @@ mod tests {
     }
 
     #[test]
-    fn maps_smelt_busy_and_idle_directly() {
+    fn maps_busy_and_idle_directly() {
         assert_eq!(
-            map_smelt_status(&status(SmeltState::Busy, None, None)),
+            map_status(&status(SmeltState::Busy, None, None)),
             PaneStatus::Busy
         );
         assert_eq!(
-            map_smelt_status(&status(SmeltState::Idle, None, None)),
+            map_status(&status(SmeltState::Idle, None, None)),
             PaneStatus::Idle
         );
     }
@@ -127,7 +126,7 @@ mod tests {
     #[test]
     fn maps_unfocused_turn_complete_to_unread() {
         assert_eq!(
-            map_smelt_status(&status(
+            map_status(&status(
                 SmeltState::NeedsAttention,
                 Some(SmeltReason::TurnComplete),
                 Some(SmeltFocus::Unfocused)
@@ -139,7 +138,7 @@ mod tests {
     #[test]
     fn maps_blocked_attention_to_needs_attention() {
         assert_eq!(
-            map_smelt_status(&status(
+            map_status(&status(
                 SmeltState::NeedsAttention,
                 Some(SmeltReason::Permission),
                 Some(SmeltFocus::Focused)

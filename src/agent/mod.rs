@@ -1,9 +1,9 @@
+pub mod adapter;
 pub mod git;
 pub mod ipc;
 pub mod persist;
 pub mod provider;
 pub mod reconcile;
-pub mod status;
 pub mod tmux;
 pub mod watch;
 
@@ -61,7 +61,6 @@ pub struct Pane {
     pub status: PaneStatus,
     pub observed_status: Option<PaneStatus>,
     pub content_hash: String,
-    pub content_moving: bool,
     pub heuristic_attention: bool,
     pub window_active: bool,
     pub last_active: Option<DateTime<Utc>>,

@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use sha2::{Digest, Sha256};
+use smelt_ansi::parse_ansi_lines;
 
 use crate::agent::Pane;
+use crate::agent::adapter::apply_provider_statuses;
 use crate::agent::git::enrich_panes;
 use crate::agent::provider::{ProcessTable, parse_process_table, resolve};
-use crate::agent::status::apply_provider_statuses;
 
 const PROCESS_TABLE_TTL: Duration = Duration::from_secs(1);
 
@@ -173,33 +174,45 @@ fn capture_content(panes: &mut [Pane]) {
     thread::scope(|scope| {
         for pane in panes {
             scope.spawn(move || {
-                let (hash, moving, attention) = capture_pane_content(&pane.target);
+                let (hash, attention) = capture_pane_content(&pane.target);
                 pane.content_hash = hash;
-                pane.content_moving = moving;
                 pane.heuristic_attention = attention;
             });
         }
     });
 }
 
-fn capture_pane_content(target: &str) -> (String, bool, bool) {
+fn capture_pane_content(target: &str) -> (String, bool) {
     let _g = smelt_perf::perf::begin("tmux.capture_pane_content");
     let Ok(out) = Command::new("tmux")
         .arg("capture-pane")
         .arg("-t")
         .arg(target)
         .arg("-p")
+        .arg("-e")
         .arg("-S")
         .arg("-10")
         .output()
     else {
-        return (String::new(), false, false);
+        return (String::new(), false);
     };
     let content = trim_trailing_newlines(out.stdout);
     smelt_perf::perf::record_value("tmux.capture_bytes", content.len() as u64);
-    let hash = short_hash(&content);
-    let attention = attention_re().is_match(&String::from_utf8_lossy(&content));
-    (hash, false, attention)
+    pane_content_state(&content)
+}
+
+fn pane_content_state(content: &[u8]) -> (String, bool) {
+    let text = plain_text(content);
+    let attention = attention_re().is_match(&text);
+    (short_hash(content), attention)
+}
+
+fn plain_text(content: &[u8]) -> String {
+    parse_ansi_lines(&String::from_utf8_lossy(content))
+        .into_iter()
+        .map(|line| line.into_iter().map(|span| span.text).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn trim_trailing_newlines(mut data: Vec<u8>) -> Vec<u8> {
@@ -342,4 +355,39 @@ pub fn parse_target(s: &str) -> (String, String, String) {
         rest[..dot_idx].to_string(),
         rest[dot_idx + 1..].to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pane_content_state;
+
+    #[test]
+    fn ansi_only_change_produces_activity_hash_change() {
+        let red = b"\x1b[31mWorking\x1b[0m";
+        let blue = b"\x1b[34mWorking\x1b[0m";
+
+        let (red_hash, _) = pane_content_state(red);
+        let (blue_hash, _) = pane_content_state(blue);
+
+        assert_ne!(red_hash, blue_hash);
+    }
+
+    #[test]
+    fn ansi_sequences_do_not_break_attention_detection() {
+        let content = b"Do you \x1b[38;2;255;0;0mwant to\x1b[0m proceed?";
+
+        let (_, attention) = pane_content_state(content);
+
+        assert!(attention);
+    }
+
+    #[test]
+    fn stable_ansi_content_produces_stable_hash() {
+        let content = b"\x1b[32mCompleted\x1b[0m";
+
+        let (first, _) = pane_content_state(content);
+        let (second, _) = pane_content_state(content);
+
+        assert_eq!(first, second);
+    }
 }

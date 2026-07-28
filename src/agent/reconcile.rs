@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use crate::agent::persist::{CachedPane, Snapshot};
 use crate::agent::{Pane, PaneStatus};
 
+const BUSY_UNCHANGED_POLLS: usize = 3;
+
 #[derive(Debug, Default)]
 pub struct Reconciler {
     prev_content: HashMap<String, String>,
@@ -79,7 +81,7 @@ impl Reconciler {
             }
 
             let content_changed = raw_content_changed && !focus_changed;
-            let active_now = content_changed || p.content_moving;
+            let active_now = content_changed;
 
             if active_now {
                 self.last_active.insert(id.clone(), now);
@@ -90,13 +92,11 @@ impl Reconciler {
             p.last_active = self.last_active.get(&id).copied();
 
             p.status = if active_now {
-                if p.window_active && prev_status == PaneStatus::Idle {
-                    PaneStatus::Idle
-                } else {
-                    PaneStatus::Busy
-                }
+                PaneStatus::Busy
             } else if prev_status == PaneStatus::Busy {
-                if self.unchanged_count.get(&id).copied().unwrap_or_default() >= 2 {
+                if self.unchanged_count.get(&id).copied().unwrap_or_default()
+                    >= BUSY_UNCHANGED_POLLS
+                {
                     if p.heuristic_attention {
                         PaneStatus::NeedsAttention
                     } else if p.window_active {
@@ -251,5 +251,36 @@ mod tests {
         reconciler.reconcile(&mut panes);
 
         assert_eq!(panes[0].status, PaneStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn busy_settles_after_three_unchanged_polls() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Busy, "same", false));
+
+        for _ in 0..2 {
+            let mut panes = vec![pane("same", false, false)];
+
+            reconciler.reconcile(&mut panes);
+
+            assert_eq!(panes[0].status, PaneStatus::Busy);
+        }
+
+        let mut panes = vec![pane("same", false, false)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::Unread);
+    }
+
+    #[test]
+    fn content_change_starts_busy_in_focused_pane() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Idle, "old", true));
+        let mut panes = vec![pane("new", true, false)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::Busy);
     }
 }
