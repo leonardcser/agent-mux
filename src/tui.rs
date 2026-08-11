@@ -736,6 +736,23 @@ impl App {
                 }
                 Action::Redraw
             }
+            KeyCode::Char('a') => {
+                let mut changed = Vec::new();
+                for p in self.panes.values_mut() {
+                    if matches!(p.status, PaneStatus::NeedsAttention | PaneStatus::Unread) {
+                        p.status = PaneStatus::Idle;
+                        changed.push(p.pane_id.clone());
+                    }
+                }
+                if changed.is_empty() {
+                    return Action::None;
+                }
+                for id in changed {
+                    self.pending_manual_statuses.insert(id, PaneStatus::Idle);
+                }
+                self.save_state();
+                Action::Redraw
+            }
             KeyCode::Char('s') => {
                 if let Some(stashed) = self.toggle_current_stash() {
                     if stashed {
@@ -1324,6 +1341,7 @@ fn render_help(slice: &mut GridSlice<'_>) {
         ("[n]j/k", "move down/up n times"),
         ("enter", "switch to pane"),
         ("space", "toggle attention"),
+        ("a", "mark all read"),
         ("s/u", "stash/unstash"),
         ("dd", "kill pane"),
         ("gg", "go to first"),
@@ -1560,5 +1578,21 @@ mod tests {
             Some("c")
         );
         assert!(app.panes["b"].stashed);
+    }
+
+    #[test]
+    fn mark_all_read_clears_attention_and_unread() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1), pane("c", 2)]);
+        app.panes.get_mut("a").unwrap().status = PaneStatus::Unread;
+        app.panes.get_mut("b").unwrap().status = PaneStatus::NeedsAttention;
+        app.panes.get_mut("c").unwrap().status = PaneStatus::Busy;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
+
+        // Unread/attention panes are cleared; busy panes are left untouched.
+        assert_eq!(app.panes["a"].status, PaneStatus::Idle);
+        assert_eq!(app.panes["b"].status, PaneStatus::Idle);
+        assert_eq!(app.panes["c"].status, PaneStatus::Busy);
     }
 }
