@@ -130,6 +130,8 @@ pub struct UiState {
     pub last_position: LastPosition,
     #[serde(rename = "sidebarWidth", default, skip_serializing_if = "is_zero_u16")]
     pub sidebar_width: u16,
+    #[serde(rename = "sortMode", default, skip_serializing_if = "String::is_empty")]
+    pub sort_mode: String,
     #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -289,6 +291,7 @@ fn ui_state_from_legacy_state(state: State) -> UiState {
         panes,
         last_position: state.last_position,
         sidebar_width: state.sidebar_width,
+        sort_mode: String::new(),
         updated_at: state.updated_at,
     }
 }
