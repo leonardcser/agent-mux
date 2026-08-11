@@ -656,6 +656,14 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent, tx: &mpsc::Sender<Msg>) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Emacs navigation: alias C-n/C-p to down/up so they flow through the
+        // existing vim handling below.
+        let key = match key.code {
+            KeyCode::Char('n') if ctrl => KeyEvent::from(KeyCode::Down),
+            KeyCode::Char('p') if ctrl => KeyEvent::from(KeyCode::Up),
+            _ => key,
+        };
         if key.code == KeyCode::Esc
             || key.code == KeyCode::Char('q')
             || (ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')))
@@ -675,6 +683,20 @@ impl App {
         }
         let count = self.count.max(1);
         self.count = 0;
+
+        // Emacs go-to-top / go-to-bottom: M-< and M->.
+        if alt && matches!(key.code, KeyCode::Char('<')) {
+            self.pending_g = false;
+            self.cursor = first_pane(&self.items).unwrap_or(0);
+            self.preview_gen += 1;
+            return Action::Preview;
+        }
+        if alt && matches!(key.code, KeyCode::Char('>')) {
+            self.pending_g = false;
+            self.cursor = last_pane(&self.items).unwrap_or(0);
+            self.preview_gen += 1;
+            return Action::Preview;
+        }
 
         if key.code == KeyCode::Char('d') {
             if self.pending_d {
@@ -1321,13 +1343,16 @@ fn render_help(slice: &mut GridSlice<'_>) {
     put_clipped(slice, 2, 1, "Keybindings", title);
     let rows = [
         ("j/k", "move down/up"),
+        ("C-n/C-p", "move down/up"),
         ("[n]j/k", "move down/up n times"),
         ("enter", "switch to pane"),
         ("space", "toggle attention"),
         ("s/u", "stash/unstash"),
         ("dd", "kill pane"),
         ("gg", "go to first"),
+        ("M-<", "go to first"),
         ("G", "go to last"),
+        ("M->", "go to last"),
         ("R", "reload watch"),
         ("H/L", "resize sidebar"),
         ("drag", "resize sidebar"),
@@ -1560,5 +1585,30 @@ mod tests {
             Some("c")
         );
         assert!(app.panes["b"].stashed);
+    }
+
+    #[test]
+    fn emacs_navigation_matches_vim_motions() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1), pane("c", 2)]);
+        let cur = |app: &App| app.current_pane().map(|p| p.pane_id.clone());
+
+        app.cursor = app.find_pane_by_id("a").unwrap();
+
+        // C-n moves down like j.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), &tx);
+        assert_eq!(cur(&app).as_deref(), Some("b"));
+
+        // C-p moves up like k.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &tx);
+        assert_eq!(cur(&app).as_deref(), Some("a"));
+
+        // M-> jumps to the last session like G.
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::ALT), &tx);
+        assert_eq!(cur(&app).as_deref(), Some("c"));
+
+        // M-< jumps to the first session like gg.
+        app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::ALT), &tx);
+        assert_eq!(cur(&app).as_deref(), Some("a"));
     }
 }
