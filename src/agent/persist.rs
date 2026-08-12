@@ -257,15 +257,6 @@ pub fn display_status(
     }
 }
 
-pub fn has_manual_status(ui_state: &UiState, pane_id: &str, pane_target: &str) -> bool {
-    ui_state
-        .panes
-        .get(pane_id)
-        .or_else(|| ui_state.panes.get(pane_target))
-        .and_then(|ui| ui.manual_status)
-        .is_some()
-}
-
 pub fn ui_pane_state_is_empty(ui: &UiPaneState) -> bool {
     !ui.stashed && ui.manual_status.is_none()
 }
@@ -527,7 +518,7 @@ pub fn heartbeat_write_lock_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{UiPaneState, UiState, apply_ui_state, display_status, has_manual_status};
+    use super::{UiPaneState, UiState, apply_ui_state, display_status};
     use crate::agent::{Pane, PaneStatus};
 
     fn pane(status: PaneStatus, content_hash: &str) -> Pane {
@@ -579,6 +570,5 @@ mod tests {
         apply_ui_state(&mut panes, &state);
 
         assert_eq!(panes[0].status, PaneStatus::Idle);
-        assert!(has_manual_status(&state, "%1", "s:1.1"));
     }
 }
