@@ -11,6 +11,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use smelt_ansi::{AnsiSpan, parse_ansi_lines};
+use smelt_term::geometry::Rect;
 use smelt_term::grid::{Color, GridSlice, Style};
 use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface, TerminalSession};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -32,6 +33,8 @@ const SYNCING_MSG: &str = "syncing agent-mux snapshot";
 #[derive(Clone, Debug)]
 enum Hit {
     Separator,
+    /// A clickable sidebar row, carrying its index into `items`.
+    Row(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -218,11 +221,11 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                         Action::None => {}
                     }
                 }
-                Event::Mouse(mouse) => {
-                    if app.handle_mouse(mouse) {
-                        dirty = true;
-                    }
-                }
+                Event::Mouse(mouse) => match app.handle_mouse(mouse) {
+                    Action::Quit => return Ok(()),
+                    Action::Redraw => dirty = true,
+                    _ => {}
+                },
                 Event::Resize(w, h) => {
                     surface.set_terminal_size(w, h);
                     app.resize(w, h);
@@ -807,31 +810,42 @@ impl App {
                 self.preview_gen += 1;
                 Action::Preview
             }
-            KeyCode::Enter => {
-                if let Some(p) = self.current_pane() {
-                    let pane_id = p.pane_id.clone();
-                    let target = p.target.clone();
-                    let was_unread = p.status == PaneStatus::Unread
-                        && !has_manual_status(&self.ui_state, &pane_id, &target);
-                    if was_unread {
-                        self.pending_manual_statuses
-                            .insert(pane_id, PaneStatus::Idle);
-                    }
-                    let _ = switch_to_pane(&target);
-                }
-                self.save_state();
-                Action::Quit
-            }
+            KeyCode::Enter => self.open_current_pane(),
             _ => Action::None,
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+    /// Read the pane under the cursor (if unread), switch tmux to it, and quit.
+    fn open_current_pane(&mut self) -> Action {
+        if let Some(p) = self.current_pane() {
+            let pane_id = p.pane_id.clone();
+            let target = p.target.clone();
+            let was_unread = p.status == PaneStatus::Unread
+                && !has_manual_status(&self.ui_state, &pane_id, &target);
+            if was_unread {
+                self.pending_manual_statuses
+                    .insert(pane_id, PaneStatus::Idle);
+            }
+            let _ = switch_to_pane(&target);
+        }
+        self.save_state();
+        Action::Quit
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if matches!(self.hits.hit(mouse.row, mouse.column), Some(Hit::Separator)) {
-                    self.dragging = true;
-                    return true;
+                match self.hits.hit(mouse.row, mouse.column).cloned() {
+                    Some(Hit::Separator) => {
+                        self.dragging = true;
+                        return Action::Redraw;
+                    }
+                    // Clicking a row selects it and opens it, like pressing Enter.
+                    Some(Hit::Row(idx)) => {
+                        self.cursor = idx;
+                        return self.open_current_pane();
+                    }
+                    None => {}
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -839,17 +853,17 @@ impl App {
                     self.sidebar_width = mouse
                         .column
                         .clamp(MIN_SIDEBAR, self.width.saturating_sub(MIN_PREVIEW));
-                    return true;
+                    return Action::Redraw;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) if self.dragging => {
                 self.dragging = false;
                 self.save_state();
-                return true;
+                return Action::Redraw;
             }
             _ => {}
         }
-        false
+        Action::None
     }
 
     fn save_state(&mut self) {
@@ -949,7 +963,7 @@ fn render_separator(slice: &mut GridSlice<'_>, app: &mut App) {
     app.hits.record(slice.grid_rect(), Hit::Separator);
 }
 
-fn render_sidebar(slice: &mut GridSlice<'_>, app: &App) {
+fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
     if let Some(err) = &app.err {
         let (message, style) = if err == SYNCING_MSG {
             (err.clone(), Style::new().fg(Color::DarkGrey))
@@ -972,15 +986,22 @@ fn render_sidebar(slice: &mut GridSlice<'_>, app: &App) {
     let h = slice.height() as usize;
     let start = visible_start(app.items.len(), app.cursor, h);
     let end = (start + h).min(app.items.len());
+    let origin = slice.grid_rect();
+    let width = slice.width();
     for (row, idx) in (start..end).enumerate() {
         render_tree_item(
             slice,
             row as u16,
-            slice.width(),
+            width,
             &app.items[idx],
             idx == app.cursor,
             app,
         );
+        // Register the row as a click target so a click opens it like Enter.
+        if matches!(app.items[idx], TreeItem::Pane(_)) {
+            app.hits
+                .record_local(origin, Rect::new(row as u16, 0, width, 1), Hit::Row(idx));
+        }
     }
 }
 
