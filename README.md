@@ -73,9 +73,10 @@ Or use the key binding: `prefix + j`
 | Key              | Action               |
 | ---------------- | -------------------- |
 | `j` / `k`        | Navigate up/down     |
+| `Ctrl-n` / `Ctrl-p` | Navigate up/down  |
 | `[count]j` / `k` | Move N sessions      |
-| `gg`             | Go to first session  |
-| `G`              | Go to last session   |
+| `gg` / `M-<`     | Go to first session  |
+| `G` / `M->`      | Go to last session   |
 | `space`          | Toggle attention     |
 | `a`              | Mark all read        |
 | `s` / `u`        | Stash/unstash        |
