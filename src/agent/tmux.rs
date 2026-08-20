@@ -36,6 +36,8 @@ struct RawPane {
     pid: i32,
     provider_pid: i32,
     window_focused: bool,
+    width: u16,
+    height: u16,
 }
 
 pub fn list_panes() -> Result<Vec<Pane>> {
@@ -75,6 +77,8 @@ fn fetch_panes() -> Result<Vec<Pane>> {
             path: r.path,
             pid: r.pid,
             window_active: r.window_focused,
+            width: r.width,
+            height: r.height,
             order,
             provider: r.cmd,
             provider_pid: r.provider_pid,
@@ -89,7 +93,7 @@ fn list_tmux_panes() -> Result<String> {
         .arg("list-panes")
         .arg("-a")
         .arg("-F")
-        .arg("#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{?session_attached,1,0}#{pane_active}\t#{pane_id}")
+        .arg("#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{?session_attached,1,0}#{pane_active}\t#{pane_id}\t#{pane_width}x#{pane_height}")
         .output()
         .context("tmux list-panes")?;
     if !out.status.success() {
@@ -106,11 +110,12 @@ fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
             if line.is_empty() {
                 return None;
             }
-            let fields: Vec<&str> = line.splitn(7, '\t').collect();
-            if fields.len() < 7 {
+            let fields: Vec<&str> = line.splitn(8, '\t').collect();
+            if fields.len() < 8 {
                 return None;
             }
             let (session, window, pane) = parse_target(fields[0]);
+            let (width, height) = parse_dims(fields[7]);
             Some(RawPane {
                 target: fields[0].to_string(),
                 cmd: fields[1].to_string(),
@@ -120,6 +125,8 @@ fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
                 window_name: fields[4].to_string(),
                 window_focused: fields[5] == "111",
                 pane_id: fields[6].to_string(),
+                width,
+                height,
                 session,
                 window,
                 pane,
@@ -339,6 +346,13 @@ fn stop_watch_process() {
             .arg(pid.to_string())
             .status();
     }
+}
+
+fn parse_dims(s: &str) -> (u16, u16) {
+    let mut parts = s.trim().splitn(2, 'x');
+    let width = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let height = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (width, height)
 }
 
 pub fn parse_target(s: &str) -> (String, String, String) {
