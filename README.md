@@ -78,6 +78,7 @@ Or use the key binding: `prefix + j`
 | `gg` / `M-<`     | Go to first session  |
 | `G` / `M->`      | Go to last session   |
 | `space`          | Toggle attention     |
+| `a`              | Mark all read        |
 | `s` / `u`        | Stash/unstash        |
 | `enter`          | Switch to session    |
 | `dd`             | Kill session         |
