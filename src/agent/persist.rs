@@ -130,6 +130,8 @@ pub struct UiState {
     pub last_position: LastPosition,
     #[serde(rename = "sidebarWidth", default, skip_serializing_if = "is_zero_u16")]
     pub sidebar_width: u16,
+    #[serde(rename = "sortMode", default, skip_serializing_if = "String::is_empty")]
+    pub sort_mode: String,
     #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -249,21 +251,16 @@ pub fn display_status(
     let same_content =
         manual_status_base_hash.is_empty() || manual_status_base_hash == content_hash;
     match manual_status {
+        // A manual Unread flag is sticky until you read it, but must never mask live
+        // activity: show Busy while the agent is actually working, then fall back to
+        // the Unread flag once it settles.
+        PaneStatus::Unread if observed_status == PaneStatus::Busy => PaneStatus::Busy,
         PaneStatus::Unread => PaneStatus::Unread,
         PaneStatus::Idle if same_content => PaneStatus::Idle,
         PaneStatus::Idle => observed_status,
         status if same_content => status,
         _ => observed_status,
     }
-}
-
-pub fn has_manual_status(ui_state: &UiState, pane_id: &str, pane_target: &str) -> bool {
-    ui_state
-        .panes
-        .get(pane_id)
-        .or_else(|| ui_state.panes.get(pane_target))
-        .and_then(|ui| ui.manual_status)
-        .is_some()
 }
 
 pub fn ui_pane_state_is_empty(ui: &UiPaneState) -> bool {
@@ -289,6 +286,7 @@ fn ui_state_from_legacy_state(state: State) -> UiState {
         panes,
         last_position: state.last_position,
         sidebar_width: state.sidebar_width,
+        sort_mode: String::new(),
         updated_at: state.updated_at,
     }
 }
@@ -527,7 +525,7 @@ pub fn heartbeat_write_lock_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{UiPaneState, UiState, apply_ui_state, display_status, has_manual_status};
+    use super::{UiPaneState, UiState, apply_ui_state, display_status};
     use crate::agent::{Pane, PaneStatus};
 
     fn pane(status: PaneStatus, content_hash: &str) -> Pane {
@@ -557,6 +555,24 @@ mod tests {
     }
 
     #[test]
+    fn manual_unread_yields_to_live_busy() {
+        // A pane flagged Unread must still show Busy while the agent is working,
+        // regardless of the base hash, then return to the Unread flag once idle.
+        assert_eq!(
+            display_status(PaneStatus::Busy, "new", PaneStatus::Unread, "old"),
+            PaneStatus::Busy
+        );
+        assert_eq!(
+            display_status(PaneStatus::Busy, "same", PaneStatus::Unread, "same"),
+            PaneStatus::Busy
+        );
+        assert_eq!(
+            display_status(PaneStatus::Idle, "new", PaneStatus::Unread, "old"),
+            PaneStatus::Unread
+        );
+    }
+
+    #[test]
     fn manual_read_holds_until_content_changes() {
         assert_eq!(
             display_status(PaneStatus::Unread, "same", PaneStatus::Idle, "same"),
@@ -579,6 +595,5 @@ mod tests {
         apply_ui_state(&mut panes, &state);
 
         assert_eq!(panes[0].status, PaneStatus::Idle);
-        assert!(has_manual_status(&state, "%1", "s:1.1"));
     }
 }

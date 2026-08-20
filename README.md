@@ -73,16 +73,24 @@ Or use the key binding: `prefix + j`
 | Key              | Action               |
 | ---------------- | -------------------- |
 | `j` / `k`        | Navigate up/down     |
+| `Ctrl-n` / `Ctrl-p` | Navigate up/down  |
 | `[count]j` / `k` | Move N sessions      |
-| `gg`             | Go to first session  |
-| `G`              | Go to last session   |
+| `gg` / `M-<`     | Go to first session  |
+| `G` / `M->`      | Go to last session   |
 | `space`          | Toggle attention     |
+| `a`              | Mark all read        |
 | `s` / `u`        | Stash/unstash        |
 | `enter`          | Switch to session    |
 | `dd`             | Kill session         |
+| `o`              | Toggle sort order    |
 | `R`              | Reload watch process |
 | `H` / `L`        | Resize sidebar       |
 | `?`              | Toggle help          |
 | `q` / `esc`      | Quit                 |
 
 The sidebar separator can also be dragged with the mouse.
+
+Sessions are grouped by folder. Press `o` to switch between the default
+stable order and sorting by most recent change first — folders are ordered by
+their most recently active session, and sessions within each folder likewise.
+The choice is remembered across restarts.

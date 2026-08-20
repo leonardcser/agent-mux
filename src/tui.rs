@@ -18,7 +18,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::ipc;
 use crate::agent::persist::{
-    LastPosition, Snapshot, UiState, apply_ui_state, has_manual_status, load_snapshot,
+    LastPosition, Snapshot, UiState, apply_ui_state, load_snapshot,
     load_ui_state, panes_from_snapshot, ui_pane_state_is_empty, update_ui_state,
 };
 use crate::agent::{Pane, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane};
@@ -364,6 +364,40 @@ enum Action {
     Quit,
 }
 
+/// How sessions are ordered in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SortMode {
+    /// Stable creation order (the default), grouped by folder.
+    #[default]
+    Order,
+    /// Most recently changed first: folders are ordered by their most
+    /// recently active session, and sessions within a folder likewise.
+    Recent,
+}
+
+impl SortMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            SortMode::Order => "order",
+            SortMode::Recent => "recent",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "recent" => SortMode::Recent,
+            _ => SortMode::Order,
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            SortMode::Order => SortMode::Recent,
+            SortMode::Recent => SortMode::Order,
+        }
+    }
+}
+
 struct App {
     panes: HashMap<String, Pane>,
     items: Vec<TreeItem>,
@@ -382,6 +416,7 @@ struct App {
     show_help: bool,
     pending_d: bool,
     pending_g: bool,
+    sort_mode: SortMode,
     count: usize,
     err: Option<String>,
     ui_state: UiState,
@@ -421,6 +456,7 @@ impl App {
             show_help: false,
             pending_d: false,
             pending_g: false,
+            sort_mode: SortMode::from_str(&ui_state.sort_mode),
             count: 0,
             err: snapshot.is_none().then(|| SYNCING_MSG.to_string()),
             ui_state,
@@ -546,11 +582,31 @@ impl App {
                 items.push(TreeItem::SectionHeader(Some("stashed".into())));
             }
 
-            groups.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.key.cmp(&b.key)));
+            // Most recent change first: the newest last_active in a group.
+            let group_recency = |g: &Group<'_>| g.panes.iter().filter_map(|p| p.last_active).max();
+            match self.sort_mode {
+                SortMode::Order => {
+                    groups.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.key.cmp(&b.key)));
+                }
+                SortMode::Recent => {
+                    groups.sort_by(|a, b| {
+                        group_recency(b)
+                            .cmp(&group_recency(a))
+                            .then(a.key.cmp(&b.key))
+                    });
+                }
+            }
             for mut group in groups {
-                group
-                    .panes
-                    .sort_by(|a, b| a.order.cmp(&b.order).then(a.target.cmp(&b.target)));
+                match self.sort_mode {
+                    SortMode::Order => group
+                        .panes
+                        .sort_by(|a, b| a.order.cmp(&b.order).then(a.target.cmp(&b.target))),
+                    SortMode::Recent => group.panes.sort_by(|a, b| {
+                        b.last_active
+                            .cmp(&a.last_active)
+                            .then(a.order.cmp(&b.order))
+                    }),
+                }
                 if matches!(&group.key, GroupKey::Project(_)) {
                     items.push(TreeItem::ProjectGroup(group.header_id));
                 } else {
@@ -659,6 +715,14 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent, tx: &mpsc::Sender<Msg>) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Emacs navigation: alias C-n/C-p to down/up so they flow through the
+        // existing vim handling below.
+        let key = match key.code {
+            KeyCode::Char('n') if ctrl => KeyEvent::from(KeyCode::Down),
+            KeyCode::Char('p') if ctrl => KeyEvent::from(KeyCode::Up),
+            _ => key,
+        };
         if key.code == KeyCode::Esc
             || key.code == KeyCode::Char('q')
             || (ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')))
@@ -678,6 +742,20 @@ impl App {
         }
         let count = self.count.max(1);
         self.count = 0;
+
+        // Emacs go-to-top / go-to-bottom: M-< and M->.
+        if alt && matches!(key.code, KeyCode::Char('<')) {
+            self.pending_g = false;
+            self.cursor = first_pane(&self.items).unwrap_or(0);
+            self.preview_gen += 1;
+            return Action::Preview;
+        }
+        if alt && matches!(key.code, KeyCode::Char('>')) {
+            self.pending_g = false;
+            self.cursor = last_pane(&self.items).unwrap_or(0);
+            self.preview_gen += 1;
+            return Action::Preview;
+        }
 
         if key.code == KeyCode::Char('d') {
             if self.pending_d {
@@ -739,6 +817,23 @@ impl App {
                 }
                 Action::Redraw
             }
+            KeyCode::Char('a') => {
+                let mut changed = Vec::new();
+                for p in self.panes.values_mut() {
+                    if matches!(p.status, PaneStatus::NeedsAttention | PaneStatus::Unread) {
+                        p.status = PaneStatus::Idle;
+                        changed.push(p.pane_id.clone());
+                    }
+                }
+                if changed.is_empty() {
+                    return Action::None;
+                }
+                for id in changed {
+                    self.pending_manual_statuses.insert(id, PaneStatus::Idle);
+                }
+                self.save_state();
+                Action::Redraw
+            }
             KeyCode::Char('s') => {
                 if let Some(stashed) = self.toggle_current_stash() {
                     if stashed {
@@ -774,6 +869,17 @@ impl App {
             KeyCode::Char('R') => {
                 let _ = restart_watch();
                 Action::LoadPanes
+            }
+            KeyCode::Char('o') => {
+                let selected = self.current_pane().map(|p| p.pane_id.clone());
+                self.sort_mode = self.sort_mode.toggled();
+                self.rebuild_items();
+                self.cursor = selected
+                    .and_then(|id| self.find_pane_by_id(&id))
+                    .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
+                self.preview_gen += 1;
+                self.save_state();
+                Action::Preview
             }
             KeyCode::Char('H') => {
                 self.sidebar_width = self
@@ -820,9 +926,9 @@ impl App {
         if let Some(p) = self.current_pane() {
             let pane_id = p.pane_id.clone();
             let target = p.target.clone();
-            let was_unread = p.status == PaneStatus::Unread
-                && !has_manual_status(&self.ui_state, &pane_id, &target);
-            if was_unread {
+            // Opening a pane reads it, even if it was force-marked unread —
+            // consistent with Space/`a`, which clear a manual Unread too.
+            if p.status == PaneStatus::Unread {
                 self.pending_manual_statuses
                     .insert(pane_id, PaneStatus::Idle);
             }
@@ -896,6 +1002,7 @@ impl App {
             .collect();
         let pending = self.pending_manual_statuses.clone();
         let sidebar_width = self.sidebar_width;
+        let sort_mode = self.sort_mode;
         if update_ui_state(|state| {
             for p in &panes {
                 if !state.panes.contains_key(&p.pane_id)
@@ -921,6 +1028,7 @@ impl App {
                 scroll_start,
             };
             state.sidebar_width = sidebar_width;
+            state.sort_mode = sort_mode.as_str().to_string();
         })
         .is_ok()
         {
@@ -1342,13 +1450,18 @@ fn render_help(slice: &mut GridSlice<'_>) {
     put_clipped(slice, 2, 1, "Keybindings", title);
     let rows = [
         ("j/k", "move down/up"),
+        ("C-n/C-p", "move down/up"),
         ("[n]j/k", "move down/up n times"),
         ("enter", "switch to pane"),
         ("space", "toggle attention"),
+        ("a", "mark all read"),
         ("s/u", "stash/unstash"),
         ("dd", "kill pane"),
         ("gg", "go to first"),
+        ("M-<", "go to first"),
         ("G", "go to last"),
+        ("M->", "go to last"),
+        ("o", "toggle sort order"),
         ("R", "reload watch"),
         ("H/L", "resize sidebar"),
         ("drag", "resize sidebar"),
@@ -1555,6 +1668,7 @@ mod tests {
             show_help: false,
             pending_d: false,
             pending_g: false,
+            sort_mode: SortMode::default(),
             count: 0,
             err: None,
             ui_state: UiState::default(),
@@ -1581,5 +1695,92 @@ mod tests {
             Some("c")
         );
         assert!(app.panes["b"].stashed);
+    }
+
+    fn pane_at(id: &str, order: usize, path: &str, last_active_secs: i64) -> Pane {
+        Pane {
+            pane_id: id.to_string(),
+            target: format!("session:1.{order}"),
+            path: path.to_string(),
+            order,
+            last_active: chrono::DateTime::from_timestamp(last_active_secs, 0),
+            ..Pane::default()
+        }
+    }
+
+    fn pane_ids(app: &App) -> Vec<String> {
+        app.items
+            .iter()
+            .filter_map(|it| match it {
+                TreeItem::Pane(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recent_sort_orders_folders_and_sessions_by_last_active() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_panes(vec![
+            pane_at("a1", 0, "/a", 100),
+            pane_at("a2", 1, "/a", 300),
+            pane_at("b1", 2, "/b", 500),
+        ]);
+
+        // Default order: grouped by folder, in creation order.
+        assert_eq!(app.sort_mode, SortMode::Order);
+        assert_eq!(pane_ids(&app), ["a1", "a2", "b1"]);
+
+        // Toggle to recent: folder /b (500) sorts ahead of /a (300); within /a
+        // the newer a2 (300) sorts ahead of a1 (100).
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.sort_mode, SortMode::Recent);
+        assert_eq!(pane_ids(&app), ["b1", "a2", "a1"]);
+
+        // Toggling again returns to the stable order.
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.sort_mode, SortMode::Order);
+        assert_eq!(pane_ids(&app), ["a1", "a2", "b1"]);
+    }
+
+    #[test]
+    fn mark_all_read_clears_attention_and_unread() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1), pane("c", 2)]);
+        app.panes.get_mut("a").unwrap().status = PaneStatus::Unread;
+        app.panes.get_mut("b").unwrap().status = PaneStatus::NeedsAttention;
+        app.panes.get_mut("c").unwrap().status = PaneStatus::Busy;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
+
+        // Unread/attention panes are cleared; busy panes are left untouched.
+        assert_eq!(app.panes["a"].status, PaneStatus::Idle);
+        assert_eq!(app.panes["b"].status, PaneStatus::Idle);
+        assert_eq!(app.panes["c"].status, PaneStatus::Busy);
+    }
+
+    #[test]
+    fn emacs_navigation_matches_vim_motions() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1), pane("c", 2)]);
+        let cur = |app: &App| app.current_pane().map(|p| p.pane_id.clone());
+
+        app.cursor = app.find_pane_by_id("a").unwrap();
+
+        // C-n moves down like j.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), &tx);
+        assert_eq!(cur(&app).as_deref(), Some("b"));
+
+        // C-p moves up like k.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &tx);
+        assert_eq!(cur(&app).as_deref(), Some("a"));
+
+        // M-> jumps to the last session like G.
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::ALT), &tx);
+        assert_eq!(cur(&app).as_deref(), Some("c"));
+
+        // M-< jumps to the first session like gg.
+        app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::ALT), &tx);
+        assert_eq!(cur(&app).as_deref(), Some("a"));
     }
 }
