@@ -17,7 +17,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::ipc;
 use crate::agent::persist::{
-    LastPosition, Snapshot, UiState, apply_ui_state, has_manual_status, load_snapshot,
+    LastPosition, Snapshot, UiState, apply_ui_state, load_snapshot,
     load_ui_state, panes_from_snapshot, ui_pane_state_is_empty, update_ui_state,
 };
 use crate::agent::{Pane, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane};
@@ -917,9 +917,9 @@ impl App {
                 if let Some(p) = self.current_pane() {
                     let pane_id = p.pane_id.clone();
                     let target = p.target.clone();
-                    let was_unread = p.status == PaneStatus::Unread
-                        && !has_manual_status(&self.ui_state, &pane_id, &target);
-                    if was_unread {
+                    // Opening a pane reads it, even if it was force-marked unread —
+                    // consistent with Space/`a`, which clear a manual Unread too.
+                    if p.status == PaneStatus::Unread {
                         self.pending_manual_statuses
                             .insert(pane_id, PaneStatus::Idle);
                     }
