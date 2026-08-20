@@ -1554,15 +1554,22 @@ fn display_width(s: &str) -> usize {
 }
 
 fn truncate_width(s: &str, max: usize) -> String {
+    if display_width(s) <= max {
+        return s.to_string();
+    }
     let mut out = String::new();
     let mut width = 0;
+    let limit = max.saturating_sub(1);
     for ch in s.chars() {
         let w = ch.width().unwrap_or(1).max(1);
-        if width + w > max {
+        if width + w > limit {
             break;
         }
         out.push(ch);
         width += w;
+    }
+    if max >= 1 {
+        out.push('…');
     }
     out
 }
