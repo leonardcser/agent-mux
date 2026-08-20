@@ -63,6 +63,8 @@ pub struct Pane {
     pub content_hash: String,
     pub heuristic_attention: bool,
     pub window_active: bool,
+    pub width: u16,
+    pub height: u16,
     pub last_active: Option<DateTime<Utc>>,
     pub stashed: bool,
     pub order: usize,
