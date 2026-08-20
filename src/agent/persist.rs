@@ -251,6 +251,10 @@ pub fn display_status(
     let same_content =
         manual_status_base_hash.is_empty() || manual_status_base_hash == content_hash;
     match manual_status {
+        // A manual Unread flag is sticky until you read it, but must never mask live
+        // activity: show Busy while the agent is actually working, then fall back to
+        // the Unread flag once it settles.
+        PaneStatus::Unread if observed_status == PaneStatus::Busy => PaneStatus::Busy,
         PaneStatus::Unread => PaneStatus::Unread,
         PaneStatus::Idle if same_content => PaneStatus::Idle,
         PaneStatus::Idle => observed_status,
@@ -553,6 +557,24 @@ mod tests {
 
     #[test]
     fn manual_unread_overrides_observed_idle() {
+        assert_eq!(
+            display_status(PaneStatus::Idle, "new", PaneStatus::Unread, "old"),
+            PaneStatus::Unread
+        );
+    }
+
+    #[test]
+    fn manual_unread_yields_to_live_busy() {
+        // A pane flagged Unread must still show Busy while the agent is working,
+        // regardless of the base hash, then return to the Unread flag once idle.
+        assert_eq!(
+            display_status(PaneStatus::Busy, "new", PaneStatus::Unread, "old"),
+            PaneStatus::Busy
+        );
+        assert_eq!(
+            display_status(PaneStatus::Busy, "same", PaneStatus::Unread, "same"),
+            PaneStatus::Busy
+        );
         assert_eq!(
             display_status(PaneStatus::Idle, "new", PaneStatus::Unread, "old"),
             PaneStatus::Unread
