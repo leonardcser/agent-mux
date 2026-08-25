@@ -11,6 +11,18 @@ const BUSY_UNCHANGED_POLLS: usize = 3;
 // churn until the content settles, capped so a genuinely busy pane recovers.
 const RESIZE_SETTLE_POLLS: usize = 5;
 
+fn activity_status(previous: PaneStatus, busy: bool, focused: bool) -> PaneStatus {
+    if busy {
+        PaneStatus::Busy
+    } else if focused {
+        PaneStatus::Idle
+    } else if matches!(previous, PaneStatus::Busy | PaneStatus::Unread) {
+        PaneStatus::Unread
+    } else {
+        PaneStatus::Idle
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Reconciler {
     prev_content: HashMap<String, String>,
@@ -84,22 +96,13 @@ impl Reconciler {
             };
             self.resize_settling.insert(id.clone(), settling);
 
-            if let Some(observed_status) = p.observed_status {
-                let content_changed = raw_content_changed && !focus_changed && !resize_suppressed;
-                let status = if observed_status == PaneStatus::Unread
-                    && prev_status == PaneStatus::Idle
-                    && !content_changed
-                {
-                    PaneStatus::Idle
-                } else {
-                    observed_status
-                };
-                if status == PaneStatus::Busy {
+            if let Some(observed_busy) = p.observed_busy {
+                if observed_busy {
                     self.last_active.insert(id.clone(), now);
                     self.unchanged_count.insert(id.clone(), 0);
                 }
                 p.last_active = self.last_active.get(&id).copied();
-                p.status = status;
+                p.status = activity_status(prev_status, observed_busy, p.window_active);
                 self.track_pane(p);
                 continue;
             }
@@ -115,32 +118,13 @@ impl Reconciler {
             }
             p.last_active = self.last_active.get(&id).copied();
 
-            p.status = if active_now {
+            p.status = if !active_now
+                && prev_status == PaneStatus::Busy
+                && self.unchanged_count.get(&id).copied().unwrap_or_default() < BUSY_UNCHANGED_POLLS
+            {
                 PaneStatus::Busy
-            } else if prev_status == PaneStatus::Busy {
-                if self.unchanged_count.get(&id).copied().unwrap_or_default()
-                    >= BUSY_UNCHANGED_POLLS
-                {
-                    if p.heuristic_attention {
-                        PaneStatus::NeedsAttention
-                    } else if p.window_active {
-                        PaneStatus::Idle
-                    } else {
-                        PaneStatus::Unread
-                    }
-                } else {
-                    PaneStatus::Busy
-                }
-            } else if p.heuristic_attention || prev_status == PaneStatus::NeedsAttention {
-                PaneStatus::NeedsAttention
-            } else if prev_status == PaneStatus::Unread {
-                if p.window_active {
-                    PaneStatus::Idle
-                } else {
-                    PaneStatus::Unread
-                }
             } else {
-                PaneStatus::Idle
+                activity_status(prev_status, active_now, p.window_active)
             };
 
             self.track_pane(p);
@@ -203,13 +187,12 @@ mod tests {
         }
     }
 
-    fn pane(content_hash: &str, window_active: bool, heuristic_attention: bool) -> Pane {
+    fn pane(content_hash: &str, window_active: bool) -> Pane {
         Pane {
             pane_id: "%1".to_string(),
             target: "s:1.1".to_string(),
             content_hash: content_hash.to_string(),
             window_active,
-            heuristic_attention,
             width: 80,
             height: 24,
             ..Pane::default()
@@ -220,26 +203,33 @@ mod tests {
         Pane {
             width,
             height,
-            ..pane(content_hash, false, false)
+            ..pane(content_hash, false)
         }
     }
 
-    fn pane_with_observed(
-        content_hash: &str,
-        window_active: bool,
-        observed_status: PaneStatus,
-    ) -> Pane {
+    fn pane_with_observed(content_hash: &str, window_active: bool, busy: bool) -> Pane {
         Pane {
-            observed_status: Some(observed_status),
-            ..pane(content_hash, window_active, false)
+            observed_busy: Some(busy),
+            ..pane(content_hash, window_active)
         }
     }
 
     #[test]
-    fn observed_unread_from_idle_focus_change_stays_idle() {
+    fn observed_busy_becoming_idle_marks_unfocused_pane_unread() {
         let mut reconciler = Reconciler::new();
-        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Idle, "old", true));
-        let mut panes = vec![pane_with_observed("new", false, PaneStatus::Unread)];
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Busy, "same", false));
+        let mut panes = vec![pane_with_observed("same", false, false)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::Unread);
+    }
+
+    #[test]
+    fn observed_busy_becoming_idle_stays_read_when_focused() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Busy, "same", true));
+        let mut panes = vec![pane_with_observed("same", true, false)];
 
         reconciler.reconcile(&mut panes);
 
@@ -247,32 +237,24 @@ mod tests {
     }
 
     #[test]
-    fn observed_unread_from_idle_content_change_marks_unread() {
+    fn observed_idle_preserves_unread_until_focused() {
         let mut reconciler = Reconciler::new();
-        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Idle, "old", false));
-        let mut panes = vec![pane_with_observed("new", false, PaneStatus::Unread)];
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Unread, "same", false));
 
+        let mut panes = vec![pane_with_observed("same", false, false)];
         reconciler.reconcile(&mut panes);
-
         assert_eq!(panes[0].status, PaneStatus::Unread);
+
+        let mut panes = vec![pane_with_observed("same", true, false)];
+        reconciler.reconcile(&mut panes);
+        assert_eq!(panes[0].status, PaneStatus::Idle);
     }
 
     #[test]
-    fn observed_unread_from_busy_marks_unread() {
+    fn observed_busy_marks_pane_busy() {
         let mut reconciler = Reconciler::new();
-        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Busy, "old", false));
-        let mut panes = vec![pane_with_observed("old", false, PaneStatus::Unread)];
-
-        reconciler.reconcile(&mut panes);
-
-        assert_eq!(panes[0].status, PaneStatus::Unread);
-    }
-
-    #[test]
-    fn content_change_without_focus_change_marks_busy() {
-        let mut reconciler = Reconciler::new();
-        reconciler.seed_from_snapshot(&snapshot(PaneStatus::NeedsAttention, "old", false));
-        let mut panes = vec![pane("new", false, true)];
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Idle, "same", false));
+        let mut panes = vec![pane_with_observed("same", false, true)];
 
         reconciler.reconcile(&mut panes);
 
@@ -280,14 +262,25 @@ mod tests {
     }
 
     #[test]
-    fn focus_change_content_redraw_does_not_mark_busy() {
+    fn content_change_without_focus_change_marks_busy() {
         let mut reconciler = Reconciler::new();
-        reconciler.seed_from_snapshot(&snapshot(PaneStatus::NeedsAttention, "old", true));
-        let mut panes = vec![pane("new", false, true)];
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Unread, "old", false));
+        let mut panes = vec![pane("new", false)];
 
         reconciler.reconcile(&mut panes);
 
-        assert_eq!(panes[0].status, PaneStatus::NeedsAttention);
+        assert_eq!(panes[0].status, PaneStatus::Busy);
+    }
+
+    #[test]
+    fn focus_change_redraw_preserves_unread_when_focus_moves_away() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Unread, "old", true));
+        let mut panes = vec![pane("new", false)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::Unread);
     }
 
     #[test]
@@ -296,14 +289,14 @@ mod tests {
         reconciler.seed_from_snapshot(&snapshot(PaneStatus::Busy, "same", false));
 
         for _ in 0..2 {
-            let mut panes = vec![pane("same", false, false)];
+            let mut panes = vec![pane("same", false)];
 
             reconciler.reconcile(&mut panes);
 
             assert_eq!(panes[0].status, PaneStatus::Busy);
         }
 
-        let mut panes = vec![pane("same", false, false)];
+        let mut panes = vec![pane("same", false)];
 
         reconciler.reconcile(&mut panes);
 
@@ -383,7 +376,7 @@ mod tests {
     fn content_change_starts_busy_in_focused_pane() {
         let mut reconciler = Reconciler::new();
         reconciler.seed_from_snapshot(&snapshot(PaneStatus::Idle, "old", true));
-        let mut panes = vec![pane("new", true, false)];
+        let mut panes = vec![pane("new", true)];
 
         reconciler.reconcile(&mut panes);
 

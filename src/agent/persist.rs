@@ -52,20 +52,12 @@ pub struct CachedPane {
     pub git_branch: String,
     #[serde(rename = "gitDirty", default, skip_serializing_if = "is_false")]
     pub git_dirty: bool,
-    #[serde(default)]
-    pub stashed: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub order: usize,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
     #[serde(rename = "windowActive", default, skip_serializing_if = "is_false")]
     pub window_active: bool,
-    #[serde(
-        rename = "statusOverride",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub status_override: Option<i32>,
     #[serde(
         rename = "contentHash",
         default,
@@ -84,20 +76,6 @@ pub struct CachedPane {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_active: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct State {
-    #[serde(default)]
-    pub version: i32,
-    #[serde(default)]
-    pub panes: Vec<CachedPane>,
-    #[serde(rename = "lastPosition", default)]
-    pub last_position: LastPosition,
-    #[serde(rename = "sidebarWidth", default, skip_serializing_if = "is_zero_u16")]
-    pub sidebar_width: u16,
-    #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -140,20 +118,14 @@ pub struct UiState {
 pub struct UiPaneState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stashed: bool,
+    #[serde(rename = "forcedUnread", default, skip_serializing_if = "is_false")]
+    pub forced_unread: bool,
     #[serde(
-        rename = "manualStatus",
-        alias = "statusOverride",
+        rename = "readContentHash",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub manual_status: Option<i32>,
-    #[serde(
-        rename = "manualStatusBaseHash",
-        alias = "contentHash",
-        default,
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub manual_status_base_hash: String,
+    pub read_content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -192,19 +164,8 @@ impl CachedPane {
     }
 }
 
-pub fn load_state() -> Option<State> {
-    load_state_file(state_path())
-}
-
 pub fn load_snapshot() -> Option<Snapshot> {
-    load_snapshot_file().or_else(|| {
-        load_state().map(|state| Snapshot {
-            version: state.version,
-            generation: 1,
-            panes: state.panes,
-            updated_at: state.updated_at,
-        })
-    })
+    load_snapshot_file()
 }
 
 fn load_snapshot_file() -> Option<Snapshot> {
@@ -214,7 +175,6 @@ fn load_snapshot_file() -> Option<Snapshot> {
 pub fn load_ui_state() -> UiState {
     load_json_file(ui_state_path())
         .filter(|state: &UiState| state.version == 1)
-        .or_else(|| load_state().map(ui_state_from_legacy_state))
         .unwrap_or_default()
 }
 
@@ -232,63 +192,33 @@ pub fn apply_ui_state(panes: &mut [Pane], ui_state: &UiState) {
 
 pub fn apply_pane_ui_state(pane: &mut Pane, ui: &UiPaneState) {
     pane.stashed = ui.stashed;
-    if let Some(status) = ui.manual_status {
-        pane.status = display_status(
-            pane.status,
-            &pane.content_hash,
-            PaneStatus::from_i32(status),
-            &ui.manual_status_base_hash,
-        );
-    }
+    pane.status = display_status(
+        pane.status,
+        &pane.content_hash,
+        ui.forced_unread,
+        ui.read_content_hash.as_deref(),
+    );
 }
 
 pub fn display_status(
-    observed_status: PaneStatus,
+    status: PaneStatus,
     content_hash: &str,
-    manual_status: PaneStatus,
-    manual_status_base_hash: &str,
+    forced_unread: bool,
+    read_content_hash: Option<&str>,
 ) -> PaneStatus {
-    let same_content =
-        manual_status_base_hash.is_empty() || manual_status_base_hash == content_hash;
-    match manual_status {
-        // A manual Unread flag is sticky until you read it, but must never mask live
-        // activity: show Busy while the agent is actually working, then fall back to
-        // the Unread flag once it settles.
-        PaneStatus::Unread if observed_status == PaneStatus::Busy => PaneStatus::Busy,
-        PaneStatus::Unread => PaneStatus::Unread,
-        PaneStatus::Idle if same_content => PaneStatus::Idle,
-        PaneStatus::Idle => observed_status,
-        status if same_content => status,
-        _ => observed_status,
+    if status == PaneStatus::Busy {
+        PaneStatus::Busy
+    } else if forced_unread {
+        PaneStatus::Unread
+    } else if status == PaneStatus::Unread && read_content_hash == Some(content_hash) {
+        PaneStatus::Idle
+    } else {
+        status
     }
 }
 
 pub fn ui_pane_state_is_empty(ui: &UiPaneState) -> bool {
-    !ui.stashed && ui.manual_status.is_none()
-}
-
-fn ui_state_from_legacy_state(state: State) -> UiState {
-    let panes = state
-        .panes
-        .into_iter()
-        .filter_map(|cp| {
-            let key = cp.pane_key().to_string();
-            let ui = UiPaneState {
-                stashed: cp.stashed,
-                manual_status: cp.status_override,
-                manual_status_base_hash: cp.content_hash,
-            };
-            (ui.stashed || ui.manual_status.is_some()).then_some((key, ui))
-        })
-        .collect();
-    UiState {
-        version: state.version,
-        panes,
-        last_position: state.last_position,
-        sidebar_width: state.sidebar_width,
-        sort_mode: String::new(),
-        updated_at: state.updated_at,
-    }
+    !ui.stashed && !ui.forced_unread && ui.read_content_hash.is_none()
 }
 
 pub fn write_snapshot_if_changed(mut snapshot: Snapshot) -> Result<bool> {
@@ -329,8 +259,6 @@ fn comparable_panes(panes: &[CachedPane]) -> Vec<CachedPane> {
         .iter()
         .cloned()
         .map(|mut pane| {
-            pane.stashed = false;
-            pane.status_override = None;
             pane.window_active = false;
             pane.content_hash.clear();
             pane.last_active = None;
@@ -371,6 +299,7 @@ pub fn update_ui_state_if_changed(mut f: impl FnMut(&mut UiState)) -> Result<boo
     Ok(true)
 }
 
+#[cfg(not(test))]
 pub fn update_ui_state(mut f: impl FnMut(&mut UiState)) -> Result<()> {
     let lock_file = lock_file(ui_state_write_lock_path())?;
     let mut state = load_ui_state();
@@ -380,11 +309,6 @@ pub fn update_ui_state(mut f: impl FnMut(&mut UiState)) -> Result<()> {
     write_json_file(ui_state_path(), &state)?;
     drop(lock_file);
     Ok(())
-}
-
-fn load_state_file(path: PathBuf) -> Option<State> {
-    let state: State = load_json_file(path)?;
-    (state.version == 1).then_some(state)
 }
 
 fn load_json_file<T: DeserializeOwned>(path: PathBuf) -> Option<T> {
@@ -475,7 +399,6 @@ fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
                 project_dirty: cp.project_dirty,
                 git_branch: cp.git_branch.clone(),
                 git_dirty: cp.git_dirty,
-                stashed: cp.stashed,
                 order: cp.order,
                 provider: cp.provider.clone(),
                 window_active: cp.window_active,
@@ -493,10 +416,6 @@ pub fn state_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".local/state/agent-mux")
-}
-
-pub fn state_path() -> PathBuf {
-    state_dir().join("state.json")
 }
 
 pub fn snapshot_path() -> PathBuf {
@@ -538,48 +457,26 @@ mod tests {
         }
     }
 
-    fn ui(status: PaneStatus, content_hash: &str) -> UiPaneState {
-        UiPaneState {
-            manual_status: Some(status.as_i32()),
-            manual_status_base_hash: content_hash.to_string(),
-            ..UiPaneState::default()
-        }
-    }
-
     #[test]
-    fn manual_unread_overrides_observed_idle() {
+    fn forced_unread_overrides_idle_but_not_busy() {
         assert_eq!(
-            display_status(PaneStatus::Idle, "new", PaneStatus::Unread, "old"),
+            display_status(PaneStatus::Idle, "same", true, None),
             PaneStatus::Unread
         );
-    }
-
-    #[test]
-    fn manual_unread_yields_to_live_busy() {
-        // A pane flagged Unread must still show Busy while the agent is working,
-        // regardless of the base hash, then return to the Unread flag once idle.
         assert_eq!(
-            display_status(PaneStatus::Busy, "new", PaneStatus::Unread, "old"),
+            display_status(PaneStatus::Busy, "same", true, None),
             PaneStatus::Busy
-        );
-        assert_eq!(
-            display_status(PaneStatus::Busy, "same", PaneStatus::Unread, "same"),
-            PaneStatus::Busy
-        );
-        assert_eq!(
-            display_status(PaneStatus::Idle, "new", PaneStatus::Unread, "old"),
-            PaneStatus::Unread
         );
     }
 
     #[test]
-    fn manual_read_holds_until_content_changes() {
+    fn read_hash_holds_until_content_changes() {
         assert_eq!(
-            display_status(PaneStatus::Unread, "same", PaneStatus::Idle, "same"),
+            display_status(PaneStatus::Unread, "same", false, Some("same")),
             PaneStatus::Idle
         );
         assert_eq!(
-            display_status(PaneStatus::Unread, "new", PaneStatus::Idle, "old"),
+            display_status(PaneStatus::Unread, "new", false, Some("old")),
             PaneStatus::Unread
         );
     }
@@ -588,9 +485,13 @@ mod tests {
     fn applies_user_state_as_display_layer() {
         let mut panes = vec![pane(PaneStatus::Unread, "same")];
         let mut state = UiState::default();
-        state
-            .panes
-            .insert("%1".to_string(), ui(PaneStatus::Idle, "same"));
+        state.panes.insert(
+            "%1".to_string(),
+            UiPaneState {
+                read_content_hash: Some("same".to_string()),
+                ..UiPaneState::default()
+            },
+        );
 
         apply_ui_state(&mut panes, &state);
 

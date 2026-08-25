@@ -12,8 +12,9 @@ use fs2::FileExt;
 use crate::agent::git::{enrich_panes, enrich_panes_fast};
 use crate::agent::ipc::{Request, Response, socket_path};
 use crate::agent::persist::{
-    Snapshot, cache_panes, load_snapshot, load_ui_state, panes_from_snapshot, state_dir,
-    ui_pane_state_is_empty, update_ui_state_if_changed, write_heartbeat, write_snapshot_if_changed,
+    Snapshot, UiPaneState, cache_panes, load_snapshot, load_ui_state, panes_from_snapshot,
+    state_dir, ui_pane_state_is_empty, update_ui_state_if_changed, write_heartbeat,
+    write_snapshot_if_changed,
 };
 use crate::agent::{Pane, Reconciler, list_panes_fast};
 
@@ -197,16 +198,42 @@ fn publish_snapshot(
 }
 
 fn prune_ui_state(panes: &[Pane]) -> Result<()> {
-    let alive: std::collections::HashMap<String, bool> = panes
+    let pane_state: std::collections::HashMap<&str, (&str, bool)> = panes
         .iter()
-        .flat_map(|p| [(p.pane_id.clone(), true), (p.target.clone(), true)])
+        .flat_map(|p| {
+            [
+                (
+                    p.pane_id.as_str(),
+                    (p.content_hash.as_str(), p.window_active),
+                ),
+                (
+                    p.target.as_str(),
+                    (p.content_hash.as_str(), p.window_active),
+                ),
+            ]
+        })
         .collect();
     update_ui_state_if_changed(|state| {
+        for (id, ui) in &mut state.panes {
+            let Some((content_hash, focused)) = pane_state.get(id.as_str()) else {
+                continue;
+            };
+            update_pane_read_state(ui, content_hash, *focused);
+        }
         state
             .panes
-            .retain(|id, ui| alive.contains_key(id) && !ui_pane_state_is_empty(ui));
+            .retain(|id, ui| pane_state.contains_key(id.as_str()) && !ui_pane_state_is_empty(ui));
     })?;
     Ok(())
+}
+
+fn update_pane_read_state(ui: &mut UiPaneState, content_hash: &str, focused: bool) {
+    if focused {
+        ui.forced_unread = false;
+        ui.read_content_hash = None;
+    } else if ui.read_content_hash.as_deref() != Some(content_hash) {
+        ui.read_content_hash = None;
+    }
 }
 
 fn write_panes_snapshot(reconciler: &Reconciler, panes: &[Pane]) -> Result<(Snapshot, bool)> {
@@ -376,4 +403,34 @@ fn log_error(message: &str) {
 
 pub fn lock_path() -> PathBuf {
     state_dir().join("watch.lock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focusing_a_pane_marks_forced_unread_state_read() {
+        let mut ui = UiPaneState {
+            forced_unread: true,
+            ..UiPaneState::default()
+        };
+
+        update_pane_read_state(&mut ui, "current", true);
+
+        assert!(!ui.forced_unread);
+        assert_eq!(ui.read_content_hash, None);
+    }
+
+    #[test]
+    fn new_content_invalidates_a_read_hash() {
+        let mut ui = UiPaneState {
+            read_content_hash: Some("old".to_string()),
+            ..UiPaneState::default()
+        };
+
+        update_pane_read_state(&mut ui, "new", false);
+
+        assert_eq!(ui.read_content_hash, None);
+    }
 }

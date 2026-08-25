@@ -6,12 +6,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use regex::Regex;
 use sha2::{Digest, Sha256};
-use smelt_ansi::parse_ansi_lines;
 
 use crate::agent::Pane;
-use crate::agent::adapter::apply_provider_statuses;
+use crate::agent::adapter::apply_provider_activity;
 use crate::agent::git::enrich_panes;
 use crate::agent::provider::{ProcessTable, parse_process_table, resolve};
 
@@ -51,7 +49,7 @@ pub fn list_panes_fast() -> Result<Vec<Pane>> {
     let _g = smelt_perf::perf::begin("agent.list_panes_fast");
     let mut panes = fetch_panes()?;
     capture_content(&mut panes);
-    apply_provider_statuses(&mut panes);
+    apply_provider_activity(&mut panes);
     Ok(panes)
 }
 
@@ -181,15 +179,13 @@ fn capture_content(panes: &mut [Pane]) {
     thread::scope(|scope| {
         for pane in panes {
             scope.spawn(move || {
-                let (hash, attention) = capture_pane_content(&pane.target);
-                pane.content_hash = hash;
-                pane.heuristic_attention = attention;
+                pane.content_hash = capture_pane_content(&pane.target);
             });
         }
     });
 }
 
-fn capture_pane_content(target: &str) -> (String, bool) {
+fn capture_pane_content(target: &str) -> String {
     let _g = smelt_perf::perf::begin("tmux.capture_pane_content");
     let Ok(out) = Command::new("tmux")
         .arg("capture-pane")
@@ -201,25 +197,11 @@ fn capture_pane_content(target: &str) -> (String, bool) {
         .arg("-10")
         .output()
     else {
-        return (String::new(), false);
+        return String::new();
     };
     let content = trim_trailing_newlines(out.stdout);
     smelt_perf::perf::record_value("tmux.capture_bytes", content.len() as u64);
-    pane_content_state(&content)
-}
-
-fn pane_content_state(content: &[u8]) -> (String, bool) {
-    let text = plain_text(content);
-    let attention = attention_re().is_match(&text);
-    (short_hash(content), attention)
-}
-
-fn plain_text(content: &[u8]) -> String {
-    parse_ansi_lines(&String::from_utf8_lossy(content))
-        .into_iter()
-        .map(|line| line.into_iter().map(|span| span.text).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n")
+    short_hash(&content)
 }
 
 fn trim_trailing_newlines(mut data: Vec<u8>) -> Vec<u8> {
@@ -232,11 +214,6 @@ fn trim_trailing_newlines(mut data: Vec<u8>) -> Vec<u8> {
 fn short_hash(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn attention_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"Do you want to proceed\?|Do you want to allow|Allow once|press Enter to approve|Enter to select|Type something|Esc to cancel|I'll wait for your|waiting for your response|Let me know when|Please let me know|What would you like|How would you like|Should I proceed|Would you like me to|please provide|please specify|I need more information|Could you clarify|awaiting your|ready when you are|let me know if you'd like|Feel free to ask|Is there anything else|What else can I help|Want me to|Shall I|Do you want me to|Ready to proceed").expect("valid attention regex"))
 }
 
 pub fn capture_pane(target: &str, lines: usize) -> Result<String> {
@@ -373,35 +350,20 @@ pub fn parse_target(s: &str) -> (String, String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::pane_content_state;
+    use super::short_hash;
 
     #[test]
     fn ansi_only_change_produces_activity_hash_change() {
         let red = b"\x1b[31mWorking\x1b[0m";
         let blue = b"\x1b[34mWorking\x1b[0m";
 
-        let (red_hash, _) = pane_content_state(red);
-        let (blue_hash, _) = pane_content_state(blue);
-
-        assert_ne!(red_hash, blue_hash);
-    }
-
-    #[test]
-    fn ansi_sequences_do_not_break_attention_detection() {
-        let content = b"Do you \x1b[38;2;255;0;0mwant to\x1b[0m proceed?";
-
-        let (_, attention) = pane_content_state(content);
-
-        assert!(attention);
+        assert_ne!(short_hash(red), short_hash(blue));
     }
 
     #[test]
     fn stable_ansi_content_produces_stable_hash() {
         let content = b"\x1b[32mCompleted\x1b[0m";
 
-        let (first, _) = pane_content_state(content);
-        let (second, _) = pane_content_state(content);
-
-        assert_eq!(first, second);
+        assert_eq!(short_hash(content), short_hash(content));
     }
 }

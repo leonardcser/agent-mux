@@ -20,7 +20,6 @@ pub enum PaneStatus {
     #[default]
     Idle = 0,
     Busy = 1,
-    NeedsAttention = 2,
     Unread = 3,
 }
 
@@ -28,7 +27,6 @@ impl PaneStatus {
     pub fn from_i32(value: i32) -> Self {
         match value {
             1 => Self::Busy,
-            2 => Self::NeedsAttention,
             3 => Self::Unread,
             _ => Self::Idle,
         }
@@ -59,9 +57,8 @@ pub struct Pane {
     pub pid: i32,
     pub provider_pid: i32,
     pub status: PaneStatus,
-    pub observed_status: Option<PaneStatus>,
+    pub observed_busy: Option<bool>,
     pub content_hash: String,
-    pub heuristic_attention: bool,
     pub window_active: bool,
     pub width: u16,
     pub height: u16,

@@ -3,13 +3,13 @@ mod smelt;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::agent::{Pane, PaneStatus};
+use crate::agent::Pane;
 
 use self::default::DEFAULT_ADAPTER;
 use self::smelt::SMELT_ADAPTER;
 
 trait ProviderAdapter: Sync {
-    fn observed_statuses(&self, _panes: &[Pane]) -> HashMap<u32, PaneStatus> {
+    fn observed_activity(&self, _panes: &[Pane]) -> HashMap<u32, bool> {
         HashMap::new()
     }
 }
@@ -22,17 +22,17 @@ fn adapter_for(provider: &str) -> &'static dyn ProviderAdapter {
     }
 }
 
-pub fn apply_provider_statuses(panes: &mut [Pane]) {
+pub fn apply_provider_activity(panes: &mut [Pane]) {
     let providers: HashSet<String> = panes.iter().map(|pane| pane.provider.clone()).collect();
 
     for provider in providers {
-        let statuses = adapter_for(&provider).observed_statuses(panes);
+        let activity = adapter_for(&provider).observed_activity(panes);
         for pane in panes.iter_mut().filter(|pane| pane.provider == provider) {
             if pane.provider_pid <= 0 {
                 continue;
             }
-            if let Some(status) = statuses.get(&(pane.provider_pid as u32)) {
-                pane.observed_status = Some(*status);
+            if let Some(busy) = activity.get(&(pane.provider_pid as u32)) {
+                pane.observed_busy = Some(*busy);
             }
         }
     }

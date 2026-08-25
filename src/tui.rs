@@ -17,9 +17,10 @@ use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface, Terminal
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::ipc;
+#[cfg(not(test))]
+use crate::agent::persist::{LastPosition, ui_pane_state_is_empty, update_ui_state};
 use crate::agent::persist::{
-    LastPosition, Snapshot, UiState, apply_ui_state, load_snapshot,
-    load_ui_state, panes_from_snapshot, ui_pane_state_is_empty, update_ui_state,
+    Snapshot, UiState, apply_ui_state, load_snapshot, load_ui_state, panes_from_snapshot,
 };
 use crate::agent::{Pane, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane};
 
@@ -376,6 +377,7 @@ enum SortMode {
 }
 
 impl SortMode {
+    #[cfg(not(test))]
     fn as_str(self) -> &'static str {
         match self {
             SortMode::Order => "order",
@@ -420,7 +422,7 @@ struct App {
     count: usize,
     err: Option<String>,
     ui_state: UiState,
-    pending_manual_statuses: HashMap<String, PaneStatus>,
+    pending_unread_changes: HashMap<String, bool>,
     pending_kills: HashMap<String, Pane>,
     hits: HitRegistry<Hit>,
     _tmux_session: String,
@@ -460,13 +462,13 @@ impl App {
             count: 0,
             err: snapshot.is_none().then(|| SYNCING_MSG.to_string()),
             ui_state,
-            pending_manual_statuses: HashMap::new(),
+            pending_unread_changes: HashMap::new(),
             pending_kills: HashMap::new(),
             hits: HitRegistry::new(),
             _tmux_session: tmux_session,
         };
         app.rebuild_items();
-        if let Some(att) = app.first_attention_pane() {
+        if let Some(att) = app.first_unread_pane() {
             app.cursor = att;
         } else if !app.ui_state.last_position.pane_id.is_empty()
             || !app.ui_state.last_position.pane_target.is_empty()
@@ -644,12 +646,11 @@ impl App {
             .position(|it| matches!(it, TreeItem::Pane(id) if id == pane_id))
     }
 
-    fn first_attention_pane(&self) -> Option<usize> {
+    fn first_unread_pane(&self) -> Option<usize> {
         self.items.iter().enumerate().find_map(|(i, it)| {
             let TreeItem::Pane(id) = it else { return None };
             let p = self.panes.get(id)?;
-            (!p.stashed && matches!(p.status, PaneStatus::NeedsAttention | PaneStatus::Unread))
-                .then_some(i)
+            (!p.stashed && p.status == PaneStatus::Unread).then_some(i)
         })
     }
 
@@ -661,7 +662,7 @@ impl App {
         let pane = self.current_pane()?.clone();
         let pane_id = pane.pane_id.clone();
         let target = pane.target.clone();
-        self.pending_manual_statuses.remove(&pane_id);
+        self.pending_unread_changes.remove(&pane_id);
         self.pending_kills.insert(pane_id.clone(), pane);
         self.panes.remove(&pane_id);
         self.rebuild_items();
@@ -802,17 +803,20 @@ impl App {
             KeyCode::Char(' ') => {
                 let mut changed = None;
                 if let Some(p) = self.current_pane_mut() {
-                    match p.status {
-                        PaneStatus::Idle => p.status = PaneStatus::Unread,
-                        PaneStatus::NeedsAttention | PaneStatus::Unread => {
-                            p.status = PaneStatus::Idle
-                        }
+                    let unread = match p.status {
+                        PaneStatus::Idle => true,
+                        PaneStatus::Unread => false,
                         PaneStatus::Busy => return Action::None,
-                    }
-                    changed = Some((p.pane_id.clone(), p.status));
+                    };
+                    p.status = if unread {
+                        PaneStatus::Unread
+                    } else {
+                        PaneStatus::Idle
+                    };
+                    changed = Some((p.pane_id.clone(), unread));
                 }
-                if let Some((id, status)) = changed {
-                    self.pending_manual_statuses.insert(id, status);
+                if let Some((id, unread)) = changed {
+                    self.pending_unread_changes.insert(id, unread);
                     self.save_state();
                 }
                 Action::Redraw
@@ -820,7 +824,7 @@ impl App {
             KeyCode::Char('a') => {
                 let mut changed = Vec::new();
                 for p in self.panes.values_mut() {
-                    if matches!(p.status, PaneStatus::NeedsAttention | PaneStatus::Unread) {
+                    if p.status == PaneStatus::Unread {
                         p.status = PaneStatus::Idle;
                         changed.push(p.pane_id.clone());
                     }
@@ -829,7 +833,7 @@ impl App {
                     return Action::None;
                 }
                 for id in changed {
-                    self.pending_manual_statuses.insert(id, PaneStatus::Idle);
+                    self.pending_unread_changes.insert(id, false);
                 }
                 self.save_state();
                 Action::Redraw
@@ -926,11 +930,10 @@ impl App {
         if let Some(p) = self.current_pane() {
             let pane_id = p.pane_id.clone();
             let target = p.target.clone();
-            // Opening a pane reads it, even if it was force-marked unread —
+            // Opening a pane reads it, even if it was force-marked unread,
             // consistent with Space/`a`, which clear a manual Unread too.
             if p.status == PaneStatus::Unread {
-                self.pending_manual_statuses
-                    .insert(pane_id, PaneStatus::Idle);
+                self.pending_unread_changes.insert(pane_id, false);
             }
             let _ = switch_to_pane(&target);
         }
@@ -954,13 +957,11 @@ impl App {
                     None => {}
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if self.dragging {
-                    self.sidebar_width = mouse
-                        .column
-                        .clamp(MIN_SIDEBAR, self.width.saturating_sub(MIN_PREVIEW));
-                    return Action::Redraw;
-                }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                self.sidebar_width = mouse
+                    .column
+                    .clamp(MIN_SIDEBAR, self.width.saturating_sub(MIN_PREVIEW));
+                return Action::Redraw;
             }
             MouseEventKind::Up(MouseButton::Left) if self.dragging => {
                 self.dragging = false;
@@ -972,10 +973,11 @@ impl App {
         Action::None
     }
 
+    #[cfg(not(test))]
     fn save_state(&mut self) {
         let mut cursor = self.cursor;
         let mut scroll_start = self.scroll_start;
-        if let Some(att) = self.first_attention_pane() {
+        if let Some(att) = self.first_unread_pane() {
             cursor = att;
             scroll_start = 0;
         }
@@ -1000,7 +1002,7 @@ impl App {
             .keys()
             .filter_map(|id| self.panes.get(id).cloned())
             .collect();
-        let pending = self.pending_manual_statuses.clone();
+        let pending = self.pending_unread_changes.clone();
         let sidebar_width = self.sidebar_width;
         let sort_mode = self.sort_mode;
         if update_ui_state(|state| {
@@ -1015,9 +1017,9 @@ impl App {
             for p in &panes {
                 let entry = state.panes.entry(p.pane_id.clone()).or_default();
                 entry.stashed = p.stashed;
-                if let Some(status) = pending.get(&p.pane_id) {
-                    entry.manual_status = Some(status.as_i32());
-                    entry.manual_status_base_hash = p.content_hash.clone();
+                if let Some(unread) = pending.get(&p.pane_id) {
+                    entry.forced_unread = *unread;
+                    entry.read_content_hash = (!*unread).then(|| p.content_hash.clone());
                 }
             }
             state.panes.retain(|_, ui| !ui_pane_state_is_empty(ui));
@@ -1033,9 +1035,12 @@ impl App {
         .is_ok()
         {
             self.ui_state = load_ui_state();
-            self.pending_manual_statuses.clear();
+            self.pending_unread_changes.clear();
         }
     }
+
+    #[cfg(test)]
+    fn save_state(&mut self) {}
 }
 
 fn render<W: Write>(surface: &mut Surface, app: &mut App, out: &mut W) -> io::Result<()> {
@@ -1334,7 +1339,7 @@ fn render_pane_row(
                 g: 119,
                 b: 6,
             },
-            PaneStatus::NeedsAttention | PaneStatus::Unread => Color::Rgb {
+            PaneStatus::Unread => Color::Rgb {
                 r: 155,
                 g: 155,
                 b: 245,
@@ -1453,7 +1458,7 @@ fn render_help(slice: &mut GridSlice<'_>) {
         ("C-n/C-p", "move down/up"),
         ("[n]j/k", "move down/up n times"),
         ("enter", "switch to pane"),
-        ("space", "toggle attention"),
+        ("space", "toggle read/unread"),
         ("a", "mark all read"),
         ("s/u", "stash/unstash"),
         ("dd", "kill pane"),
@@ -1679,7 +1684,7 @@ mod tests {
             count: 0,
             err: None,
             ui_state: UiState::default(),
-            pending_manual_statuses: HashMap::new(),
+            pending_unread_changes: HashMap::new(),
             pending_kills: HashMap::new(),
             hits: HitRegistry::new(),
             _tmux_session: String::new(),
@@ -1751,19 +1756,35 @@ mod tests {
     }
 
     #[test]
-    fn mark_all_read_clears_attention_and_unread() {
+    fn mark_all_read_clears_unread_and_leaves_busy_untouched() {
         let (tx, _rx) = mpsc::channel();
-        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1), pane("c", 2)]);
+        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1)]);
         app.panes.get_mut("a").unwrap().status = PaneStatus::Unread;
-        app.panes.get_mut("b").unwrap().status = PaneStatus::NeedsAttention;
-        app.panes.get_mut("c").unwrap().status = PaneStatus::Busy;
+        app.panes.get_mut("b").unwrap().status = PaneStatus::Busy;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
 
-        // Unread/attention panes are cleared; busy panes are left untouched.
         assert_eq!(app.panes["a"].status, PaneStatus::Idle);
-        assert_eq!(app.panes["b"].status, PaneStatus::Idle);
-        assert_eq!(app.panes["c"].status, PaneStatus::Busy);
+        assert_eq!(app.panes["b"].status, PaneStatus::Busy);
+    }
+
+    #[test]
+    fn space_toggles_idle_and_unread_but_not_busy() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_panes(vec![pane("a", 0)]);
+        app.cursor = app.find_pane_by_id("a").unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        assert_eq!(app.panes["a"].status, PaneStatus::Unread);
+        assert_eq!(app.pending_unread_changes.get("a"), Some(&true));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        assert_eq!(app.panes["a"].status, PaneStatus::Idle);
+        assert_eq!(app.pending_unread_changes.get("a"), Some(&false));
+
+        app.panes.get_mut("a").unwrap().status = PaneStatus::Busy;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        assert_eq!(app.panes["a"].status, PaneStatus::Busy);
     }
 
     #[test]
@@ -1775,11 +1796,17 @@ mod tests {
         app.cursor = app.find_pane_by_id("a").unwrap();
 
         // C-n moves down like j.
-        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), &tx);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &tx,
+        );
         assert_eq!(cur(&app).as_deref(), Some("b"));
 
         // C-p moves up like k.
-        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &tx);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &tx,
+        );
         assert_eq!(cur(&app).as_deref(), Some("a"));
 
         // M-> jumps to the last session like G.

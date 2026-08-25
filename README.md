@@ -77,7 +77,7 @@ Or use the key binding: `prefix + j`
 | `[count]j` / `k` | Move N sessions      |
 | `gg` / `M-<`     | Go to first session  |
 | `G` / `M->`      | Go to last session   |
-| `space`          | Toggle attention     |
+| `space`          | Toggle read/unread   |
 | `a`              | Mark all read        |
 | `s` / `u`        | Stash/unstash        |
 | `enter`          | Switch to session    |
@@ -90,7 +90,11 @@ Or use the key binding: `prefix + j`
 
 The sidebar separator can also be dragged with the mouse.
 
+A session becomes unread when its agent finishes working while the session is not
+focused. Opening or focusing the session marks it read. Press `space` to toggle
+an idle session between read and unread, or `a` to mark every session read.
+
 Sessions are grouped by folder. Press `o` to switch between the default
-stable order and sorting by most recent change first — folders are ordered by
+stable order and sorting by most recent change first - folders are ordered by
 their most recently active session, and sessions within each folder likewise.
 The choice is remembered across restarts.
