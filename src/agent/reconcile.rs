@@ -61,7 +61,7 @@ impl Reconciler {
         let now = Utc::now();
         let mut alive = HashMap::new();
         for p in panes.iter_mut() {
-            let id = p.pane_id.clone();
+            let id = p.pane_id.to_string();
             alive.insert(id.clone(), true);
             let prev_status = self
                 .prev_statuses
@@ -140,7 +140,7 @@ impl Reconciler {
     }
 
     fn track_pane(&mut self, p: &Pane) {
-        let id = p.pane_id.clone();
+        let id = p.pane_id.to_string();
         if !p.content_hash.is_empty() {
             self.prev_content.insert(id.clone(), p.content_hash.clone());
         }
@@ -171,6 +171,7 @@ impl Reconciler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::PaneId;
 
     fn snapshot(status: PaneStatus, content_hash: &str, window_active: bool) -> Snapshot {
         Snapshot {
@@ -189,13 +190,12 @@ mod tests {
 
     fn pane(content_hash: &str, window_active: bool) -> Pane {
         Pane {
-            pane_id: "%1".to_string(),
             target: "s:1.1".to_string(),
             content_hash: content_hash.to_string(),
             window_active,
             width: 80,
             height: 24,
-            ..Pane::default()
+            ..Pane::new(PaneId::parse("%1").unwrap())
         }
     }
 

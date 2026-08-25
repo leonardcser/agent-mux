@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 
-use crate::agent::Pane;
 use crate::agent::adapter::apply_provider_activity;
 use crate::agent::git::enrich_panes;
 use crate::agent::provider::{ProcessTable, parse_process_table, resolve};
+use crate::agent::{Pane, PaneId};
 
 const PROCESS_TABLE_TTL: Duration = Duration::from_secs(1);
 
@@ -23,7 +23,7 @@ struct ProcessTableCache {
 
 #[derive(Debug, Clone)]
 struct RawPane {
-    pane_id: String,
+    pane_id: PaneId,
     target: String,
     session: String,
     window: String,
@@ -66,7 +66,6 @@ fn fetch_panes() -> Result<Vec<Pane>> {
         .into_iter()
         .enumerate()
         .map(|(order, r)| Pane {
-            pane_id: r.pane_id,
             target: r.target,
             session: r.session,
             window: r.window,
@@ -80,7 +79,7 @@ fn fetch_panes() -> Result<Vec<Pane>> {
             order,
             provider: r.cmd,
             provider_pid: r.provider_pid,
-            ..Pane::default()
+            ..Pane::new(r.pane_id)
         })
         .collect())
 }
@@ -122,7 +121,7 @@ fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
                 provider_pid: 0,
                 window_name: fields[4].to_string(),
                 window_focused: fields[5] == "111",
-                pane_id: fields[6].to_string(),
+                pane_id: PaneId::parse(fields[6])?,
                 width,
                 height,
                 session,
@@ -179,18 +178,18 @@ fn capture_content(panes: &mut [Pane]) {
     thread::scope(|scope| {
         for pane in panes {
             scope.spawn(move || {
-                pane.content_hash = capture_pane_content(&pane.target);
+                pane.content_hash = capture_pane_content(&pane.pane_id);
             });
         }
     });
 }
 
-fn capture_pane_content(target: &str) -> String {
+fn capture_pane_content(pane_id: &PaneId) -> String {
     let _g = smelt_perf::perf::begin("tmux.capture_pane_content");
     let Ok(out) = Command::new("tmux")
         .arg("capture-pane")
         .arg("-t")
-        .arg(target)
+        .arg(pane_id.as_str())
         .arg("-p")
         .arg("-e")
         .arg("-S")
@@ -216,46 +215,30 @@ fn short_hash(data: &[u8]) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn capture_pane(target: &str, lines: usize) -> Result<String> {
+pub fn capture_pane(pane_id: &PaneId, lines: usize) -> Result<String> {
     let _g = smelt_perf::perf::begin("tmux.capture_preview");
     let out = Command::new("tmux")
         .arg("capture-pane")
         .arg("-t")
-        .arg(target)
+        .arg(pane_id.as_str())
         .arg("-e")
         .arg("-p")
         .arg("-S")
         .arg(format!("-{lines}"))
         .output()
-        .with_context(|| format!("capture-pane {target}"))?;
+        .with_context(|| format!("capture-pane {pane_id}"))?;
     if !out.status.success() {
-        return Err(anyhow!("capture-pane {target} exited with {}", out.status));
+        return Err(anyhow!("capture-pane {pane_id} exited with {}", out.status));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub fn switch_to_pane(target: &str) -> Result<()> {
-    let (session, window, _) = parse_target(target);
-    let session_window = format!("{session}:{window}");
-    run_tmux(["switch-client", "-t", &session_window])?;
-    run_tmux(["select-pane", "-t", target])
+pub fn switch_to_pane(pane_id: &PaneId) -> Result<()> {
+    run_tmux(["switch-client", "-t", pane_id.as_str()])
 }
 
-pub fn kill_pane(target: &str) -> Result<()> {
-    let (session, window, _) = parse_target(target);
-    let session_window = format!("{session}:{window}");
-    let out = Command::new("tmux")
-        .arg("list-panes")
-        .arg("-t")
-        .arg(&session_window)
-        .output()
-        .context("list-panes")?;
-    let pane_count = String::from_utf8_lossy(&out.stdout).trim().lines().count();
-    if pane_count <= 1 {
-        run_tmux(["kill-window", "-t", &session_window])
-    } else {
-        run_tmux(["kill-pane", "-t", target])
-    }
+pub fn kill_pane(pane_id: &PaneId) -> Result<()> {
+    run_tmux(["kill-pane", "-t", pane_id.as_str()])
 }
 
 fn run_tmux<const N: usize>(args: [&str; N]) -> Result<()> {

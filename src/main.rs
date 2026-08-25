@@ -52,7 +52,7 @@ fn run_bench(args: &[String]) -> Result<()> {
         smelt_perf::perf::record_value("bench.panes", panes.len() as u64);
         if let Some(pane) = panes.first() {
             let _g = smelt_perf::perf::begin("bench.preview_capture");
-            let content = agent::capture_pane(&pane.target, 50)?;
+            let content = agent::capture_pane(&pane.pane_id, 50)?;
             smelt_perf::perf::record_value("bench.preview_bytes", content.len() as u64);
         }
     }

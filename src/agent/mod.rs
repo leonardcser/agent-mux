@@ -13,7 +13,30 @@ pub use tmux::{
     switch_to_pane,
 };
 
+use std::fmt;
+
 use chrono::{DateTime, Utc};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PaneId(String);
+
+impl PaneId {
+    pub fn parse(value: &str) -> Option<Self> {
+        let id = value.strip_prefix('%')?;
+        (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PaneId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneStatus {
@@ -37,9 +60,9 @@ impl PaneStatus {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Pane {
-    pub pane_id: String,
+    pub pane_id: PaneId,
     pub target: String,
     pub session: String,
     pub window: String,
@@ -66,4 +89,51 @@ pub struct Pane {
     pub stashed: bool,
     pub order: usize,
     pub provider: String,
+}
+
+impl Pane {
+    pub fn new(pane_id: PaneId) -> Self {
+        Self {
+            pane_id,
+            target: String::new(),
+            session: String::new(),
+            window: String::new(),
+            window_name: String::new(),
+            pane: String::new(),
+            path: String::new(),
+            short_path: String::new(),
+            project_root: String::new(),
+            project_short: String::new(),
+            project_branch: String::new(),
+            project_dirty: false,
+            git_branch: String::new(),
+            git_dirty: false,
+            pid: 0,
+            provider_pid: 0,
+            status: PaneStatus::default(),
+            observed_busy: None,
+            content_hash: String::new(),
+            window_active: false,
+            width: 0,
+            height: 0,
+            last_active: None,
+            stashed: false,
+            order: 0,
+            provider: String::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PaneId;
+
+    #[test]
+    fn pane_id_only_accepts_stable_tmux_ids() {
+        assert_eq!(PaneId::parse("%42").unwrap().as_str(), "%42");
+        assert!(PaneId::parse("session:1.1").is_none());
+        assert!(PaneId::parse("%agent").is_none());
+        assert!(PaneId::parse("%").is_none());
+        assert!(PaneId::parse("").is_none());
+    }
 }

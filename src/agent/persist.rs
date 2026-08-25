@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::agent::{Pane, PaneStatus, tmux::parse_target};
+use crate::agent::{Pane, PaneId, PaneStatus, tmux::parse_target};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CachedPane {
@@ -182,7 +182,7 @@ pub fn apply_ui_state(panes: &mut [Pane], ui_state: &UiState) {
     for pane in panes {
         if let Some(ui) = ui_state
             .panes
-            .get(&pane.pane_id)
+            .get(pane.pane_id.as_str())
             .or_else(|| ui_state.panes.get(&pane.target))
         {
             apply_pane_ui_state(pane, ui);
@@ -350,7 +350,7 @@ pub fn cache_panes(panes: &[Pane]) -> Vec<CachedPane> {
     panes
         .iter()
         .map(|p| CachedPane {
-            pane_id: p.pane_id.clone(),
+            pane_id: p.pane_id.to_string(),
             target: p.target.clone(),
             window_name: p.window_name.clone(),
             path: p.path.clone(),
@@ -377,15 +377,10 @@ pub fn panes_from_snapshot(snapshot: &Snapshot) -> Vec<Pane> {
 fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
     panes
         .iter()
-        .map(|cp| {
-            let id = if cp.pane_id.is_empty() {
-                cp.target.clone()
-            } else {
-                cp.pane_id.clone()
-            };
+        .filter_map(|cp| {
+            let pane_id = PaneId::parse(&cp.pane_id)?;
             let (session, window, pane) = parse_target(&cp.target);
-            Pane {
-                pane_id: id,
+            Some(Pane {
                 target: cp.target.clone(),
                 session,
                 window,
@@ -405,8 +400,8 @@ fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
                 content_hash: cp.content_hash.clone(),
                 status: cp.last_status.map(PaneStatus::from_i32).unwrap_or_default(),
                 last_active: cp.last_active,
-                ..Pane::default()
-            }
+                ..Pane::new(pane_id)
+            })
         })
         .collect()
 }
@@ -444,17 +439,28 @@ pub fn heartbeat_write_lock_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{UiPaneState, UiState, apply_ui_state, display_status};
-    use crate::agent::{Pane, PaneStatus};
+    use super::{
+        CachedPane, UiPaneState, UiState, apply_ui_state, display_status, panes_from_cached,
+    };
+    use crate::agent::{Pane, PaneId, PaneStatus};
 
     fn pane(status: PaneStatus, content_hash: &str) -> Pane {
         Pane {
-            pane_id: "%1".to_string(),
             target: "s:1.1".to_string(),
             status,
             content_hash: content_hash.to_string(),
-            ..Pane::default()
+            ..Pane::new(PaneId::parse("%1").unwrap())
         }
+    }
+
+    #[test]
+    fn panes_without_stable_tmux_ids_are_not_actionable() {
+        let panes = panes_from_cached(&[CachedPane {
+            target: "session:1.1".to_string(),
+            ..CachedPane::default()
+        }]);
+
+        assert!(panes.is_empty());
     }
 
     #[test]

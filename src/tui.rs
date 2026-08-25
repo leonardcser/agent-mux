@@ -22,7 +22,9 @@ use crate::agent::persist::{LastPosition, ui_pane_state_is_empty, update_ui_stat
 use crate::agent::persist::{
     Snapshot, UiState, apply_ui_state, load_snapshot, load_ui_state, panes_from_snapshot,
 };
-use crate::agent::{Pane, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane};
+use crate::agent::{
+    Pane, PaneId, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane,
+};
 
 const SIDEBAR: PaintId = PaintId(1);
 const SEPARATOR: PaintId = PaintId(2);
@@ -322,26 +324,24 @@ fn spawn_load_panes(tx: &mpsc::Sender<Msg>) {
 
 fn load_preview(app: &mut App) {
     let Some(p) = app.current_pane() else { return };
-    let target = p.target.clone();
     let pane_id = p.pane_id.clone();
     let lines = app.height.max(50) as usize;
-    let content = capture_pane(&target, lines).unwrap_or_else(|err| format!("error: {err}"));
-    app.preview_for = pane_id;
+    let content = capture_pane(&pane_id, lines).unwrap_or_else(|err| format!("error: {err}"));
+    app.preview_for = pane_id.to_string();
     app.preview_applied_gen = app.preview_gen;
     app.preview_lines = parse_ansi_lines(content.trim_end_matches('\n'));
 }
 
 fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) {
     let Some(p) = app.current_pane() else { return };
-    let target = p.target.clone();
     let pane_id = p.pane_id.clone();
     let lines = app.height.max(50) as usize;
     let preview_seq = app.preview_gen;
     let tx = tx.clone();
     thread::spawn(move || {
-        let content = capture_pane(&target, lines).unwrap_or_else(|err| format!("error: {err}"));
+        let content = capture_pane(&pane_id, lines).unwrap_or_else(|err| format!("error: {err}"));
         let _ = tx.send(Msg::PreviewLoaded {
-            pane_id,
+            pane_id: pane_id.to_string(),
             content,
             preview_seq,
         });
@@ -441,7 +441,10 @@ impl App {
             .unwrap_or_default();
         apply_ui_state(&mut panes, &ui_state);
         let mut app = Self {
-            panes: panes.into_iter().map(|p| (p.pane_id.clone(), p)).collect(),
+            panes: panes
+                .into_iter()
+                .map(|p| (p.pane_id.to_string(), p))
+                .collect(),
             items: Vec::new(),
             cursor: 0,
             scroll_start: 0,
@@ -500,8 +503,11 @@ impl App {
     }
 
     fn replace_panes(&mut self, panes: Vec<Pane>) {
-        let selected = self.current_pane().map(|p| p.pane_id.clone());
-        self.panes = panes.into_iter().map(|p| (p.pane_id.clone(), p)).collect();
+        let selected = self.current_pane().map(|p| p.pane_id.to_string());
+        self.panes = panes
+            .into_iter()
+            .map(|p| (p.pane_id.to_string(), p))
+            .collect();
         self.rebuild_items();
         self.cursor = selected
             .and_then(|id| self.find_pane_by_id(&id))
@@ -562,14 +568,14 @@ impl App {
                     let group = &mut groups[idx];
                     if p.order < group.sort_order {
                         group.sort_order = p.order;
-                        group.header_id = p.pane_id.clone();
+                        group.header_id = p.pane_id.to_string();
                     }
                     group.panes.push(p);
                 } else {
                     group_index.insert(key.clone(), groups.len());
                     groups.push(Group {
                         key,
-                        header_id: p.pane_id.clone(),
+                        header_id: p.pane_id.to_string(),
                         sort_order: p.order,
                         panes: vec![p],
                     });
@@ -618,7 +624,7 @@ impl App {
                     group
                         .panes
                         .into_iter()
-                        .map(|p| TreeItem::Pane(p.pane_id.clone())),
+                        .map(|p| TreeItem::Pane(p.pane_id.to_string())),
                 );
             }
         }
@@ -658,21 +664,21 @@ impl App {
         self.snapshot_generation > 0 || !self.panes.is_empty() || !self.pending_kills.is_empty()
     }
 
-    fn remove_current_pane(&mut self) -> Option<(String, String)> {
+    fn remove_current_pane(&mut self) -> Option<PaneId> {
         let pane = self.current_pane()?.clone();
         let pane_id = pane.pane_id.clone();
-        let target = pane.target.clone();
-        self.pending_unread_changes.remove(&pane_id);
-        self.pending_kills.insert(pane_id.clone(), pane);
-        self.panes.remove(&pane_id);
+        let pane_key = pane_id.to_string();
+        self.pending_unread_changes.remove(&pane_key);
+        self.pending_kills.insert(pane_key.clone(), pane);
+        self.panes.remove(&pane_key);
         self.rebuild_items();
         self.cursor = nearest_pane(&self.items, self.cursor);
-        if self.preview_for == pane_id {
+        if self.preview_for == pane_key {
             self.preview_for.clear();
             self.preview_lines.clear();
         }
         self.preview_gen += 1;
-        Some((pane_id, target))
+        Some(pane_id)
     }
 
     fn restore_pending_kill(&mut self, pane_id: &str) {
@@ -690,10 +696,10 @@ impl App {
     fn hide_pending_kills(&mut self, panes: &mut Vec<Pane>) {
         let alive: HashMap<String, bool> = panes
             .iter()
-            .map(|pane| (pane.pane_id.clone(), true))
+            .map(|pane| (pane.pane_id.to_string(), true))
             .collect();
         self.pending_kills.retain(|id, _| alive.contains_key(id));
-        panes.retain(|pane| !self.pending_kills.contains_key(&pane.pane_id));
+        panes.retain(|pane| !self.pending_kills.contains_key(pane.pane_id.as_str()));
     }
 
     fn toggle_current_stash(&mut self) -> Option<bool> {
@@ -701,7 +707,7 @@ impl App {
         let (pane_id, stashed) = {
             let pane = self.current_pane_mut()?;
             pane.stashed = !pane.stashed;
-            (pane.pane_id.clone(), pane.stashed)
+            (pane.pane_id.to_string(), pane.stashed)
         };
 
         self.rebuild_items();
@@ -762,11 +768,14 @@ impl App {
             if self.pending_d {
                 self.pending_d = false;
                 self.pending_g = false;
-                if let Some((pane_id, target)) = self.remove_current_pane() {
+                if let Some(pane_id) = self.remove_current_pane() {
                     let tx = tx.clone();
                     thread::spawn(move || {
-                        let err = kill_pane(&target).err().map(|e| e.to_string());
-                        let _ = tx.send(Msg::PaneKilled { pane_id, err });
+                        let err = kill_pane(&pane_id).err().map(|e| e.to_string());
+                        let _ = tx.send(Msg::PaneKilled {
+                            pane_id: pane_id.to_string(),
+                            err,
+                        });
                     });
                     return Action::Preview;
                 }
@@ -813,7 +822,7 @@ impl App {
                     } else {
                         PaneStatus::Idle
                     };
-                    changed = Some((p.pane_id.clone(), unread));
+                    changed = Some((p.pane_id.to_string(), unread));
                 }
                 if let Some((id, unread)) = changed {
                     self.pending_unread_changes.insert(id, unread);
@@ -826,7 +835,7 @@ impl App {
                 for p in self.panes.values_mut() {
                     if p.status == PaneStatus::Unread {
                         p.status = PaneStatus::Idle;
-                        changed.push(p.pane_id.clone());
+                        changed.push(p.pane_id.to_string());
                     }
                 }
                 if changed.is_empty() {
@@ -858,7 +867,7 @@ impl App {
                     && p.stashed
                 {
                     p.stashed = false;
-                    selected = Some(p.pane_id.clone());
+                    selected = Some(p.pane_id.to_string());
                 }
                 if let Some(id) = selected {
                     self.rebuild_items();
@@ -875,7 +884,7 @@ impl App {
                 Action::LoadPanes
             }
             KeyCode::Char('o') => {
-                let selected = self.current_pane().map(|p| p.pane_id.clone());
+                let selected = self.current_pane().map(|p| p.pane_id.to_string());
                 self.sort_mode = self.sort_mode.toggled();
                 self.rebuild_items();
                 self.cursor = selected
@@ -929,13 +938,13 @@ impl App {
     fn open_current_pane(&mut self) -> Action {
         if let Some(p) = self.current_pane() {
             let pane_id = p.pane_id.clone();
-            let target = p.target.clone();
             // Opening a pane reads it, even if it was force-marked unread,
             // consistent with Space/`a`, which clear a manual Unread too.
             if p.status == PaneStatus::Unread {
-                self.pending_unread_changes.insert(pane_id, false);
+                self.pending_unread_changes
+                    .insert(pane_id.to_string(), false);
             }
-            let _ = switch_to_pane(&target);
+            let _ = switch_to_pane(&pane_id);
         }
         self.save_state();
         Action::Quit
@@ -988,7 +997,7 @@ impl App {
                 TreeItem::Pane(id) => self.panes.get(id),
                 _ => None,
             })
-            .map(|p| (p.pane_id.clone(), p.target.clone()))
+            .map(|p| (p.pane_id.to_string(), p.target.clone()))
             .unwrap_or_default();
         let pane_ids: std::collections::HashMap<String, bool> = self
             .items
@@ -1007,17 +1016,17 @@ impl App {
         let sort_mode = self.sort_mode;
         if update_ui_state(|state| {
             for p in &panes {
-                if !state.panes.contains_key(&p.pane_id)
+                if !state.panes.contains_key(p.pane_id.as_str())
                     && let Some(ui) = state.panes.remove(&p.target)
                 {
-                    state.panes.insert(p.pane_id.clone(), ui);
+                    state.panes.insert(p.pane_id.to_string(), ui);
                 }
             }
             state.panes.retain(|id, _| pane_ids.contains_key(id));
             for p in &panes {
-                let entry = state.panes.entry(p.pane_id.clone()).or_default();
+                let entry = state.panes.entry(p.pane_id.to_string()).or_default();
                 entry.stashed = p.stashed;
-                if let Some(unread) = pending.get(&p.pane_id) {
+                if let Some(unread) = pending.get(p.pane_id.as_str()) {
                     entry.forced_unread = *unread;
                     entry.read_content_hash = (!*unread).then(|| p.content_hash.clone());
                 }
@@ -1650,11 +1659,10 @@ mod tests {
 
     fn pane(id: &str, order: usize) -> Pane {
         Pane {
-            pane_id: id.to_string(),
             target: format!("session:1.{order}"),
             path: "/workspace".to_string(),
             order,
-            ..Pane::default()
+            ..Pane::new(PaneId::parse(id).unwrap())
         }
     }
 
@@ -1662,7 +1670,7 @@ mod tests {
         let mut app = App {
             panes: panes
                 .into_iter()
-                .map(|pane| (pane.pane_id.clone(), pane))
+                .map(|pane| (pane.pane_id.to_string(), pane))
                 .collect(),
             items: Vec::new(),
             cursor: 0,
@@ -1694,9 +1702,22 @@ mod tests {
     }
 
     #[test]
+    fn removing_pane_returns_stable_tmux_id() {
+        let mut selected = pane("%42", 0);
+        selected.target = "session:9.1".to_string();
+        let mut app = app_with_panes(vec![selected]);
+        app.cursor = app.find_pane_by_id("%42").unwrap();
+
+        assert_eq!(
+            app.remove_current_pane().as_ref().map(PaneId::as_str),
+            Some("%42")
+        );
+    }
+
+    #[test]
     fn stashing_keeps_cursor_row_instead_of_following_pane() {
-        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1), pane("c", 2)]);
-        app.cursor = app.find_pane_by_id("b").unwrap();
+        let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1), pane("%3", 2)]);
+        app.cursor = app.find_pane_by_id("%2").unwrap();
         let previous_cursor = app.cursor;
 
         assert_eq!(app.toggle_current_stash(), Some(true));
@@ -1704,19 +1725,18 @@ mod tests {
         assert_eq!(app.cursor, previous_cursor);
         assert_eq!(
             app.current_pane().map(|pane| pane.pane_id.as_str()),
-            Some("c")
+            Some("%3")
         );
-        assert!(app.panes["b"].stashed);
+        assert!(app.panes["%2"].stashed);
     }
 
     fn pane_at(id: &str, order: usize, path: &str, last_active_secs: i64) -> Pane {
         Pane {
-            pane_id: id.to_string(),
             target: format!("session:1.{order}"),
             path: path.to_string(),
             order,
             last_active: chrono::DateTime::from_timestamp(last_active_secs, 0),
-            ..Pane::default()
+            ..Pane::new(PaneId::parse(id).unwrap())
         }
     }
 
@@ -1734,87 +1754,87 @@ mod tests {
     fn recent_sort_orders_folders_and_sessions_by_last_active() {
         let (tx, _rx) = mpsc::channel();
         let mut app = app_with_panes(vec![
-            pane_at("a1", 0, "/a", 100),
-            pane_at("a2", 1, "/a", 300),
-            pane_at("b1", 2, "/b", 500),
+            pane_at("%1", 0, "/a", 100),
+            pane_at("%2", 1, "/a", 300),
+            pane_at("%3", 2, "/b", 500),
         ]);
 
         // Default order: grouped by folder, in creation order.
         assert_eq!(app.sort_mode, SortMode::Order);
-        assert_eq!(pane_ids(&app), ["a1", "a2", "b1"]);
+        assert_eq!(pane_ids(&app), ["%1", "%2", "%3"]);
 
-        // Toggle to recent: folder /b (500) sorts ahead of /a (300); within /a
-        // the newer a2 (300) sorts ahead of a1 (100).
+        // Toggle to recent: folder /b (500) sorts ahead of /a (300), and the
+        // newer session within /a (300) sorts ahead of the older one (100).
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
         assert_eq!(app.sort_mode, SortMode::Recent);
-        assert_eq!(pane_ids(&app), ["b1", "a2", "a1"]);
+        assert_eq!(pane_ids(&app), ["%3", "%2", "%1"]);
 
         // Toggling again returns to the stable order.
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
         assert_eq!(app.sort_mode, SortMode::Order);
-        assert_eq!(pane_ids(&app), ["a1", "a2", "b1"]);
+        assert_eq!(pane_ids(&app), ["%1", "%2", "%3"]);
     }
 
     #[test]
     fn mark_all_read_clears_unread_and_leaves_busy_untouched() {
         let (tx, _rx) = mpsc::channel();
-        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1)]);
-        app.panes.get_mut("a").unwrap().status = PaneStatus::Unread;
-        app.panes.get_mut("b").unwrap().status = PaneStatus::Busy;
+        let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1)]);
+        app.panes.get_mut("%1").unwrap().status = PaneStatus::Unread;
+        app.panes.get_mut("%2").unwrap().status = PaneStatus::Busy;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
 
-        assert_eq!(app.panes["a"].status, PaneStatus::Idle);
-        assert_eq!(app.panes["b"].status, PaneStatus::Busy);
+        assert_eq!(app.panes["%1"].status, PaneStatus::Idle);
+        assert_eq!(app.panes["%2"].status, PaneStatus::Busy);
     }
 
     #[test]
     fn space_toggles_idle_and_unread_but_not_busy() {
         let (tx, _rx) = mpsc::channel();
-        let mut app = app_with_panes(vec![pane("a", 0)]);
-        app.cursor = app.find_pane_by_id("a").unwrap();
+        let mut app = app_with_panes(vec![pane("%1", 0)]);
+        app.cursor = app.find_pane_by_id("%1").unwrap();
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-        assert_eq!(app.panes["a"].status, PaneStatus::Unread);
-        assert_eq!(app.pending_unread_changes.get("a"), Some(&true));
+        assert_eq!(app.panes["%1"].status, PaneStatus::Unread);
+        assert_eq!(app.pending_unread_changes.get("%1"), Some(&true));
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-        assert_eq!(app.panes["a"].status, PaneStatus::Idle);
-        assert_eq!(app.pending_unread_changes.get("a"), Some(&false));
+        assert_eq!(app.panes["%1"].status, PaneStatus::Idle);
+        assert_eq!(app.pending_unread_changes.get("%1"), Some(&false));
 
-        app.panes.get_mut("a").unwrap().status = PaneStatus::Busy;
+        app.panes.get_mut("%1").unwrap().status = PaneStatus::Busy;
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-        assert_eq!(app.panes["a"].status, PaneStatus::Busy);
+        assert_eq!(app.panes["%1"].status, PaneStatus::Busy);
     }
 
     #[test]
     fn emacs_navigation_matches_vim_motions() {
         let (tx, _rx) = mpsc::channel();
-        let mut app = app_with_panes(vec![pane("a", 0), pane("b", 1), pane("c", 2)]);
-        let cur = |app: &App| app.current_pane().map(|p| p.pane_id.clone());
+        let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1), pane("%3", 2)]);
+        let cur = |app: &App| app.current_pane().map(|p| p.pane_id.to_string());
 
-        app.cursor = app.find_pane_by_id("a").unwrap();
+        app.cursor = app.find_pane_by_id("%1").unwrap();
 
         // C-n moves down like j.
         app.handle_key(
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
             &tx,
         );
-        assert_eq!(cur(&app).as_deref(), Some("b"));
+        assert_eq!(cur(&app).as_deref(), Some("%2"));
 
         // C-p moves up like k.
         app.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             &tx,
         );
-        assert_eq!(cur(&app).as_deref(), Some("a"));
+        assert_eq!(cur(&app).as_deref(), Some("%1"));
 
         // M-> jumps to the last session like G.
         app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::ALT), &tx);
-        assert_eq!(cur(&app).as_deref(), Some("c"));
+        assert_eq!(cur(&app).as_deref(), Some("%3"));
 
         // M-< jumps to the first session like gg.
         app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::ALT), &tx);
-        assert_eq!(cur(&app).as_deref(), Some("a"));
+        assert_eq!(cur(&app).as_deref(), Some("%1"));
     }
 }

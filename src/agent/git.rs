@@ -219,6 +219,7 @@ fn git_dirty(dir: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::PaneId;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -248,7 +249,7 @@ mod tests {
             path: worktree.to_string_lossy().to_string(),
             git_dirty: true,
             project_dirty: true,
-            ..Pane::default()
+            ..Pane::new(PaneId::parse("%1").unwrap())
         }];
 
         enrich_panes_fast(&mut panes);

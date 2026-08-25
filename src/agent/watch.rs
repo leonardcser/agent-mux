@@ -95,7 +95,7 @@ fn refresh_once_with(
     for p in &mut panes {
         if let Some(ui) = ui_state
             .panes
-            .get(&p.pane_id)
+            .get(p.pane_id.as_str())
             .or_else(|| ui_state.panes.get(&p.target))
         {
             p.stashed = ui.stashed;
@@ -257,7 +257,10 @@ fn apply_cached_metadata(panes: &mut [Pane], snapshot: &Snapshot) {
         .collect();
 
     for p in panes {
-        let Some(cached) = cached.get(&p.pane_id).or_else(|| cached.get(&p.target)) else {
+        let Some(cached) = cached
+            .get(p.pane_id.as_str())
+            .or_else(|| cached.get(&p.target))
+        else {
             continue;
         };
         if cached.path != p.path {
