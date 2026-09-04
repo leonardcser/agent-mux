@@ -2,6 +2,7 @@
 name = "agent-mux"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -15,4 +16,5 @@ sha2 = "0.11.0"
 smelt-ansi = "0.1.0"
 smelt-perf = "0.1.1"
 smelt-term = "0.3.0"
+sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 unicode-width = "0.2.2"

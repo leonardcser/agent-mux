@@ -2,8 +2,8 @@
 
 A TUI for multiplexing AI coding agent sessions in tmux.
 
-Lists all active agent panes (Claude Code, Open Code, Gemini CLI, Codex CLI, Kimi CLI)
-grouped by workspace, with a live preview panel showing each session's output.
+Lists all active agent panes (Smelt, Claude Code, Open Code, Gemini CLI, Codex CLI,
+Kimi CLI) grouped by workspace, with a live preview panel showing each session's output.
 Select a session and press enter to jump to it.
 
 <p align="center">
@@ -12,7 +12,7 @@ Select a session and press enter to jump to it.
 
 ## Requirements
 
-- Rust 1.85+
+- Rust 1.88+
 - tmux (must be run inside a tmux session)
 
 ## Setup

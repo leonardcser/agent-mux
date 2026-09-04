@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::adapter::apply_provider_activity;
 use crate::agent::git::enrich_panes;
-use crate::agent::provider::{ProcessTable, parse_process_table, resolve};
+use crate::agent::provider::{ProcessTable, resolve};
 use crate::agent::{Pane, PaneId};
 
 const PROCESS_TABLE_TTL: Duration = Duration::from_secs(1);
@@ -152,17 +152,12 @@ fn load_process_table() -> ProcessTable {
         && let Some(entry) = cache.as_ref()
         && entry.loaded_at.elapsed() < PROCESS_TABLE_TTL
     {
-        smelt_perf::perf::record_value("process.ps_cache_hit", 1);
+        smelt_perf::perf::record_value("process.snapshot_cache_hit", 1);
         return entry.table.clone();
     }
 
-    let _g = smelt_perf::perf::begin("process.ps");
-    let table = Command::new("ps")
-        .arg("-eo")
-        .arg("pid=,ppid=,command=")
-        .output()
-        .map(|out| parse_process_table(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_default();
+    let _g = smelt_perf::perf::begin("process.snapshot");
+    let table = ProcessTable::capture();
 
     if let Ok(mut cache) = cache.lock() {
         *cache = Some(ProcessTableCache {
