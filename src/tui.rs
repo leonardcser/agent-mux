@@ -10,11 +10,14 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use smelt_ansi::{AnsiSpan, parse_ansi_lines};
+use smelt_term::ansi::parse_ansi_lines;
 use smelt_term::geometry::Rect;
 use smelt_term::grid::{Color, GridSlice, Style};
-use smelt_term::{Constraint, HitRegistry, LayoutTree, PaintId, Surface, TerminalSession};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use smelt_term::{
+    Axis, DividerStyles, HitRegistry, LayoutStyle, LayoutTree, Line, NoopSizer, PaintId,
+    ResolvedLayout, Split, SplitInteraction, SplitOptions, SplitPane, SplitResizeMode, SplitSize,
+    Surface, TerminalSession,
+};
 
 use crate::agent::ipc;
 #[cfg(not(test))]
@@ -27,7 +30,6 @@ use crate::agent::{
 };
 
 const SIDEBAR: PaintId = PaintId(1);
-const SEPARATOR: PaintId = PaintId(2);
 const PREVIEW: PaintId = PaintId(3);
 const MIN_SIDEBAR: u16 = 20;
 const MIN_PREVIEW: u16 = 20;
@@ -35,7 +37,6 @@ const SYNCING_MSG: &str = "syncing agent-mux snapshot";
 
 #[derive(Clone, Debug)]
 enum Hit {
-    Separator,
     /// A clickable sidebar row, carrying its index into `items`.
     Row(usize),
 }
@@ -72,6 +73,7 @@ enum Msg {
 pub fn run(tmux_session: String) -> Result<()> {
     let mut term = TerminalSession::builder()
         .buffer_capacity(128 * 1024)
+        .focus_events(true)
         .enter_stdout()?;
     let (w, h) = term.size()?;
     let mut surface = Surface::new(w, h);
@@ -206,6 +208,7 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
         if event::poll(poll_for)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    dirty |= app.split_interaction.active_id().is_some();
                     match app.handle_key(key, &tx) {
                         Action::Quit => return Ok(()),
                         Action::Redraw => dirty = true,
@@ -232,6 +235,10 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                 Event::Resize(w, h) => {
                     surface.set_terminal_size(w, h);
                     app.resize(w, h);
+                    dirty = true;
+                }
+                Event::FocusLost => {
+                    app.cancel_resize();
                     dirty = true;
                 }
                 _ => {}
@@ -406,15 +413,15 @@ struct App {
     cursor: usize,
     scroll_start: usize,
     preview_for: String,
-    preview_lines: Vec<Vec<AnsiSpan>>,
+    preview_lines: Vec<Line<'static>>,
     preview_gen: u64,
     preview_applied_gen: u64,
     snapshot_generation: u64,
     project_win_width: HashMap<String, usize>,
     width: u16,
     height: u16,
-    sidebar_width: u16,
-    dragging: bool,
+    sidebar: Split,
+    split_interaction: SplitInteraction,
     show_help: bool,
     pending_d: bool,
     pending_g: bool,
@@ -426,6 +433,21 @@ struct App {
     pending_kills: HashMap<String, Pane>,
     hits: HitRegistry<Hit>,
     _tmux_session: String,
+}
+
+fn sidebar_split(width: u16) -> Split {
+    Split::new(
+        Axis::Horizontal,
+        SplitOptions {
+            size: SplitSize::Cells(width),
+            minimum: [MIN_SIDEBAR, MIN_PREVIEW],
+            resize_mode: SplitResizeMode::Cells,
+            styles: Some(DividerStyles {
+                normal: Style::new().fg(Color::DarkGrey),
+                active: Style::new().fg(Color::Grey),
+            }),
+        },
+    )
 }
 
 impl App {
@@ -456,8 +478,8 @@ impl App {
             project_win_width: HashMap::new(),
             width: 0,
             height: 0,
-            sidebar_width: ui_state.sidebar_width,
-            dragging: false,
+            sidebar: sidebar_split(ui_state.sidebar_width),
+            split_interaction: SplitInteraction::default(),
             show_help: false,
             pending_d: false,
             pending_g: false,
@@ -494,12 +516,31 @@ impl App {
     fn resize(&mut self, width: u16, height: u16) {
         self.width = width;
         self.height = height;
-        if self.sidebar_width == 0 {
-            self.sidebar_width = (width / 4).max(MIN_SIDEBAR);
+        if self.sidebar.preferred_size() == SplitSize::Cells(0) {
+            self.sidebar
+                .set_preferred_size(SplitSize::Cells((width / 4).max(MIN_SIDEBAR)));
         }
-        self.sidebar_width = self
-            .sidebar_width
-            .clamp(MIN_SIDEBAR, width.saturating_sub(MIN_PREVIEW));
+    }
+
+    fn layout(&self) -> LayoutTree {
+        LayoutTree::split(
+            self.sidebar.clone(),
+            LayoutTree::leaf(SIDEBAR),
+            LayoutTree::leaf(PREVIEW),
+        )
+    }
+
+    fn resolved_layout(&self) -> ResolvedLayout {
+        self.layout()
+            .resolve(Rect::new(0, 0, self.width, self.height), &NoopSizer)
+    }
+
+    fn sidebar_width(&self) -> u16 {
+        let layout = self.resolved_layout();
+        let available = layout
+            .split(self.sidebar.id())
+            .map_or(0, |split| split.geometry.available);
+        self.sidebar.preferred_size().resolve(available)
     }
 
     fn replace_panes(&mut self, panes: Vec<Pane>) {
@@ -721,6 +762,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, tx: &mpsc::Sender<Msg>) -> Action {
+        self.cancel_resize();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         // Emacs navigation: alias C-n/C-p to down/up so they flow through the
@@ -894,17 +936,18 @@ impl App {
                 self.save_state();
                 Action::Preview
             }
-            KeyCode::Char('H') => {
-                self.sidebar_width = self
-                    .sidebar_width
-                    .saturating_sub((2 * count) as u16)
-                    .max(MIN_SIDEBAR);
-                self.resize(self.width, self.height);
-                Action::Redraw
-            }
-            KeyCode::Char('L') => {
-                self.sidebar_width = self.sidebar_width.saturating_add((2 * count) as u16);
-                self.resize(self.width, self.height);
+            KeyCode::Char('H' | 'L') => {
+                let delta = i32::try_from(count).unwrap_or(i32::MAX).saturating_mul(2);
+                let delta = if key.code == KeyCode::Char('H') {
+                    -delta
+                } else {
+                    delta
+                };
+                if let Some(split) = self.resolved_layout().split(self.sidebar.id())
+                    && split.resize(SplitPane::First, delta)
+                {
+                    self.save_state();
+                }
                 Action::Redraw
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -951,35 +994,47 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                match self.hits.hit(mouse.row, mouse.column).cloned() {
-                    Some(Hit::Separator) => {
-                        self.dragging = true;
-                        return Action::Redraw;
-                    }
-                    // Clicking a row selects it and opens it, like pressing Enter.
-                    Some(Hit::Row(idx)) => {
-                        self.cursor = idx;
-                        return self.open_current_pane();
-                    }
-                    None => {}
-                }
+        let layout = self.resolved_layout();
+        let active = self
+            .split_interaction
+            .active_id()
+            .and_then(|id| layout.split(id));
+        let response = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => layout
+                .divider_at(mouse.row, mouse.column)
+                .and_then(|split| self.split_interaction.begin(split, mouse.row, mouse.column)),
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.split_interaction
+                    .update(active, mouse.row, mouse.column)
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
-                self.sidebar_width = mouse
-                    .column
-                    .clamp(MIN_SIDEBAR, self.width.saturating_sub(MIN_PREVIEW));
-                return Action::Redraw;
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.split_interaction
+                    .release(active, mouse.row, mouse.column)
             }
-            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
-                self.dragging = false;
+            _ => None,
+        };
+        if let Some(response) = response {
+            if response.ended() && response.changed {
                 self.save_state();
-                return Action::Redraw;
             }
-            _ => {}
+            return Action::Redraw;
+        }
+        // Clicking a row selects it and opens it, like pressing Enter.
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(Hit::Row(idx)) = self.hits.hit(mouse.row, mouse.column).cloned()
+        {
+            self.cursor = idx;
+            return self.open_current_pane();
         }
         Action::None
+    }
+
+    fn cancel_resize(&mut self) {
+        if let Some(response) = self.split_interaction.cancel()
+            && response.changed
+        {
+            self.save_state();
+        }
     }
 
     #[cfg(not(test))]
@@ -1012,7 +1067,7 @@ impl App {
             .filter_map(|id| self.panes.get(id).cloned())
             .collect();
         let pending = self.pending_unread_changes.clone();
-        let sidebar_width = self.sidebar_width;
+        let sidebar_width = self.sidebar_width();
         let sort_mode = self.sort_mode;
         if update_ui_state(|state| {
             for p in &panes {
@@ -1049,40 +1104,25 @@ impl App {
     }
 
     #[cfg(test)]
-    fn save_state(&mut self) {}
+    fn save_state(&mut self) {
+        self.ui_state.sidebar_width = self.sidebar_width();
+    }
 }
 
 fn render<W: Write>(surface: &mut Surface, app: &mut App, out: &mut W) -> io::Result<()> {
     app.hits.clear();
-    surface.set_layout(LayoutTree::hbox(vec![
-        (
-            Constraint::Length(app.sidebar_width),
-            LayoutTree::leaf(SIDEBAR),
-        ),
-        (Constraint::Length(1), LayoutTree::leaf(SEPARATOR)),
-        (Constraint::Fill, LayoutTree::leaf(PREVIEW)),
-    ]));
+    surface.set_layout(app.layout());
+    surface.set_layout_style(LayoutStyle {
+        active_split: app.split_interaction.active_id(),
+        ..LayoutStyle::default()
+    });
     surface.render(out, |id, slice, _theme| {
         if id == SIDEBAR {
             render_sidebar(slice, app);
-        } else if id == SEPARATOR {
-            render_separator(slice, app);
         } else if id == PREVIEW {
             render_preview(slice, app);
         }
     })
-}
-
-fn render_separator(slice: &mut GridSlice<'_>, app: &mut App) {
-    let style = Style::new().fg(if app.dragging {
-        Color::Grey
-    } else {
-        Color::DarkGrey
-    });
-    for y in 0..slice.height() {
-        slice.set(0, y, '│', style);
-    }
-    app.hits.record(slice.grid_rect(), Hit::Separator);
 }
 
 fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
@@ -1092,17 +1132,11 @@ fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
         } else {
             (format!("Error: {err}"), Style::new().fg(Color::Red))
         };
-        put_clipped(slice, 0, 0, &message, style);
+        slice.put_str(0, 0, &message, style);
         return;
     }
     if app.items.is_empty() {
-        put_clipped(
-            slice,
-            2,
-            1,
-            "No active sessions",
-            Style::new().fg(Color::DarkGrey),
-        );
+        slice.put_str(2, 1, "No active sessions", Style::new().fg(Color::DarkGrey));
         return;
     }
     let h = slice.height() as usize;
@@ -1142,13 +1176,7 @@ fn render_tree_item(
             let mut text = format!("─{label}");
             let fill = width.saturating_sub(display_width(&text) as u16);
             text.push_str(&"─".repeat(fill as usize));
-            put_clipped(
-                slice,
-                0,
-                row,
-                &text,
-                Style::new().fg(Color::AnsiValue(242)).dim(),
-            );
+            slice.put_str(0, row, &text, Style::new().fg(Color::AnsiValue(242)).dim());
         }
         TreeItem::Workspace(id) => {
             if let Some(p) = app.panes.get(id) {
@@ -1247,19 +1275,18 @@ fn render_header_row(slice: &mut GridSlice<'_>, row: u16, width: u16, header: He
     if branch.is_empty() {
         name = truncate_width(&name, avail);
     }
-    let mut col = put_clipped(slice, 0, row, " ", style);
-    col = put_clipped(slice, col, row, &name, style);
+    let mut col = slice.put_str(0, row, " ", style);
+    col = slice.put_str(col, row, &name, style);
     if !branch.is_empty() {
         let pad = width
             .saturating_sub(col)
             .saturating_sub(display_width(&branch) as u16)
             .saturating_sub(1);
-        fill_spaces(slice, col, row, pad, style);
-        col += pad;
-        col = put_clipped(slice, col, row, &branch, branch_style);
-        let _ = put_clipped(slice, col, row, " ", branch_style);
+        col = slice.put_padded(col, row, pad, "", style);
+        col = slice.put_str(col, row, &branch, branch_style);
+        let _ = slice.put_str(col, row, " ", branch_style);
     } else {
-        fill_spaces(slice, col, row, width.saturating_sub(col), style);
+        slice.put_padded(col, row, width.saturating_sub(col), "", style);
     }
 }
 
@@ -1284,7 +1311,7 @@ fn render_pane_row(
     } else {
         Style::default()
     };
-    fill_spaces(slice, 0, row, width, fill_style);
+    slice.fill_row(row, fill_style);
 
     let mut win_label = pane_label(p);
     let mut worktree = if !p.short_path.is_empty() && p.path != p.project_root {
@@ -1379,8 +1406,7 @@ fn render_pane_row(
     };
 
     let mut col = 0;
-    col = put_clipped(
-        slice,
+    col = slice.put_str(
         col,
         row,
         PREFIX,
@@ -1388,13 +1414,13 @@ fn render_pane_row(
     );
     slice.set(col, row, icon, fill_style.fg(icon_color));
     col += 1;
-    col = put_clipped(slice, col, row, " ", fill_style);
-    col = put_clipped(slice, col, row, &win_label, text_style);
+    col = slice.put_str(col, row, " ", fill_style);
+    col = slice.put_str(col, row, &win_label, text_style);
     if !worktree_rendered.is_empty() {
-        col = put_clipped(slice, col, row, &worktree_rendered, dim_style);
+        col = slice.put_str(col, row, &worktree_rendered, dim_style);
     }
-    col = put_clipped(slice, col, row, &" ".repeat(gap), dim_style);
-    let _ = put_clipped(slice, col, row, &elapsed, dim_style);
+    col = slice.put_str(col, row, &" ".repeat(gap), dim_style);
+    let _ = slice.put_str(col, row, &elapsed, dim_style);
 }
 
 fn pane_label(p: &Pane) -> String {
@@ -1420,19 +1446,13 @@ fn render_preview(slice: &mut GridSlice<'_>, app: &App) {
         return;
     }
     if app.preview_lines.is_empty() {
-        put_clipped(
-            slice,
-            1,
-            1,
-            "loading preview…",
-            Style::new().fg(Color::DarkGrey),
-        );
+        slice.put_str(1, 1, "loading preview…", Style::new().fg(Color::DarkGrey));
         return;
     }
     let h = slice.height() as usize;
     let start = app.preview_lines.len().saturating_sub(h);
     for (row, line) in app.preview_lines.iter().skip(start).take(h).enumerate() {
-        put_ansi_spans(slice, 0, row as u16, line);
+        slice.put_line(0, row as u16, line);
     }
 }
 
@@ -1443,25 +1463,15 @@ fn render_empty_preview(slice: &mut GridSlice<'_>, app: &App) {
         "No active sessions"
     };
     let detail = "Start a supported agent in tmux and it will appear here.";
-    put_clipped(slice, 2, 1, title, Style::new().fg(Color::White).bold());
-    put_clipped(slice, 2, 3, detail, Style::new().fg(Color::DarkGrey));
-}
-
-fn put_ansi_spans(slice: &mut GridSlice<'_>, mut x: u16, y: u16, spans: &[AnsiSpan]) -> u16 {
-    for span in spans {
-        x = put_clipped(slice, x, y, &span.text, span.style);
-        if x >= slice.width() {
-            break;
-        }
-    }
-    x
+    slice.put_str(2, 1, title, Style::new().fg(Color::White).bold());
+    slice.put_str(2, 3, detail, Style::new().fg(Color::DarkGrey));
 }
 
 fn render_help(slice: &mut GridSlice<'_>) {
     let title = Style::new().fg(Color::White).bold();
     let key = Style::new().fg(Color::Yellow).bold();
     let dim = Style::new().fg(Color::DarkGrey);
-    put_clipped(slice, 2, 1, "Keybindings", title);
+    slice.put_str(2, 1, "Keybindings", title);
     let rows = [
         ("j/k", "move down/up"),
         ("C-n/C-p", "move down/up"),
@@ -1484,8 +1494,8 @@ fn render_help(slice: &mut GridSlice<'_>) {
     ];
     for (i, (k, desc)) in rows.iter().enumerate() {
         let y = i as u16 + 3;
-        put_clipped(slice, 2, y, &format!("{k:<8}"), key);
-        put_clipped(slice, 12, y, desc, dim);
+        slice.put_str(2, y, &format!("{k:<8}"), key);
+        slice.put_str(12, y, desc, dim);
     }
 }
 
@@ -1535,7 +1545,7 @@ fn elapsed_label(p: &Pane) -> String {
     };
     let secs = (chrono::Utc::now() - t).num_seconds().max(0);
     if secs < 60 {
-        format!("{}s", secs)
+        format!("{secs}s")
     } else if secs < 3600 {
         format!("{}m", secs / 60)
     } else if secs < 86_400 {
@@ -1545,43 +1555,16 @@ fn elapsed_label(p: &Pane) -> String {
     }
 }
 
-fn put_clipped(slice: &mut GridSlice<'_>, mut x: u16, y: u16, text: &str, style: Style) -> u16 {
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(1).max(1) as u16;
-        if x + w > slice.width() || y >= slice.height() {
-            break;
-        }
-        slice.set(x, y, ch, style);
-        x += w;
-    }
-    x
-}
-
-fn fill_spaces(slice: &mut GridSlice<'_>, x: u16, y: u16, width: u16, style: Style) {
-    for col in x..x.saturating_add(width).min(slice.width()) {
-        slice.set(col, y, ' ', style);
-    }
-}
-
 fn display_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    usize::from(smelt_term::display_width(s))
 }
 
 fn truncate_width(s: &str, max: usize) -> String {
     if display_width(s) <= max {
         return s.to_string();
     }
-    let mut out = String::new();
-    let mut width = 0;
-    let limit = max.saturating_sub(1);
-    for ch in s.chars() {
-        let w = ch.width().unwrap_or(1).max(1);
-        if width + w > limit {
-            break;
-        }
-        out.push(ch);
-        width += w;
-    }
+    let limit = u16::try_from(max.saturating_sub(1)).unwrap_or(u16::MAX);
+    let mut out = smelt_term::truncate_width(s, limit);
     if max >= 1 {
         out.push('…');
     }
@@ -1683,8 +1666,8 @@ mod tests {
             project_win_width: HashMap::new(),
             width: 0,
             height: 0,
-            sidebar_width: 0,
-            dragging: false,
+            sidebar: sidebar_split(0),
+            split_interaction: SplitInteraction::default(),
             show_help: false,
             pending_d: false,
             pending_g: false,
@@ -1699,6 +1682,122 @@ mod tests {
         };
         app.rebuild_items();
         app
+    }
+
+    #[test]
+    fn sidebar_survives_terminal_shrink_and_restore() {
+        let mut app = app_with_panes(vec![pane("%1", 0)]);
+        let mut surface = Surface::new(120, 24);
+        app.resize(120, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        let preferred = surface.paint_rect(SIDEBAR).unwrap().width;
+        for width in [60, 39, 20, 3, 2, 1, 0, 120] {
+            surface.set_terminal_size(width, 24);
+            app.resize(width, 24);
+            render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+            assert!(surface.paint_rect(SIDEBAR).unwrap().width <= width);
+        }
+        assert_eq!(surface.paint_rect(SIDEBAR).unwrap().width, preferred);
+    }
+
+    #[test]
+    fn sidebar_restores_preference_after_temporary_clamp() {
+        let mut app = app_with_panes(vec![pane("%1", 0)]);
+        let mut surface = Surface::new(200, 24);
+        app.resize(200, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        assert_eq!(surface.paint_rect(SIDEBAR).unwrap().width, 50);
+        surface.set_terminal_size(60, 24);
+        app.resize(60, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        surface.set_terminal_size(200, 24);
+        app.resize(200, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        assert_eq!(surface.paint_rect(SIDEBAR).unwrap().width, 50);
+    }
+
+    #[test]
+    fn sidebar_keys_mouse_and_saved_width_share_bounds() {
+        let mut app = app_with_panes(vec![pane("%1", 0)]);
+        let mut surface = Surface::new(120, 24);
+        let (tx, _rx) = mpsc::channel();
+        app.resize(120, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        let cursor = app.cursor;
+        for ch in ['3', 'L'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+        }
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        assert_eq!(surface.paint_rect(SIDEBAR).unwrap().width, 36);
+        assert_eq!(app.ui_state.sidebar_width, 36);
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36)),
+            Action::Redraw
+        ));
+        assert_eq!(app.split_interaction.active_id(), Some(app.sidebar.id()));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50));
+        assert_eq!(
+            app.ui_state.sidebar_width, 36,
+            "save only at gesture completion"
+        );
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 54));
+        assert_eq!(
+            app.ui_state.sidebar_width, 54,
+            "final pointer position is applied"
+        );
+        assert_eq!(app.split_interaction.active_id(), None);
+        assert_eq!(app.cursor, cursor);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 54));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), u16::MAX));
+        app.handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.split_interaction.active_id(), None);
+        assert_eq!(app.sidebar_width(), 97);
+        assert!(matches!(
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30)),
+            Action::None
+        ));
+        surface.set_terminal_size(39, 24);
+        app.resize(39, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        app.save_state();
+        assert_eq!(app.ui_state.sidebar_width, 97);
+        surface.set_terminal_size(160, 24);
+        app.resize(160, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        assert_eq!(surface.paint_rect(SIDEBAR).unwrap().width, 97);
+    }
+
+    #[test]
+    fn preview_ansi_graphemes_survive_resize_and_clip_at_pane_boundary() {
+        let mut app = app_with_panes(vec![pane("%1", 0)]);
+        app.cursor = app.find_pane_by_id("%1").unwrap();
+        app.preview_lines = parse_ansi_lines("\x1b[31me\x1b[32m\u{301}界 tail");
+        let mut surface = Surface::new(80, 8);
+        app.resize(80, 8);
+        let mut output = Vec::new();
+        render(&mut surface, &mut app, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("e\u{301}"),
+            "combining mark stays on its base across ANSI spans"
+        );
+        assert!(output.contains('界'));
+        for width in [22, 3, 2, 80] {
+            surface.set_terminal_size(width, 8);
+            app.resize(width, 8);
+            render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        }
+        assert_eq!(truncate_width("e\u{301}界tail", 4), "e\u{301}界…");
+        assert_eq!(truncate_width("界tail", 1), "…");
+        assert_eq!(truncate_width("界tail", 0), "");
+        assert_eq!(display_width("e\u{301}界"), 3);
     }
 
     #[test]

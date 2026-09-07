@@ -14,11 +14,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "smelt-ansi",
  "smelt-perf",
  "smelt-term",
  "sysinfo",
- "unicode-width",
 ]
 
 [[package]]
@@ -73,6 +71,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.64"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -106,6 +113,19 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "static_assertions",
+ "zmij",
 ]
 
 [[package]]
@@ -662,36 +682,47 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smelt-ansi"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd843276b9a3ca129e9dc979bf9da6a6b10061dd3ac37416fa2b5dd2d8a67ff8"
+checksum = "5491249ce2dc054de0f6008167950589a5682eb3c346a5aedead43d3d61d1dc9"
 dependencies = [
  "smelt-style",
 ]
 
 [[package]]
 name = "smelt-perf"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6cdb3f11da3c72045b8238447e6070b53931f8983ea824ebb8065c95c09283b"
+checksum = "a1231272aaacbc25f0eed3385dced7295f68a257aa4e73ac1cfa63c6d189aace"
 
 [[package]]
 name = "smelt-style"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ea657f94786c2bfed68979b51b0356c0b5874b3edb4da8a9081cf071f301bfa"
+checksum = "316ca1f924768fdd9a7b7991e47cede200018e5c674c179615a907045f9eb74e"
+dependencies = [
+ "unicode-segmentation",
+ "unicode-width",
+]
 
 [[package]]
 name = "smelt-term"
-version = "0.3.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fca16c5f4d18bcef3b1aa749dfcf2c17b9a2a2a2e1881e5ea383e1cf5f9fe997"
+checksum = "e35dd7c491aa0083ea30378d52d9779ef8e3d9dcae1120f8e401286a3a2196d4"
 dependencies = [
+ "compact_str",
  "crossterm",
  "smelt-ansi",
  "smelt-style",
  "unicode-width",
 ]
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "syn"
@@ -732,9 +763,9 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "unicode-segmentation"
-version = "1.13.3"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
 
 [[package]]
 name = "unicode-width"
