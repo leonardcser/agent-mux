@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 
-use crate::agent::git::{enrich_panes, enrich_panes_fast};
+use crate::agent::git::{dirty_statuses, enrich_panes_fast};
 use crate::agent::ipc::{Request, Response, socket_path};
 use crate::agent::persist::{
     Snapshot, UiPaneState, cache_panes, load_snapshot, load_ui_state, panes_from_snapshot,
-    state_dir, ui_pane_state_is_empty, update_ui_state_if_changed, write_heartbeat,
-    write_snapshot_if_changed,
+    snapshot_path, state_dir, ui_pane_state_is_empty, update_snapshot, update_snapshot_at,
+    update_ui_state_if_changed, write_heartbeat,
 };
 use crate::agent::{Pane, Reconciler, list_panes_fast};
 
@@ -88,7 +88,6 @@ fn refresh_once_with(
 ) -> Result<()> {
     write_heartbeat()?;
 
-    let previous = load_snapshot();
     let ui_state = load_ui_state();
 
     let mut panes = list_panes_fast()?;
@@ -102,18 +101,8 @@ fn refresh_once_with(
         }
     }
 
-    if let Some(snapshot) = previous.as_ref() {
-        apply_cached_metadata(&mut panes, snapshot);
-    }
-    if panes
-        .iter()
-        .any(|pane| pane.short_path.is_empty() || pane.project_root.is_empty())
-    {
-        enrich_panes_fast(&mut panes);
-    }
-
     reconciler.reconcile(&mut panes);
-    let (snapshot, changed) = write_panes_snapshot(reconciler, &panes)?;
+    let (snapshot, changed) = write_panes_snapshot(reconciler, &panes, snapshot_path())?;
     publish_snapshot(latest_snapshot, subscribers, snapshot, changed);
     write_heartbeat()?;
 
@@ -143,17 +132,29 @@ fn refresh_metadata_snapshot() -> Result<Option<Snapshot>> {
         return Ok(None);
     };
     let mut panes = panes_from_snapshot(&snapshot);
-    enrich_panes(&mut panes);
+    enrich_panes_fast(&mut panes);
+    let dirty = dirty_statuses(&panes);
     let metadata = cache_panes(&panes);
-    merge_metadata_snapshot(&metadata)
+    merge_metadata_snapshot(&metadata, &dirty)
 }
 
 fn merge_metadata_snapshot(
     metadata: &[crate::agent::persist::CachedPane],
+    dirty: &std::collections::HashMap<String, Option<bool>>,
 ) -> Result<Option<Snapshot>> {
-    let Some(mut snapshot) = load_snapshot() else {
-        return Ok(None);
-    };
+    let updated = update_snapshot(|previous| {
+        let mut snapshot = previous?.clone();
+        apply_metadata(&mut snapshot, metadata, dirty);
+        Some(snapshot)
+    })?;
+    Ok(updated.and_then(|(snapshot, changed)| changed.then_some(snapshot)))
+}
+
+fn apply_metadata(
+    snapshot: &mut Snapshot,
+    metadata: &[crate::agent::persist::CachedPane],
+    dirty: &std::collections::HashMap<String, Option<bool>>,
+) {
     let metadata: std::collections::HashMap<String, &crate::agent::persist::CachedPane> = metadata
         .iter()
         .map(|pane| (pane.pane_key().to_string(), pane))
@@ -169,12 +170,14 @@ fn merge_metadata_snapshot(
         pane.project_root = meta.project_root.clone();
         pane.project_short = meta.project_short.clone();
         pane.project_branch = meta.project_branch.clone();
-        pane.project_dirty = meta.project_dirty;
         pane.git_branch = meta.git_branch.clone();
-        pane.git_dirty = meta.git_dirty;
+        if let Some(Some(value)) = dirty.get(&pane.project_root) {
+            pane.project_dirty = *value;
+        }
+        if let Some(Some(value)) = dirty.get(&pane.path) {
+            pane.git_dirty = *value;
+        }
     }
-    let changed = write_snapshot_if_changed(snapshot)?;
-    Ok(changed.then(load_snapshot).flatten())
 }
 
 fn publish_snapshot(
@@ -183,12 +186,18 @@ fn publish_snapshot(
     snapshot: Snapshot,
     changed: bool,
 ) {
+    // Keep publication ordered with the shared state update.
+    let mut latest = latest_snapshot.and_then(|latest| latest.lock().ok());
     let mut was_empty = false;
-    if let Some(latest_snapshot) = latest_snapshot
-        && let Ok(mut latest) = latest_snapshot.lock()
-    {
+    if let Some(latest) = latest.as_mut() {
+        if latest
+            .as_ref()
+            .is_some_and(|current| current.revision > snapshot.revision)
+        {
+            return;
+        }
         was_empty = latest.is_none();
-        *latest = Some(snapshot.clone());
+        **latest = Some(snapshot.clone());
     }
     if (changed || was_empty)
         && let Some(subscribers) = subscribers
@@ -236,17 +245,31 @@ fn update_pane_read_state(ui: &mut UiPaneState, content_hash: &str, focused: boo
     }
 }
 
-fn write_panes_snapshot(reconciler: &Reconciler, panes: &[Pane]) -> Result<(Snapshot, bool)> {
-    let mut cached = cache_panes(panes);
-    reconciler.apply_to_cache(&mut cached);
-    let changed = write_snapshot_if_changed(Snapshot {
-        version: 1,
-        generation: 0,
-        panes: cached,
-        updated_at: None,
-    })?;
-    let snapshot = load_snapshot().context("load written snapshot")?;
-    Ok((snapshot, changed))
+fn write_panes_snapshot(
+    reconciler: &Reconciler,
+    panes: &[Pane],
+    path: PathBuf,
+) -> Result<(Snapshot, bool)> {
+    update_snapshot_at(path, |previous| {
+        let mut panes = panes.to_vec();
+        if let Some(previous) = previous {
+            apply_cached_metadata(&mut panes, previous);
+        }
+        if panes
+            .iter()
+            .any(|pane| pane.short_path.is_empty() || pane.project_root.is_empty())
+        {
+            enrich_panes_fast(&mut panes);
+        }
+        let mut cached = cache_panes(&panes);
+        reconciler.apply_to_cache(&mut cached);
+        Some(Snapshot {
+            version: 1,
+            panes: cached,
+            ..Snapshot::default()
+        })
+    })?
+    .context("update pane snapshot")
 }
 
 fn apply_cached_metadata(panes: &mut [Pane], snapshot: &Snapshot) {
@@ -411,6 +434,119 @@ pub fn lock_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_poll_preserves_metadata_committed_after_pane_discovery() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-mux-poll-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("snapshot.json");
+        let panes = vec![Pane {
+            path: "/repo".to_string(),
+            ..Pane::new(crate::agent::PaneId::parse("%1").unwrap())
+        }];
+        let reconciler = Reconciler::new();
+        write_panes_snapshot(&reconciler, &panes, path.clone()).unwrap();
+
+        // The metadata worker commits after the fast poll has discovered clean panes.
+        update_snapshot_at(path.clone(), |previous| {
+            let mut snapshot = previous.unwrap().clone();
+            snapshot.panes[0].git_dirty = true;
+            snapshot.panes[0].project_dirty = true;
+            Some(snapshot)
+        })
+        .unwrap();
+        let (snapshot, changed) = write_panes_snapshot(&reconciler, &panes, path).unwrap();
+        assert!(snapshot.panes[0].git_dirty);
+        assert!(snapshot.panes[0].project_dirty);
+        assert!(!changed);
+        assert_eq!(snapshot.revision, 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_merge_preserves_live_pane_state_and_skips_changed_paths() {
+        let panes = vec![Pane {
+            path: "/repo".to_string(),
+            project_root: "/repo".to_string(),
+            ..Pane::new(crate::agent::PaneId::parse("%1").unwrap())
+        }];
+        let metadata = cache_panes(&panes);
+        let dirty = std::collections::HashMap::from([("/repo".to_string(), Some(true))]);
+        let mut snapshot = Snapshot {
+            version: 1,
+            panes: cache_panes(&panes),
+            ..Snapshot::default()
+        };
+        snapshot.panes[0].content_hash = "new content".to_string();
+        apply_metadata(&mut snapshot, &metadata, &dirty);
+        assert!(snapshot.panes[0].git_dirty);
+        assert!(snapshot.panes[0].project_dirty);
+        assert_eq!(snapshot.panes[0].content_hash, "new content");
+        snapshot.panes[0].path = "/other".to_string();
+        snapshot.panes[0].git_dirty = false;
+        snapshot.panes[0].project_dirty = false;
+        apply_metadata(&mut snapshot, &metadata, &dirty);
+        assert!(!snapshot.panes[0].git_dirty);
+        assert!(!snapshot.panes[0].project_dirty);
+    }
+
+    #[test]
+    fn failed_dirty_check_does_not_restore_stale_values() {
+        let stale = vec![Pane {
+            path: "/repo".to_string(),
+            project_root: "/repo".to_string(),
+            ..Pane::new(crate::agent::PaneId::parse("%1").unwrap())
+        }];
+        let metadata = cache_panes(&stale);
+        let dirty = std::collections::HashMap::from([("/repo".to_string(), None)]);
+        let mut snapshot = Snapshot {
+            panes: metadata.clone(),
+            ..Snapshot::default()
+        };
+        // A newer successful check has already committed dirty status.
+        snapshot.panes[0].git_dirty = true;
+        snapshot.panes[0].project_dirty = true;
+        apply_metadata(&mut snapshot, &metadata, &dirty);
+        assert!(snapshot.panes[0].git_dirty);
+        assert!(snapshot.panes[0].project_dirty);
+        let clean = std::collections::HashMap::from([("/repo".to_string(), Some(false))]);
+        apply_metadata(&mut snapshot, &metadata, &clean);
+        assert!(!snapshot.panes[0].git_dirty);
+        assert!(!snapshot.panes[0].project_dirty);
+    }
+
+    #[test]
+    fn publishing_an_older_snapshot_does_not_roll_back_state() {
+        let latest = Arc::new(Mutex::new(Some(Snapshot {
+            version: 1,
+            generation: 1,
+            revision: 2,
+            updated_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            ..Snapshot::default()
+        })));
+        let (tx, rx) = mpsc::channel();
+        let subscribers = Arc::new(Mutex::new(vec![tx]));
+        publish_snapshot(
+            Some(&latest),
+            Some(&subscribers),
+            Snapshot {
+                version: 1,
+                generation: 1,
+                revision: 1,
+                updated_at: Some(chrono::Utc::now()),
+                ..Snapshot::default()
+            },
+            true,
+        );
+        assert_eq!(latest.lock().unwrap().as_ref().unwrap().revision, 2);
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn focusing_a_pane_marks_forced_unread_state_read() {

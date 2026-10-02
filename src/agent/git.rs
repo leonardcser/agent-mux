@@ -2,61 +2,55 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
 
 use crate::agent::Pane;
 
-#[derive(Clone, Debug)]
-struct DirtyEntry {
-    index_mtime: SystemTime,
-    dirty: bool,
+pub fn enrich_panes(panes: &mut [Pane]) {
+    let _g = smelt_perf::perf::begin("git.enrich_panes");
+    enrich_panes_fast(panes);
+    let dirty = dirty_statuses(panes);
+    for pane in panes {
+        if let Some(Some(value)) = dirty.get(&pane.path) {
+            pane.git_dirty = *value;
+        }
+        if let Some(Some(value)) = dirty.get(&pane.project_root) {
+            pane.project_dirty = *value;
+        }
+    }
 }
 
-static DIRTY_CACHE: OnceLock<Mutex<HashMap<String, DirtyEntry>>> = OnceLock::new();
+pub fn dirty_statuses(panes: &[Pane]) -> HashMap<String, Option<bool>> {
+    let mut dirty = HashMap::new();
+    for pane in panes {
+        for path in [&pane.path, &pane.project_root] {
+            dirty.entry(path.clone()).or_insert_with(|| git_dirty(path));
+        }
+    }
+    dirty
+}
 
 pub fn enrich_panes_fast(panes: &mut [Pane]) {
     let _g = smelt_perf::perf::begin("git.enrich_panes_fast");
-    enrich_panes_with(panes, false);
-}
-
-pub fn enrich_panes(panes: &mut [Pane]) {
-    let _g = smelt_perf::perf::begin("git.enrich_panes");
-    enrich_panes_with(panes, true);
-}
-
-fn enrich_panes_with(panes: &mut [Pane], include_dirty: bool) {
     let mut unique: HashMap<String, WsInfo> = HashMap::new();
     for p in panes.iter() {
-        unique.entry(p.path.clone()).or_insert_with(|| WsInfo {
-            short_path: shorten(&p.path),
-            project_root: String::new(),
-            project_short: String::new(),
-            git_branch: String::new(),
-            git_dirty: None,
+        unique.entry(p.path.clone()).or_insert_with(|| {
+            let project_root = project_root(&p.path);
+            WsInfo {
+                short_path: shorten(&p.path),
+                project_short: shorten(&project_root),
+                project_root,
+                git_branch: git_branch(&p.path),
+            }
         });
     }
 
     smelt_perf::perf::record_value("git.unique_paths", unique.len() as u64);
-    for (path, info) in unique.iter_mut() {
-        info.git_branch = git_branch(path);
-        if include_dirty {
-            info.git_dirty = Some(git_dirty(path));
-        }
-        info.project_root = project_root(path);
-        info.project_short = shorten(&info.project_root);
-    }
 
-    let mut projects: HashMap<String, (String, Option<bool>)> = HashMap::new();
+    let mut projects = HashMap::new();
     for info in unique.values() {
         projects
             .entry(info.project_root.clone())
-            .or_insert_with(|| {
-                (
-                    git_branch(&info.project_root),
-                    include_dirty.then(|| git_dirty(&info.project_root)),
-                )
-            });
+            .or_insert_with(|| git_branch(&info.project_root));
     }
 
     for p in panes.iter_mut() {
@@ -65,14 +59,8 @@ fn enrich_panes_with(panes: &mut [Pane], include_dirty: bool) {
             p.project_root = info.project_root.clone();
             p.project_short = info.project_short.clone();
             p.git_branch = info.git_branch.clone();
-            if let Some(dirty) = info.git_dirty {
-                p.git_dirty = dirty;
-            }
-            if let Some((branch, dirty)) = projects.get(&info.project_root) {
+            if let Some(branch) = projects.get(&info.project_root) {
                 p.project_branch = branch.clone();
-                if let Some(dirty) = dirty {
-                    p.project_dirty = *dirty;
-                }
             }
         }
     }
@@ -84,7 +72,6 @@ struct WsInfo {
     project_root: String,
     project_short: String,
     git_branch: String,
-    git_dirty: Option<bool>,
 }
 
 fn shorten(path: &str) -> String {
@@ -173,47 +160,18 @@ fn git_branch(dir: &str) -> String {
     }
 }
 
-fn git_dirty(dir: &str) -> bool {
+fn git_dirty(dir: &str) -> Option<bool> {
     let _g = smelt_perf::perf::begin("git.dirty");
-    let Some(gitdir) = resolve_git_dir(dir) else {
-        return false;
-    };
-    let Ok(meta) = fs::metadata(gitdir.join("index")) else {
-        return false;
-    };
-    let Ok(mtime) = meta.modified() else {
-        return false;
-    };
-
-    let cache = DIRTY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(cache) = cache.lock()
-        && let Some(entry) = cache.get(dir)
-        && entry.index_mtime == mtime
-    {
-        return entry.dirty;
+    if resolve_git_dir(dir).is_none() {
+        return Some(false);
     }
-
-    let dirty = {
-        let _g = smelt_perf::perf::begin("git.status");
-        Command::new("git")
-            .arg("status")
-            .arg("--porcelain")
-            .current_dir(dir)
-            .output()
-            .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
-            .unwrap_or(false)
-    };
-
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(
-            dir.to_string(),
-            DirtyEntry {
-                index_mtime: mtime,
-                dirty,
-            },
-        );
-    }
-    dirty
+    let _g = smelt_perf::perf::begin("git.status");
+    let output = Command::new("git")
+        .args(["--no-optional-locks", "status", "--porcelain"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    output.status.success().then_some(!output.stdout.is_empty())
 }
 
 #[cfg(test)]
@@ -228,6 +186,93 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("agent-mux-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn dirty_status_tracks_changes_without_index_updates() -> std::io::Result<()> {
+        let repo = temp_dir("dirty");
+        fs::create_dir_all(&repo)?;
+        git(&repo, &["init"]);
+        fs::write(repo.join("tracked"), "original")?;
+        git(&repo, &["add", "tracked"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        let path = repo.to_str().unwrap();
+        let mut panes = vec![Pane {
+            path: path.to_string(),
+            ..Pane::new(PaneId::parse("%1").unwrap())
+        }];
+        let index_mtime = fs::metadata(repo.join(".git/index"))?.modified()?;
+        for (file, contents, dirty) in [
+            ("tracked", Some("original"), false),
+            ("tracked", Some("modified"), true),
+            ("tracked", Some("original"), false),
+            ("untracked", Some("new"), true),
+            ("untracked", None, false),
+        ] {
+            if let Some(contents) = contents {
+                fs::write(repo.join(file), contents)?;
+            } else {
+                fs::remove_file(repo.join(file))?;
+            }
+            enrich_panes(&mut panes);
+            assert_eq!(panes[0].git_dirty, dirty);
+            assert_eq!(panes[0].project_dirty, dirty);
+            assert_eq!(
+                fs::metadata(repo.join(".git/index"))?.modified()?,
+                index_mtime
+            );
+        }
+        fs::remove_dir_all(repo)
+    }
+
+    #[test]
+    fn dirty_status_detects_untracked_files_before_first_commit() -> std::io::Result<()> {
+        let repo = temp_dir("unborn");
+        fs::create_dir_all(&repo)?;
+        git(&repo, &["init"]);
+        fs::write(repo.join("untracked"), "new")?;
+        assert_eq!(git_dirty(repo.to_str().unwrap()), Some(true));
+        fs::remove_dir_all(repo)
+    }
+
+    #[test]
+    fn failed_git_status_preserves_dirty_metadata() -> std::io::Result<()> {
+        let repo = temp_dir("invalid");
+        fs::create_dir_all(repo.join(".git"))?;
+        let mut panes = vec![Pane {
+            path: repo.to_string_lossy().to_string(),
+            git_dirty: true,
+            project_dirty: true,
+            ..Pane::new(PaneId::parse("%1").unwrap())
+        }];
+        enrich_panes(&mut panes);
+        assert!(panes[0].git_dirty);
+        assert!(panes[0].project_dirty);
+        fs::remove_dir_all(repo)
     }
 
     #[test]

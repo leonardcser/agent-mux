@@ -98,3 +98,19 @@ Sessions are grouped by folder. Press `o` to switch between the default
 stable order and sorting by most recent change first - folders are ordered by
 their most recently active session, and sessions within each folder likewise.
 The choice is remembered across restarts.
+
+State is stored in `~/.local/state/agent-mux`. Set `AGENT_MUX_STATE_DIR` to use
+another directory without changing your home directory or Git configuration.
+
+## Testing
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+python3 tests/e2e_dirty_status.py
+```
+
+The E2E test uses an isolated tmux server and state directory. It checks Git
+status and rendered dirty markers through edits, restores, and concurrent hook
+refreshes, without starting an AI session or changing your running watcher.

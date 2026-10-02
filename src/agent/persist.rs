@@ -85,6 +85,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub generation: u64,
     #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
     pub panes: Vec<CachedPane>,
     #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
@@ -221,18 +223,33 @@ pub fn ui_pane_state_is_empty(ui: &UiPaneState) -> bool {
     !ui.stashed && !ui.forced_unread && ui.read_content_hash.is_none()
 }
 
-pub fn write_snapshot_if_changed(mut snapshot: Snapshot) -> Result<bool> {
-    let lock_file = lock_file(snapshot_write_lock_path())?;
-    let previous = load_snapshot_file();
+pub fn update_snapshot(
+    update: impl FnOnce(Option<&Snapshot>) -> Option<Snapshot>,
+) -> Result<Option<(Snapshot, bool)>> {
+    update_snapshot_at(snapshot_path(), update)
+}
+
+pub(super) fn update_snapshot_at(
+    path: PathBuf,
+    update: impl FnOnce(Option<&Snapshot>) -> Option<Snapshot>,
+) -> Result<Option<(Snapshot, bool)>> {
+    let lock_file = lock_file(path.with_extension("lock"))?;
+    let previous =
+        load_json_file::<Snapshot>(path.clone()).filter(|snapshot| snapshot.version == 1);
+    let Some(mut snapshot) = update(previous.as_ref()) else {
+        return Ok(None);
+    };
     if previous
         .as_ref()
-        .is_some_and(|previous| previous.generation > 0 && previous.panes == snapshot.panes)
+        .is_some_and(|previous| previous.revision > 0 && previous.panes == snapshot.panes)
     {
-        drop(lock_file);
-        return Ok(false);
+        return Ok(previous.map(|snapshot| (snapshot, false)));
     }
 
     snapshot.version = 1;
+    snapshot.revision = previous
+        .as_ref()
+        .map_or(1, |previous| previous.revision + 1);
     snapshot.generation = previous
         .as_ref()
         .map(|previous| {
@@ -245,9 +262,9 @@ pub fn write_snapshot_if_changed(mut snapshot: Snapshot) -> Result<bool> {
         })
         .unwrap_or(1);
     snapshot.updated_at = Some(Utc::now());
-    write_json_file(snapshot_path(), &snapshot)?;
+    write_json_file(path, &snapshot)?;
     drop(lock_file);
-    Ok(true)
+    Ok(Some((snapshot, true)))
 }
 
 fn panes_equal_for_generation(a: &[CachedPane], b: &[CachedPane]) -> bool {
@@ -317,26 +334,32 @@ fn load_json_file<T: DeserializeOwned>(path: PathBuf) -> Option<T> {
 }
 
 fn lock_file(path: PathBuf) -> Result<File> {
-    fs::create_dir_all(state_dir()).context("create state dir")?;
+    let parent = path
+        .parent()
+        .context("state file has no parent directory")?;
+    fs::create_dir_all(parent).context("create state dir")?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path)
+        .open(&path)
         .context("open state lock")?;
     file.lock_exclusive().context("lock state")?;
     Ok(file)
 }
 
 fn write_json_file<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
-    fs::create_dir_all(state_dir()).context("create state dir")?;
+    let parent = path
+        .parent()
+        .context("state file has no parent directory")?;
+    fs::create_dir_all(parent).context("create state dir")?;
     let data = serde_json::to_vec_pretty(value).context("encode state")?;
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("state.json");
-    let tmp_path = state_dir().join(format!(".{file_name}-{}.tmp", std::process::id()));
+    let tmp_path = parent.join(format!(".{file_name}-{}.tmp", std::process::id()));
     {
         let mut tmp = File::create(&tmp_path).context("create tmp state")?;
         tmp.write_all(&data).context("write tmp state")?;
@@ -407,6 +430,9 @@ fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
 }
 
 pub fn state_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("AGENT_MUX_STATE_DIR") {
+        return PathBuf::from(path);
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -423,10 +449,6 @@ pub fn ui_state_path() -> PathBuf {
 
 pub fn heartbeat_path() -> PathBuf {
     state_dir().join("heartbeat.json")
-}
-
-pub fn snapshot_write_lock_path() -> PathBuf {
-    state_dir().join("snapshot.lock")
 }
 
 pub fn ui_state_write_lock_path() -> PathBuf {
@@ -451,6 +473,77 @@ mod tests {
             content_hash: content_hash.to_string(),
             ..Pane::new(PaneId::parse("%1").unwrap())
         }
+    }
+
+    #[test]
+    fn concurrent_snapshot_updates_read_the_latest_state_under_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-mux-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("snapshot.json");
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let path = path.clone();
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..20 {
+                    super::update_snapshot_at(path.clone(), |previous| {
+                        let mut snapshot = previous.cloned().unwrap_or_else(|| super::Snapshot {
+                            version: 1,
+                            panes: vec![CachedPane::default()],
+                            ..super::Snapshot::default()
+                        });
+                        snapshot.panes[0].order += 1;
+                        Some(snapshot)
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let snapshot = super::load_json_file::<super::Snapshot>(path).unwrap();
+        assert_eq!(snapshot.panes[0].order, 80);
+        assert_eq!(snapshot.generation, 80);
+        assert_eq!(snapshot.revision, 80);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revision_advances_for_writes_that_do_not_change_display_generation() {
+        let root = std::env::temp_dir().join(format!("agent-mux-revision-{}", std::process::id()));
+        let path = root.join("nested/snapshot.json");
+        let (initial, _) = super::update_snapshot_at(path.clone(), |_| {
+            Some(super::Snapshot {
+                panes: vec![CachedPane::default()],
+                ..super::Snapshot::default()
+            })
+        })
+        .unwrap()
+        .unwrap();
+        let (updated, changed) = super::update_snapshot_at(path.clone(), |previous| {
+            let mut snapshot = previous.unwrap().clone();
+            snapshot.panes[0].content_hash = "new".to_string();
+            Some(snapshot)
+        })
+        .unwrap()
+        .unwrap();
+        assert!(changed);
+        assert_eq!(updated.generation, initial.generation);
+        assert_eq!(updated.revision, initial.revision + 1);
+        let (unchanged, changed) = super::update_snapshot_at(path, |previous| previous.cloned())
+            .unwrap()
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(unchanged.revision, updated.revision);
+        assert_eq!(std::fs::read_dir(root.join("nested")).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
