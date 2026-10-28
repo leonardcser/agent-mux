@@ -156,7 +156,7 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                     if preview_seq >= app.preview_applied_gen {
                         app.preview_applied_gen = preview_seq;
                         app.preview_for = pane_id;
-                        app.preview_lines = parse_ansi_lines(content.trim_end_matches('\n'));
+                        app.preview_lines = preview_lines(&content);
                         dirty = true;
                     }
                 }
@@ -329,6 +329,23 @@ fn spawn_load_panes(tx: &mpsc::Sender<Msg>) {
     });
 }
 
+/// Parses a captured pane. Captures keep trailing cells, so empty rows are padded rather than bare
+/// newlines; the rows at the bottom that show nothing are dropped so the preview ends at the content.
+fn preview_lines(content: &str) -> Vec<Line<'static>> {
+    let mut lines = parse_ansi_lines(content.trim_end_matches('\n'));
+    while lines.last().is_some_and(shows_nothing) {
+        lines.pop();
+    }
+    lines
+}
+
+/// A row with no visible text, no background and no reverse video.
+fn shows_nothing(line: &Line<'_>) -> bool {
+    line.spans
+        .iter()
+        .all(|span| span.text.trim().is_empty() && span.style.bg.is_none() && !span.style.reverse)
+}
+
 fn load_preview(app: &mut App) {
     let Some(p) = app.current_pane() else { return };
     let pane_id = p.pane_id.clone();
@@ -336,7 +353,7 @@ fn load_preview(app: &mut App) {
     let content = capture_pane(&pane_id, lines).unwrap_or_else(|err| format!("error: {err}"));
     app.preview_for = pane_id.to_string();
     app.preview_applied_gen = app.preview_gen;
-    app.preview_lines = parse_ansi_lines(content.trim_end_matches('\n'));
+    app.preview_lines = preview_lines(&content);
 }
 
 fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) {
@@ -1639,6 +1656,21 @@ fn nearest_pane(items: &[TreeItem], from: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_keeps_erase_painted_rows_and_drops_empty_trailing_ones() {
+        let painted = "\x1b[48;2;10;10;10mab    \n      \n\x1b[0m\n      \n";
+        let lines = preview_lines(painted);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].width(), 6);
+        assert!(lines[1].spans.iter().all(|s| s.style.bg.is_some()));
+    }
+
+    #[test]
+    fn preview_drops_blank_rows_with_the_default_background() {
+        assert_eq!(preview_lines("one\ntwo\n    \n    \n").len(), 2);
+        assert!(preview_lines("   \n   ").is_empty());
+    }
 
     fn pane(id: &str, order: usize) -> Pane {
         Pane {

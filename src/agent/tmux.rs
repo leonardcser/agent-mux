@@ -217,6 +217,9 @@ pub fn capture_pane(pane_id: &PaneId, lines: usize) -> Result<String> {
         .arg("-t")
         .arg(pane_id.as_str())
         .arg("-e")
+        // Keep trailing cells: a TUI that fills its background by erasing would otherwise lose it
+        // after the last printed character of every row.
+        .arg("-N")
         .arg("-p")
         .arg("-S")
         .arg(format!("-{lines}"))
