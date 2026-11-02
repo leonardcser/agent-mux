@@ -130,6 +130,13 @@ pub struct UiState {
 pub struct UiPaneState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stashed: bool,
+    // Bind parking to one busy period, so it cannot carry into the next task.
+    #[serde(
+        rename = "parkedBusySince",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub parked_busy_since: Option<DateTime<Utc>>,
     #[serde(rename = "forcedUnread", default, skip_serializing_if = "is_false")]
     pub forced_unread: bool,
     #[serde(
@@ -188,6 +195,9 @@ pub fn apply_ui_state(panes: &mut [Pane], ui_state: &UiState) {
 
 pub fn apply_pane_ui_state(pane: &mut Pane, ui: &UiPaneState) {
     pane.stashed = ui.stashed;
+    pane.parked_busy_since = ui
+        .parked_busy_since
+        .filter(|since| pane.status == PaneStatus::Busy && pane.status_changed_at == Some(*since));
     pane.status = display_status(
         pane.status,
         &pane.content_hash,
@@ -214,7 +224,10 @@ pub fn display_status(
 }
 
 pub fn ui_pane_state_is_empty(ui: &UiPaneState) -> bool {
-    !ui.stashed && !ui.forced_unread && ui.read_content_hash.is_none()
+    !ui.stashed
+        && ui.parked_busy_since.is_none()
+        && !ui.forced_unread
+        && ui.read_content_hash.is_none()
 }
 
 pub fn update_snapshot(

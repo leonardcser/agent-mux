@@ -45,6 +45,7 @@ pub enum StartupSelection {
 pub enum WorkingSection {
     #[default]
     Section,
+    Manual,
     Inline,
     #[serde(rename = "inline-last")]
     InlineLast,
@@ -118,6 +119,7 @@ mod tests {
     fn section_settings_are_independent() {
         for (working, expected_working) in [
             ("section", WorkingSection::Section),
+            ("manual", WorkingSection::Manual),
             ("inline", WorkingSection::Inline),
             ("inline-last", WorkingSection::InlineLast),
         ] {

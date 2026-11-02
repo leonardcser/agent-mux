@@ -86,6 +86,7 @@ pub struct Pane {
     pub last_active: Option<DateTime<Utc>>,
     pub status_changed_at: Option<DateTime<Utc>>,
     pub stashed: bool,
+    pub parked_busy_since: Option<DateTime<Utc>>,
     pub order: usize,
     pub provider: String,
 }
@@ -118,6 +119,7 @@ impl Pane {
             last_active: None,
             status_changed_at: None,
             stashed: false,
+            parked_busy_since: None,
             order: 0,
             provider: String::new(),
         }

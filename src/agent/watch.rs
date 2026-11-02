@@ -232,27 +232,20 @@ fn publish_snapshot(
 }
 
 fn prune_ui_state(panes: &[Pane]) -> Result<()> {
-    let pane_state: std::collections::HashMap<&str, (&str, bool)> = panes
+    let pane_state: std::collections::HashMap<&str, &Pane> = panes
         .iter()
-        .flat_map(|p| {
-            [
-                (
-                    p.pane_id.as_str(),
-                    (p.content_hash.as_str(), p.window_active),
-                ),
-                (
-                    p.target.as_str(),
-                    (p.content_hash.as_str(), p.window_active),
-                ),
-            ]
-        })
+        .flat_map(|p| [(p.pane_id.as_str(), p), (p.target.as_str(), p)])
         .collect();
     update_ui_state_if_changed(|state| {
         for (id, ui) in &mut state.panes {
-            let Some((content_hash, focused)) = pane_state.get(id.as_str()) else {
+            let Some(pane) = pane_state.get(id.as_str()) else {
                 continue;
             };
-            update_pane_read_state(ui, content_hash, *focused);
+            ui.parked_busy_since = ui.parked_busy_since.filter(|since| {
+                pane.status == crate::agent::PaneStatus::Busy
+                    && pane.status_changed_at == Some(*since)
+            });
+            update_pane_read_state(ui, &pane.content_hash, pane.window_active);
         }
         state
             .panes

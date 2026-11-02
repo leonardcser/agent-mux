@@ -61,6 +61,7 @@ Reload with `tmux source-file ~/.tmux.conf`, then use `prefix + j`.
 | `gg` / `G`                | First/last session                 |
 | `Enter`                   | Open session                       |
 | `s` / `u`                 | Stash/unstash                      |
+| `Ctrl+Enter` / `w`        | Park/unpark in manual mode         |
 | `a`                       | Add window in selected project     |
 | `space` / `A`             | Toggle read/unread / mark all read |
 | `dd`                      | Kill session                       |
@@ -98,13 +99,21 @@ new_window_command = "" # shell | smelt | opencode | codex | claude
 [sidebar]
 sort = "recent"              # recent | creation; unset: saved choice
 select = "unread"            # unread | last | first
-working = "section"          # inline | inline-last | section
+working = "section"          # section | manual | inline | inline-last
 working_section = "collapse" # collapse | expand
 stashed_section = "collapse" # collapse | expand
 ```
 
-`working` keeps busy sessions inline, puts them last within each project
-(`inline-last`), or moves them to a dedicated section (`section`, default).
+`working` modes:
+
+- `section` (default): move busy sessions into Working automatically.
+- `manual`: Ctrl+Enter or `w` parks/unparks busy, non-stashed sessions.
+  Parking survives reopening and ends when work finishes.
+- `inline`: keep busy sessions in place.
+- `inline-last`: put busy sessions last within each project.
+
+Use `w` if your terminal/tmux cannot distinguish Ctrl+Enter from Enter.
+
 `working_section` and `stashed_section` control section behavior: `collapse`
 opens on focus; `expand` keeps the section open. Stashed sessions stay separate.
 Reopen agent-mux to apply changes.

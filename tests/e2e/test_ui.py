@@ -104,6 +104,58 @@ def test_inline_last_keeps_busy_session_below_idle(mux, repo):
     )
 
 
+@pytest.mark.parametrize("key", ["w", "\x1b[13;5u"], ids=["w", "ctrl-enter"])
+def test_manual_working_parking_returns_after_completion(mux, repo, key):
+    mux.config.write_text(
+        '[sidebar]\nworking = "manual"\nsort = "creation"\nselect = "last"\n'
+    )
+    _, busy_pid = mux.add_agent("busy", cwd=repo)
+    _, idle_pid = mux.add_agent("idle", cwd=repo)
+    mux.write_statuses(
+        [{"pid": busy_pid, "state": "busy"}, {"pid": idle_pid, "state": "idle"}]
+    )
+    pane = mux.launch()
+    mux.wait_screen(pane, lambda frame: "preview-busy" in frame, "select busy agent")
+    assert "working (" not in mux.screen(pane)
+    mux.send(pane, "-l", key)
+    mux.wait_screen(
+        pane,
+        lambda frame: "working (1)" in frame and "preview-idle" in frame,
+        "park busy agent and select next agent",
+    )
+    mux.send(pane, "q")
+    wait_for(
+        lambda: (
+            pane not in mux.tmux("list-panes", "-a", "-F", "#{pane_id}").splitlines()
+        ),
+        "close sidebar",
+    )
+    pane = mux.launch()
+    mux.wait_screen(pane, lambda frame: "working (1)" in frame, "restore parking")
+    mux.send(pane, "j")
+    mux.wait_screen(pane, lambda frame: "preview-busy" in frame, "select parked agent")
+    mux.send(pane, "-l", key)
+    mux.wait_screen(pane, lambda frame: "working (" not in frame, "unpark early")
+    mux.send(pane, "-l", key)
+    mux.wait_screen(pane, lambda frame: "working (1)" in frame, "park again")
+    mux.write_statuses(
+        [{"pid": busy_pid, "state": "idle"}, {"pid": idle_pid, "state": "idle"}]
+    )
+    mux.wait_screen(
+        pane, lambda frame: "working (" not in frame, "return finished agent"
+    )
+    sidebar = "\n".join(line.split("│", 1)[0] for line in mux.screen(pane).splitlines())
+    assert sidebar.index("busy") < sidebar.index("idle")
+    mux.write_statuses(
+        [{"pid": busy_pid, "state": "busy"}, {"pid": idle_pid, "state": "idle"}]
+    )
+    wait_for(
+        lambda: any(p.get("lastStatus") == 1 for p in mux.snapshot()["panes"]),
+        "detect new busy period",
+    )
+    assert "working (" not in mux.screen(pane)
+
+
 def test_config_error_stays_visible_scrolls_and_quits(mux):
     mux.tmux("set-option", "-g", "remain-on-exit", "on")
     mux.config.write_text("[sidebar]\nworking = 'automatic'\n")

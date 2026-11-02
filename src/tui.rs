@@ -901,7 +901,9 @@ impl App {
         if pane.stashed {
             Some(Section::Stashed)
         } else if pane.status == PaneStatus::Busy
-            && self.sidebar_config.working == WorkingSection::Section
+            && (self.sidebar_config.working == WorkingSection::Section
+                || (self.sidebar_config.working == WorkingSection::Manual
+                    && pane.parked_busy_since.is_some()))
         {
             Some(Section::Working)
         } else {
@@ -987,11 +989,42 @@ impl App {
         }
     }
 
+    fn toggle_current_parking(&mut self) -> Action {
+        if self.sidebar_config.working != WorkingSection::Manual {
+            return Action::None;
+        }
+        let previous_cursor = self.cursor;
+        let Some(pane) = self.current_pane_mut() else {
+            return Action::None;
+        };
+        if pane.stashed || pane.status != PaneStatus::Busy {
+            return Action::None;
+        }
+        let parked = pane.parked_busy_since.is_none();
+        if parked && pane.status_changed_at.is_none() {
+            return Action::None;
+        }
+        pane.parked_busy_since = if parked { pane.status_changed_at } else { None };
+        let id = pane.pane_id.to_string();
+        self.rebuild_items();
+        self.cursor = if parked {
+            nearest_pane(&self.items, previous_cursor)
+        } else {
+            self.find_pane_by_id(&id)
+                .unwrap_or_else(|| nearest_pane(&self.items, previous_cursor))
+        };
+        self.select_cursor(self.cursor, false);
+        self.preview_gen += 1;
+        self.save_state();
+        Action::Redraw
+    }
+
     fn toggle_current_stash(&mut self) -> Option<bool> {
         let previous_cursor = self.cursor;
         let (pane_id, stashed) = {
             let pane = self.current_pane_mut()?;
             pane.stashed = !pane.stashed;
+            pane.parked_busy_since = None;
             (pane.pane_id.to_string(), pane.stashed)
         };
         if !stashed {
@@ -1230,6 +1263,8 @@ impl App {
                 self.preview_gen += 1;
                 Action::Redraw
             }
+            KeyCode::Enter if ctrl => self.toggle_current_parking(),
+            KeyCode::Char('w') => self.toggle_current_parking(),
             KeyCode::Enter => self.open_current_pane(),
             _ => Action::None,
         }
@@ -1336,6 +1371,7 @@ impl App {
         for p in self.panes.values() {
             let entry = state.panes.entry(p.pane_id.to_string()).or_default();
             entry.stashed = p.stashed;
+            entry.parked_busy_since = p.parked_busy_since;
             if let Some(unread) = self.pending_unread_changes.get(p.pane_id.as_str()) {
                 entry.forced_unread = *unread;
                 entry.read_content_hash = (!*unread).then(|| p.content_hash.clone());
@@ -1783,6 +1819,7 @@ fn render_help(slice: &mut GridSlice<'_>) {
         ("a", "add window in project"),
         ("A", "mark all read"),
         ("s/u", "stash/unstash"),
+        ("C-ret/w", "park/unpark (manual mode)"),
         ("dd", "kill pane"),
         ("gg", "go to first"),
         ("M-<", "go to first"),
@@ -2764,6 +2801,56 @@ mod tests {
             ));
             assert_eq!(app.current_pane().unwrap().pane_id.as_str(), id);
         }
+    }
+
+    #[test]
+    fn manual_parking_ignores_idle_stashed_and_other_modes() {
+        use PaneStatus::{Busy, Idle, Unread};
+        use WorkingSection::{Inline, InlineLast, Manual, Section};
+        for (mode, status, stashed) in [
+            (Manual, Idle, false),
+            (Manual, Unread, false),
+            (Manual, Busy, true),
+            (Section, Busy, false),
+            (Inline, Busy, false),
+            (InlineLast, Busy, false),
+        ] {
+            let mut p = pane_at("%1", 0, "/repo", 100);
+            p.status = status;
+            p.stashed = stashed;
+            let mut app = app_with_panes(vec![p]);
+            app.sidebar_config.working = mode;
+            assert!(matches!(app.toggle_current_parking(), Action::None));
+            assert!(app.panes["%1"].parked_busy_since.is_none());
+        }
+    }
+
+    #[test]
+    fn parking_only_session_keeps_it_accessible() {
+        let mut p = pane_at("%1", 0, "/repo", 100);
+        p.status = PaneStatus::Busy;
+        let mut app = app_with_panes(vec![p]);
+        app.sidebar_config.working = WorkingSection::Manual;
+        assert!(matches!(app.toggle_current_parking(), Action::Redraw));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        assert_eq!(app.pane_section(&app.panes["%1"]), Some(Section::Working));
+        assert!(matches!(app.toggle_current_parking(), Action::Redraw));
+        assert_eq!(app.pane_section(&app.panes["%1"]), None);
+    }
+
+    #[test]
+    fn saved_parking_expires_even_if_completion_snapshot_was_missed() {
+        let mut p = pane_at("%1", 0, "/repo", 100);
+        p.status = PaneStatus::Busy;
+        let mut app = app_with_panes(vec![p.clone()]);
+        app.sidebar_config.working = WorkingSection::Manual;
+        app.toggle_current_parking();
+        let state = app.ui_state.clone();
+        crate::agent::persist::apply_pane_ui_state(&mut p, &state.panes["%1"]);
+        assert!(p.parked_busy_since.is_some());
+        p.status_changed_at = Some(p.status_changed_at.unwrap() + chrono::Duration::seconds(1));
+        crate::agent::persist::apply_pane_ui_state(&mut p, &state.panes["%1"]);
+        assert!(p.parked_busy_since.is_none());
     }
 
     #[test]
