@@ -198,13 +198,17 @@ fn ready_build(expected: &str) -> Option<BuildInfo> {
 
 fn validate(executable: &Path, expected: &str) -> Result<()> {
     let (output, child_output) = UnixStream::pair()?;
+    let timeout = Duration::from_secs(3);
+    // Darwin rejects socket options after the peer closes. Configure this before
+    // spawning; it also bounds reads when a descendant inherits stdout.
+    output.set_read_timeout(Some(timeout))?;
     let mut child = Command::new(executable)
         .arg("--daemon-info")
         .stdin(Stdio::null())
         .stdout(Stdio::from(OwnedFd::from(child_output)))
         .stderr(Stdio::null())
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -219,12 +223,6 @@ fn validate(executable: &Path, expected: &str) -> Result<()> {
     if !status.success() {
         bail!("replacement validation exited with {status}");
     }
-    // A socket timeout also bounds reads if a descendant inherits stdout.
-    output.set_read_timeout(Some(
-        deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_millis(1)),
-    ))?;
     let mut bytes = Vec::new();
     output
         .take(4096)
