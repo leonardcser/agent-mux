@@ -48,12 +48,15 @@ Reload with `tmux source-file ~/.tmux.conf`, then use `prefix + j`.
 | `gg` / `G`                | First/last session                 |
 | `Enter`                   | Open session                       |
 | `s` / `u`                 | Stash/unstash                      |
-| `space` / `a`             | Toggle read/unread / mark all read |
+| `a`                       | Add window in selected project     |
+| `space` / `A`             | Toggle read/unread / mark all read |
 | `dd`                      | Kill session                       |
 | `o`                       | Toggle recent/creation order       |
 | `H` / `L` or drag divider | Resize sidebar                     |
 | `?`                       | Full key help                      |
 | `q` / `Esc`               | Quit                               |
+
+New windows open at the end of the selected agent's tmux session.
 
 ### Sidebar
 
@@ -74,12 +77,16 @@ opening them marks them read.
 Optional file: `~/.config/agent-mux/config.toml` (or
 `$XDG_CONFIG_HOME/agent-mux/config.toml` if set).
 
+Defaults:
+
 ```toml
+new_window_command = "" # shell | smelt | opencode | codex | claude
+
 [sidebar]
-# sort = "recent"    # "recent" | "creation"; unset: saved choice or "recent"
-select = "unread"    # "unread" | "last" | "first"
-working = "collapse" # "collapse" | "expand" | "inline"
-stashed = "collapse" # "collapse" | "expand"
+sort = "recent"      # recent | creation; unset: saved choice
+select = "unread"    # unread | last | first
+working = "collapse" # collapse | expand | inline
+stashed = "collapse" # collapse | expand
 ```
 
 Set `working = "inline"` to keep busy sessions in the normal list, without a

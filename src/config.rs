@@ -9,6 +9,7 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub sidebar: SidebarConfig,
+    pub new_window_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -102,6 +103,15 @@ mod tests {
         let config: Config = toml::from_str("[sidebar]\nworking = 'expand'").unwrap();
         assert_eq!(config.sidebar.working, WorkingSection::Expand);
         assert_eq!(config.sidebar.stashed, SectionBehavior::Collapse);
+    }
+
+    #[test]
+    fn new_window_command_is_optional() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.new_window_command, None);
+        let config: Config = toml::from_str("new_window_command = 'smelt --resume'").unwrap();
+        assert_eq!(config.new_window_command.as_deref(), Some("smelt --resume"));
+        assert!(toml::from_str::<Config>("new_window_command = false").is_err());
     }
 
     #[test]

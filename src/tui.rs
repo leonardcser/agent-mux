@@ -98,6 +98,7 @@ pub fn run(tmux_session: String) -> Result<()> {
     let mut surface = Surface::new(w, h);
 
     let mut app = App::new(tmux_session, config.sidebar);
+    app.new_window_command = config.new_window_command;
     app.resize(w, h);
     run_loop(&mut surface, term.writer(), &mut app).map_err(Into::into)
 }
@@ -463,6 +464,7 @@ struct App {
     sort_mode: SortMode,
     expanded_section: Option<Section>,
     sidebar_config: SidebarConfig,
+    new_window_command: Option<String>,
     count: usize,
     err: Option<String>,
     daemon_err: Option<String>,
@@ -521,6 +523,7 @@ impl App {
             sort_mode: SortMode::default(),
             expanded_section: None,
             sidebar_config,
+            new_window_command: None,
             count: 0,
             err: snapshot.is_none().then(|| SYNCING_MSG.to_string()),
             daemon_err: None,
@@ -1034,6 +1037,21 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('a') => {
+                let Some(pane) = self.current_pane() else {
+                    return Action::None;
+                };
+                match crate::agent::tmux::new_window(pane, self.new_window_command.as_deref()) {
+                    Ok(()) => {
+                        self.save_state();
+                        Action::Quit
+                    }
+                    Err(err) => {
+                        self.err = Some(format!("{err:#}"));
+                        Action::Redraw
+                    }
+                }
+            }
+            KeyCode::Char('A') => {
                 let mut changed = Vec::new();
                 for p in self.panes.values_mut() {
                     if p.status == PaneStatus::Unread {
@@ -1151,7 +1169,7 @@ impl App {
         if let Some(p) = self.current_pane() {
             let pane_id = p.pane_id.clone();
             // Opening a pane reads it, even if it was force-marked unread,
-            // consistent with Space/`a`, which clear a manual Unread too.
+            // consistent with Space/`A`, which clear a manual Unread too.
             if p.status == PaneStatus::Unread {
                 self.pending_unread_changes
                     .insert(pane_id.to_string(), false);
@@ -1675,7 +1693,8 @@ fn render_help(slice: &mut GridSlice<'_>) {
         ("[n]j/k", "move down/up n times"),
         ("enter", "switch to pane"),
         ("space", "toggle read/unread"),
-        ("a", "mark all read"),
+        ("a", "add window in project"),
+        ("A", "mark all read"),
         ("s/u", "stash/unstash"),
         ("dd", "kill pane"),
         ("gg", "go to first"),
@@ -1886,6 +1905,7 @@ mod tests {
             sort_mode: SortMode::default(),
             expanded_section: None,
             sidebar_config: SidebarConfig::default(),
+            new_window_command: None,
             count: 0,
             err: None,
             daemon_err: None,
@@ -1897,6 +1917,17 @@ mod tests {
         };
         app.focus_startup_session();
         app
+    }
+
+    #[test]
+    fn add_without_selected_session_does_nothing() {
+        let mut app = app_with_panes(Vec::new());
+        let (tx, _rx) = mpsc::channel();
+        assert!(matches!(
+            app.handle_key(KeyEvent::from(KeyCode::Char('a')), &tx),
+            Action::None
+        ));
+        assert!(app.err.is_none());
     }
 
     #[test]
@@ -2765,7 +2796,7 @@ mod tests {
         app.panes.get_mut("%1").unwrap().status = PaneStatus::Unread;
         app.panes.get_mut("%2").unwrap().status = PaneStatus::Busy;
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT), &tx);
 
         assert_eq!(app.panes["%1"].status, PaneStatus::Idle);
         assert_eq!(app.panes["%2"].status, PaneStatus::Busy);

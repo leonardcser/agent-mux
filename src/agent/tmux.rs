@@ -233,6 +233,35 @@ pub fn switch_to_pane(pane_id: &PaneId) -> Result<()> {
     run_tmux(["switch-client", "-t", pane_id.as_str()])
 }
 
+pub fn new_window(pane: &Pane, command: Option<&str>) -> Result<()> {
+    let target = format!("={}:$", pane.session);
+    let mut cmd = Command::new("tmux");
+    cmd.args([
+        "new-window",
+        "-a",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        &target,
+        "-c",
+        &pane.path,
+    ]);
+    if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
+        cmd.arg(command);
+    }
+    let output = cmd.output().context("tmux new-window")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "tmux new-window: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let pane_id = PaneId::parse(String::from_utf8_lossy(&output.stdout).trim())
+        .context("tmux new-window returned invalid pane ID")?;
+    switch_to_pane(&pane_id)
+}
+
 pub fn kill_pane(pane_id: &PaneId) -> Result<()> {
     run_tmux(["kill-pane", "-t", pane_id.as_str()])
 }
