@@ -22,8 +22,7 @@ Or, from a local checkout:
 cargo install --path . --locked
 ```
 
-Rerun the same command to upgrade. Open TUIs pick up validated updates
-automatically; otherwise, updates take effect on the next launch.
+Rerun the same command to upgrade.
 
 ## Use
 
@@ -33,16 +32,7 @@ Run inside tmux:
 agent-mux
 ```
 
-Use Up/Down to preview a session. Click or press Enter to open it. Background
-monitoring starts and recovers automatically. Watcher errors appear alongside
-the session list; agent sessions and saved UI state are preserved.
-
-The read-only preview updates when the selected pane produces output, with a
-60 FPS ceiling and no idle capture polling. It does not resize or control the
-source pane. Startup shows cached sessions immediately, then updates their
-status silently without changing the selected session if it still exists.
-When no cached sessions exist, a loading message appears only if the first
-status check takes longer than 200 ms.
+Use Up/Down to preview a session, then click or press Enter to open it.
 
 Optional shortcut in `~/.tmux.conf`:
 
@@ -56,7 +46,7 @@ Reload with `tmux source-file ~/.tmux.conf`, then use `prefix + j`.
 
 | Key                       | Action                             |
 | ------------------------- | ---------------------------------- |
-| `j` / `k` or Up/Down       | Move down/up                       |
+| `j` / `k` or Up/Down      | Move down/up                       |
 | `h` / Left                | Collapse current section           |
 | `gg` / `G`                | First/last session                 |
 | `Enter`                   | Open session                       |
@@ -70,24 +60,11 @@ Reload with `tmux source-file ~/.tmux.conf`, then use `prefix + j`.
 | `?`                       | Full key help                      |
 | `q` / `Esc`               | Quit                               |
 
-New windows use the project's main checkout and append to the selected agent's tmux session.
-
 ### Sidebar
 
-Sessions are grouped by project, with the latest state changes first.
-
-- **Working**: busy agents, returned to the main list when finished.
-- **Stashed**: sessions set aside with `s`, including busy ones.
-
-Sections expand when entered and collapse when left. Click a section title to
-expand and select its first session, or collapse it. A section stays open if
-there is no other session to select, or it is configured to stay expanded.
-Startup selects an unread, non-stashed session, then falls back to your last
-selection or the first session. Finished, unfocused sessions become unread;
-opening them marks them read.
-
-smelt's `waiting` counts as busy. Completed sessions keep a `✓` after being read;
-new work clears it.
+Sessions are grouped by project. Busy sessions appear under **Working**;
+use `s` to move sessions to **Stashed**. Click a section title to expand or
+collapse it. Sessions that finish in the background become unread until opened.
 
 ## Configuration
 
@@ -109,16 +86,11 @@ stashed_section = "collapse" # collapse | expand
 
 `working` modes:
 
-- `section` (default): move busy sessions into Working automatically.
-- `manual`: Ctrl+Enter or `w` parks/unparks busy, non-stashed sessions.
-  Parking survives reopening and ends when work finishes.
+- `section`: move busy sessions to Working automatically.
+- `manual`: use Ctrl+Enter or `w` to park busy sessions in Working.
 - `inline`: keep busy sessions in place.
-- `inline-last`: put busy sessions last within each project.
+- `inline-last`: show busy sessions last in each project.
 
-Use `w` if your terminal/tmux cannot distinguish Ctrl+Enter from Enter.
-
-`working_section` and `stashed_section` control section behavior: `collapse`
-opens on focus; `expand` keeps the section open. Stashed sessions stay separate.
 Reopen agent-mux to apply changes.
 
 ## Development
