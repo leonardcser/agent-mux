@@ -1704,7 +1704,9 @@ fn render_pane_row(
             PaneStatus::Idle => Color::DarkGrey,
         }
     };
-    let icon = if matches!(p.status, PaneStatus::Idle) {
+    let icon = if p.completed {
+        '✓'
+    } else if matches!(p.status, PaneStatus::Idle) {
         '○'
     } else {
         '●'
@@ -2601,6 +2603,26 @@ mod tests {
             Action::None
         ));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+    }
+
+    #[test]
+    fn completed_rows_keep_checkmark_when_read() {
+        for status in [PaneStatus::Unread, PaneStatus::Idle] {
+            let mut completed = pane("%1", 0);
+            completed.status = status;
+            completed.completed = true;
+            let app = app_with_panes(vec![completed]);
+            let mut grid = smelt_term::grid::Grid::new(40, 1);
+            render_pane_row(
+                &mut grid.slice_mut(Rect::new(0, 0, 40, 1)),
+                0,
+                40,
+                &app.panes["%1"],
+                false,
+                &app,
+            );
+            assert_eq!(grid.cell(3, 0).symbol.as_str(), "✓");
+        }
     }
 
     #[test]

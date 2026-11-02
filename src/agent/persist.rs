@@ -70,6 +70,8 @@ pub struct CachedPane {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub completed: bool,
     #[serde(
         rename = "lastActive",
         default,
@@ -394,6 +396,7 @@ pub fn cache_panes(panes: &[Pane]) -> Vec<CachedPane> {
             order: p.order,
             provider: p.provider.clone(),
             window_active: p.window_active,
+            completed: p.completed,
             last_active: p.last_active,
             status_changed_at: p.status_changed_at,
             ..CachedPane::default()
@@ -430,6 +433,7 @@ fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
                 window_active: cp.window_active,
                 content_hash: cp.content_hash.clone(),
                 status: cp.last_status.map(PaneStatus::from_i32).unwrap_or_default(),
+                completed: cp.completed,
                 last_active: cp.last_active,
                 status_changed_at: cp.status_changed_at.or(cp.last_active),
                 ..Pane::new(pane_id)

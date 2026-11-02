@@ -5,15 +5,23 @@ use serde::Deserialize;
 
 use crate::agent::Pane;
 
-use super::ProviderAdapter;
+use super::{ObservedActivity, ProviderAdapter};
 
 pub(super) struct SmeltAdapter;
 
 impl ProviderAdapter for SmeltAdapter {
-    fn observed_activity(&self, _panes: &[Pane]) -> HashMap<u32, bool> {
+    fn observed_activity(&self, _panes: &[Pane]) -> HashMap<u32, ObservedActivity> {
         smelt_statuses()
             .into_iter()
-            .map(|(pid, status)| (pid, status.state.is_busy()))
+            .map(|(pid, status)| {
+                (
+                    pid,
+                    ObservedActivity {
+                        busy: status.state.is_busy(),
+                        completed: matches!(status.state, SmeltState::Completed),
+                    },
+                )
+            })
             .collect()
     }
 }
@@ -30,13 +38,15 @@ struct SmeltStatus {
 #[serde(rename_all = "snake_case")]
 enum SmeltState {
     Busy,
+    Waiting,
+    Completed,
     #[serde(other)]
     Inactive,
 }
 
 impl SmeltState {
     fn is_busy(self) -> bool {
-        matches!(self, Self::Busy)
+        matches!(self, Self::Busy | Self::Waiting)
     }
 }
 
@@ -67,14 +77,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_busy_state_is_active() {
+    fn busy_and_waiting_states_are_active() {
         assert!(SmeltState::Busy.is_busy());
+        assert!(SmeltState::Waiting.is_busy());
+        assert!(!SmeltState::Completed.is_busy());
         assert!(!SmeltState::Inactive.is_busy());
     }
 
     #[test]
-    fn all_non_busy_provider_states_are_inactive() {
-        for state in ["idle", "needs_attention", "future_state"] {
+    fn inactive_provider_states_are_not_busy() {
+        for state in ["idle", "needs_attention", "completed", "future_state"] {
             let json = format!(r#"{{"pid":1,"state":"{state}"}}"#);
             let status: SmeltStatus = serde_json::from_str(&json).unwrap();
             assert!(!status.state.is_busy());

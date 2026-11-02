@@ -11,12 +11,17 @@ const BUSY_UNCHANGED_POLLS: usize = 3;
 // churn until the content settles, capped so a genuinely busy pane recovers.
 const RESIZE_SETTLE_POLLS: usize = 5;
 
-fn activity_status(previous: PaneStatus, busy: bool, focused: bool) -> PaneStatus {
+fn activity_status(
+    previous: PaneStatus,
+    busy: bool,
+    focused: bool,
+    newly_completed: bool,
+) -> PaneStatus {
     if busy {
         PaneStatus::Busy
     } else if focused {
         PaneStatus::Idle
-    } else if matches!(previous, PaneStatus::Busy | PaneStatus::Unread) {
+    } else if newly_completed || matches!(previous, PaneStatus::Busy | PaneStatus::Unread) {
         PaneStatus::Unread
     } else {
         PaneStatus::Idle
@@ -28,6 +33,7 @@ pub struct Reconciler {
     prev_content: HashMap<String, String>,
     unchanged_count: HashMap<String, usize>,
     prev_statuses: HashMap<String, PaneStatus>,
+    prev_completed: HashMap<String, bool>,
     prev_window_active: HashMap<String, bool>,
     prev_dimensions: HashMap<String, (u16, u16)>,
     resize_settling: HashMap<String, usize>,
@@ -51,6 +57,7 @@ impl Reconciler {
                 self.prev_statuses
                     .insert(id.clone(), PaneStatus::from_i32(s));
             }
+            self.prev_completed.insert(id.clone(), cp.completed);
             self.prev_window_active.insert(id.clone(), cp.window_active);
             if let Some(t) = cp.last_active {
                 self.last_active.insert(id.clone(), t);
@@ -106,7 +113,10 @@ impl Reconciler {
                     self.unchanged_count.insert(id.clone(), 0);
                 }
                 p.last_active = self.last_active.get(&id).copied();
-                p.status = activity_status(prev_status, observed_busy, p.window_active);
+                let newly_completed =
+                    p.completed && !self.prev_completed.get(&id).copied().unwrap_or(false);
+                p.status =
+                    activity_status(prev_status, observed_busy, p.window_active, newly_completed);
                 self.track_pane(p, now);
                 continue;
             }
@@ -128,7 +138,7 @@ impl Reconciler {
             {
                 PaneStatus::Busy
             } else {
-                activity_status(prev_status, active_now, p.window_active)
+                activity_status(prev_status, active_now, p.window_active, false)
             };
 
             self.track_pane(p, now);
@@ -137,6 +147,7 @@ impl Reconciler {
         self.prev_content.retain(|k, _| alive.contains_key(k));
         self.unchanged_count.retain(|k, _| alive.contains_key(k));
         self.prev_statuses.retain(|k, _| alive.contains_key(k));
+        self.prev_completed.retain(|k, _| alive.contains_key(k));
         self.prev_window_active.retain(|k, _| alive.contains_key(k));
         self.prev_dimensions.retain(|k, _| alive.contains_key(k));
         self.resize_settling.retain(|k, _| alive.contains_key(k));
@@ -147,7 +158,9 @@ impl Reconciler {
     fn track_pane(&mut self, p: &mut Pane, now: DateTime<Utc>) {
         let id = p.pane_id.to_string();
         let changed_at = self.status_changed_at.entry(id.clone()).or_insert(now);
-        if self.prev_statuses.get(&id) != Some(&p.status) {
+        if self.prev_statuses.get(&id) != Some(&p.status)
+            || self.prev_completed.get(&id) != Some(&p.completed)
+        {
             *changed_at = now;
         }
         p.status_changed_at = Some(*changed_at);
@@ -155,6 +168,7 @@ impl Reconciler {
             self.prev_content.insert(id.clone(), p.content_hash.clone());
         }
         self.prev_statuses.insert(id.clone(), p.status);
+        self.prev_completed.insert(id.clone(), p.completed);
         self.prev_window_active.insert(id.clone(), p.window_active);
         self.prev_dimensions.insert(id, (p.width, p.height));
     }
@@ -171,6 +185,7 @@ impl Reconciler {
             if let Some(active) = self.prev_window_active.get(&id) {
                 cp.window_active = *active;
             }
+            cp.completed = self.prev_completed.get(&id).copied().unwrap_or(false);
             cp.status_changed_at = self.status_changed_at.get(&id).copied();
             if let Some(t) = self.last_active.get(&id) {
                 cp.last_active = Some(*t);
@@ -254,6 +269,35 @@ mod tests {
         restarted.reconcile(&mut panes);
         assert!(panes[0].status_changed_at.unwrap() > started);
         assert_eq!(panes[0].status, PaneStatus::Unread);
+    }
+
+    #[test]
+    fn completion_stays_distinct_from_read_state() {
+        let mut reconciler = Reconciler::new();
+        let mut panes = vec![pane_with_observed("same", false, false)];
+        panes[0].completed = true;
+        reconciler.reconcile(&mut panes);
+        assert_eq!(panes[0].status, PaneStatus::Unread);
+        panes[0].window_active = true;
+        reconciler.reconcile(&mut panes);
+        assert_eq!(panes[0].status, PaneStatus::Idle);
+        assert!(panes[0].completed);
+        let mut cached = crate::agent::persist::cache_panes(&panes);
+        reconciler.apply_to_cache(&mut cached);
+        let snapshot = Snapshot {
+            panes: cached,
+            ..Default::default()
+        };
+        let restored = crate::agent::persist::panes_from_snapshot(&snapshot);
+        assert!(restored[0].completed);
+        panes[0].window_active = false;
+        reconciler.reconcile(&mut panes);
+        assert_eq!(panes[0].status, PaneStatus::Idle);
+        panes[0].completed = false;
+        panes[0].observed_busy = Some(true);
+        reconciler.reconcile(&mut panes);
+        assert_eq!(panes[0].status, PaneStatus::Busy);
+        assert!(!panes[0].completed);
     }
 
     #[test]

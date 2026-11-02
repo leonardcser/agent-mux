@@ -8,8 +8,14 @@ use crate::agent::Pane;
 use self::default::DEFAULT_ADAPTER;
 use self::smelt::SMELT_ADAPTER;
 
+#[derive(Clone, Copy)]
+struct ObservedActivity {
+    busy: bool,
+    completed: bool,
+}
+
 trait ProviderAdapter: Sync {
-    fn observed_activity(&self, _panes: &[Pane]) -> HashMap<u32, bool> {
+    fn observed_activity(&self, _panes: &[Pane]) -> HashMap<u32, ObservedActivity> {
         HashMap::new()
     }
 }
@@ -31,8 +37,9 @@ pub fn apply_provider_activity(panes: &mut [Pane]) {
             if pane.provider_pid <= 0 {
                 continue;
             }
-            if let Some(busy) = activity.get(&(pane.provider_pid as u32)) {
-                pane.observed_busy = Some(*busy);
+            if let Some(observed) = activity.get(&(pane.provider_pid as u32)) {
+                pane.observed_busy = Some(observed.busy);
+                pane.completed = observed.completed;
             }
         }
     }

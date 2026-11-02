@@ -86,6 +86,9 @@ Startup selects an unread, non-stashed session, then falls back to your last
 selection or the first session. Finished, unfocused sessions become unread;
 opening them marks them read.
 
+smelt's `waiting` counts as busy. Completed sessions keep a `✓` after being read;
+new work clears it.
+
 ## Configuration
 
 Optional file: `~/.config/agent-mux/config.toml` (or
