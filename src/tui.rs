@@ -89,18 +89,88 @@ enum Msg {
 }
 
 pub fn run(tmux_session: String) -> Result<()> {
-    let config = Config::load()?;
+    let config = Config::load();
     let mut term = TerminalSession::builder()
         .buffer_capacity(128 * 1024)
         .focus_events(true)
         .enter_stdout()?;
     let (w, h) = term.size()?;
     let mut surface = Surface::new(w, h);
+    let config = match config {
+        Ok(config) => config,
+        Err(err) => {
+            return run_config_error(&mut surface, term.writer(), &format!("{err:#}"))
+                .map_err(Into::into);
+        }
+    };
 
     let mut app = App::new(tmux_session, config.sidebar);
     app.new_window_command = config.new_window_command;
     app.resize(w, h);
     run_loop(&mut surface, term.writer(), &mut app).map_err(Into::into)
+}
+
+fn run_config_error<W: Write>(
+    surface: &mut Surface,
+    writer: &mut W,
+    error: &str,
+) -> io::Result<()> {
+    surface.set_layout(LayoutTree::leaf(PREVIEW));
+    let mut scroll = 0usize;
+    loop {
+        surface.render(writer, |_, slice, _| {
+            render_config_error(slice, error, &mut scroll);
+        })?;
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
+                }
+                KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                _ => {}
+            },
+            Event::Resize(width, height) => surface.set_terminal_size(width, height),
+            _ => {}
+        }
+    }
+}
+
+fn config_error_lines(error: &str, width: u16) -> Vec<String> {
+    let mut lines = Vec::new();
+    for mut remaining in error.lines() {
+        if remaining.is_empty() {
+            lines.push(String::new());
+        }
+        while !remaining.is_empty() {
+            let line = smelt_term::grid::truncate_width(remaining, width.max(2));
+            remaining = &remaining[line.len()..];
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn render_config_error(slice: &mut GridSlice<'_>, error: &str, scroll: &mut usize) {
+    let lines = config_error_lines(error, slice.width().saturating_sub(4));
+    let height = slice.height().saturating_sub(6) as usize;
+    *scroll = (*scroll).min(lines.len().saturating_sub(height));
+    slice.put_str(
+        2,
+        1,
+        "Configuration error",
+        Style::new().fg(Color::Red).bold(),
+    );
+    for (row, line) in lines.iter().skip(*scroll).take(height).enumerate() {
+        slice.put_str(2, row as u16 + 3, line, Style::new().fg(Color::White));
+    }
+    slice.put_str(
+        2,
+        slice.height().saturating_sub(2),
+        "q / Esc: quit    j / k: scroll",
+        Style::new().fg(Color::DarkGrey),
+    );
 }
 
 fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> io::Result<()> {
@@ -1917,6 +1987,43 @@ mod tests {
         };
         app.focus_startup_session();
         app
+    }
+
+    #[test]
+    fn config_error_wrap_preserves_diagnostic_and_unicode() {
+        let lines = config_error_lines("path/配置.toml\n\nunknown option", 8);
+        assert!(lines.iter().all(|line| display_width(line) <= 8));
+        assert!(lines.iter().any(String::is_empty));
+        assert_eq!(lines.concat(), "path/配置.tomlunknown option");
+        assert_eq!(config_error_lines("配置", 0), vec!["配", "置"]);
+    }
+
+    #[test]
+    fn config_error_scroll_is_clamped_after_resize() {
+        let error = "first\nsecond\nthird\nfourth";
+        let mut scroll = usize::MAX;
+        let mut grid = smelt_term::grid::Grid::new(50, 8);
+        render_config_error(
+            &mut grid.slice_mut(Rect::new(0, 0, 50, 8)),
+            error,
+            &mut scroll,
+        );
+        assert_eq!(scroll, 2);
+        let mut grid = smelt_term::grid::Grid::new(80, 24);
+        render_config_error(
+            &mut grid.slice_mut(Rect::new(0, 0, 80, 24)),
+            error,
+            &mut scroll,
+        );
+        assert_eq!(scroll, 0);
+        for size in [0, 1, 2] {
+            let mut grid = smelt_term::grid::Grid::new(size, size);
+            render_config_error(
+                &mut grid.slice_mut(Rect::new(0, 0, size, size)),
+                error,
+                &mut scroll,
+            );
+        }
     }
 
     #[test]

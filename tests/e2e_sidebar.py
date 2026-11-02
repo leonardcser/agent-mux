@@ -581,19 +581,24 @@ int main(int argc, char **argv) {
                 "restore expanded sections for click-to-open check",
             )
 
+            send("q")
             config_path.write_text("[sidebar]\nworking = 'automatic'\n")
-            invalid = subprocess.run(
-                [str(binary)],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
+            sidebar = open_sidebar()
+            wait_for_screen(
+                lambda frame: (
+                    "Configuration error" in frame
+                    and str(config_path) in frame
+                    and "automatic" in frame
+                ),
+                "invalid config remains visible in terminal",
             )
-            assert invalid.returncode != 0
-            assert str(config_path) in invalid.stderr
-            assert "working" in invalid.stderr
+            send("q")
             write_config("expand", "expand")
+            sidebar = open_sidebar()
+            wait_for_screen(
+                lambda frame: len(visible_sessions(frame)) == 3,
+                "reopen after fixing config",
+            )
 
             client = subprocess.Popen(
                 ["tmux", "-L", server, "-C", "attach-session", "-t", "test"],
