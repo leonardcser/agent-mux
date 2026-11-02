@@ -235,6 +235,11 @@ pub fn switch_to_pane(pane_id: &PaneId) -> Result<()> {
 
 pub fn new_window(pane: &Pane, command: Option<&str>) -> Result<()> {
     let target = format!("={}:$", pane.session);
+    let path = if pane.project_root.is_empty() {
+        &pane.path
+    } else {
+        &pane.project_root
+    };
     let mut cmd = Command::new("tmux");
     cmd.args([
         "new-window",
@@ -245,7 +250,7 @@ pub fn new_window(pane: &Pane, command: Option<&str>) -> Result<()> {
         "-t",
         &target,
         "-c",
-        &pane.path,
+        path,
     ]);
     if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
         cmd.arg(command);

@@ -56,7 +56,7 @@ Reload with `tmux source-file ~/.tmux.conf`, then use `prefix + j`.
 | `?`                       | Full key help                      |
 | `q` / `Esc`               | Quit                               |
 
-New windows open at the end of the selected agent's tmux session.
+New windows use the project's main checkout and append to the selected agent's tmux session.
 
 ### Sidebar
 

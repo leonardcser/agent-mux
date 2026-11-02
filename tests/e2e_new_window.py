@@ -113,7 +113,26 @@ def main():
 
             config.write_text('new_window_command = "   "\n')
             add_window()
-            print("PASS: add key, default shell, configured command, cwd, session, append with gaps")
+            run("git", "init", str(project))
+            run("git", "-C", str(project), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                "commit", "--allow-empty", "-m", "Initial commit")
+            worktree = root / "worktree with spaces"
+            run("git", "-C", str(project), "worktree", "add", "-b", "feature", str(worktree))
+            tmux("respawn-pane", "-k", "-t", "agents:agent-fixture", "-c", str(worktree), str(provider))
+            wait_for(
+                lambda: any(
+                    pane.get("path") == str(worktree) and pane.get("projectRoot") == str(project)
+                    for pane in read_json(root / "state/snapshot.json").get("panes", [])
+                ),
+                "discover worktree project group",
+            )
+            add_window()
+            marker.unlink()
+            config.write_text('new_window_command = """' + command + '"""\n')
+            add_window()
+            wait_for(marker.exists, "run configured command from worktree group")
+            assert marker.read_text().strip() == str(project)
+            print("PASS: add key, default shell, configured command, project/worktree cwd, session, append with gaps")
         finally:
             for process in (client, watcher):
                 if process is not None:
