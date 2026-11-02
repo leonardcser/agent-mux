@@ -62,6 +62,30 @@ def test_sidebar_navigation_stash_restore_and_click(mux):
     )
 
 
+def test_inline_last_keeps_busy_session_below_idle(mux, repo):
+    mux.config.write_text(
+        '[sidebar]\nworking = "inline-last"\nsort = "creation"\nselect = "first"\n'
+    )
+    _, busy_pid = mux.add_agent("busy", cwd=repo)
+    _, idle_pid = mux.add_agent("idle", cwd=repo)
+    mux.write_statuses(
+        [{"pid": busy_pid, "state": "busy"}, {"pid": idle_pid, "state": "idle"}]
+    )
+    pane = mux.launch()
+    mux.wait_screen(
+        pane,
+        lambda frame: "preview-idle" in frame,
+        "select idle session before busy session",
+    )
+    sidebar = "\n".join(line.split("│", 1)[0] for line in mux.screen(pane).splitlines())
+    assert "working (" not in sidebar
+    assert sidebar.index("idle") < sidebar.index("busy")
+    mux.send(pane, "j")
+    mux.wait_screen(
+        pane, lambda frame: "preview-busy" in frame, "navigate to busy session"
+    )
+
+
 def test_config_error_stays_visible_scrolls_and_quits(mux):
     mux.tmux("set-option", "-g", "remain-on-exit", "on")
     mux.config.write_text("[sidebar]\nworking = 'automatic'\n")

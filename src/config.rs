@@ -16,7 +16,8 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct SidebarConfig {
     pub working: WorkingSection,
-    pub stashed: SectionBehavior,
+    pub working_section: SectionBehavior,
+    pub stashed_section: SectionBehavior,
     pub sort: Option<SortMode>,
     pub select: StartupSelection,
 }
@@ -43,9 +44,10 @@ pub enum StartupSelection {
 #[serde(rename_all = "lowercase")]
 pub enum WorkingSection {
     #[default]
-    Collapse,
-    Expand,
+    Section,
     Inline,
+    #[serde(rename = "inline-last")]
+    InlineLast,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -93,16 +95,14 @@ mod tests {
 
     #[test]
     fn omitted_settings_keep_sections_collapsible() {
-        for source in ["", "[sidebar]", "[sidebar]\nworking = 'collapse'"] {
+        for source in ["", "[sidebar]", "[sidebar]\nworking = 'section'"] {
             let config: Config = toml::from_str(source).unwrap();
-            assert_eq!(config.sidebar.working, WorkingSection::Collapse);
-            assert_eq!(config.sidebar.stashed, SectionBehavior::Collapse);
+            assert_eq!(config.sidebar.working, WorkingSection::Section);
+            assert_eq!(config.sidebar.working_section, SectionBehavior::Collapse);
+            assert_eq!(config.sidebar.stashed_section, SectionBehavior::Collapse);
             assert_eq!(config.sidebar.sort, None);
             assert_eq!(config.sidebar.select, StartupSelection::Unread);
         }
-        let config: Config = toml::from_str("[sidebar]\nworking = 'expand'").unwrap();
-        assert_eq!(config.sidebar.working, WorkingSection::Expand);
-        assert_eq!(config.sidebar.stashed, SectionBehavior::Collapse);
     }
 
     #[test]
@@ -116,21 +116,18 @@ mod tests {
 
     #[test]
     fn section_settings_are_independent() {
-        let behaviors = [
-            ("collapse", SectionBehavior::Collapse),
-            ("expand", SectionBehavior::Expand),
-        ];
         for (working, expected_working) in [
-            ("collapse", WorkingSection::Collapse),
-            ("expand", WorkingSection::Expand),
+            ("section", WorkingSection::Section),
             ("inline", WorkingSection::Inline),
+            ("inline-last", WorkingSection::InlineLast),
         ] {
-            for (stashed, expected_stashed) in behaviors {
-                let source = format!("[sidebar]\nworking = '{working}'\nstashed = '{stashed}'");
-                let config: Config = toml::from_str(&source).unwrap();
-                assert_eq!(config.sidebar.working, expected_working);
-                assert_eq!(config.sidebar.stashed, expected_stashed);
-            }
+            let source = format!(
+                "[sidebar]\nworking = '{working}'\nworking_section = 'expand'\nstashed_section = 'collapse'"
+            );
+            let config: Config = toml::from_str(&source).unwrap();
+            assert_eq!(config.sidebar.working, expected_working);
+            assert_eq!(config.sidebar.working_section, SectionBehavior::Expand);
+            assert_eq!(config.sidebar.stashed_section, SectionBehavior::Collapse);
         }
     }
 
@@ -158,7 +155,12 @@ mod tests {
             "[sidebar]\nworkng = 'collapse'",
             "[sidebar]\nworking = true",
             "[sidebar]\nworking = 'automatic'",
-            "[sidebar]\nstashed = 'inline'",
+            "[sidebar]\nworking = 'collapse'",
+            "[sidebar]\nworking = 'expand'",
+            "[sidebar]\nstashed = 'collapse'",
+            "[sidebar]\nstashed_section = 'inline'",
+            "[sidebar]\nworking_section = 'inline'",
+            "[sidebar]\nworking_section = false",
             "[sidebar]\nsort = 'manual'",
             "[sidebar]\nsort = true",
             "[sidebar]\nselect = 'attention'",
@@ -195,13 +197,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.toml");
         let config = Config::load_from(&path).unwrap();
-        assert_eq!(config.sidebar.working, WorkingSection::Collapse);
-        assert_eq!(config.sidebar.stashed, SectionBehavior::Collapse);
+        assert_eq!(config.sidebar.working, WorkingSection::Section);
+        assert_eq!(config.sidebar.stashed_section, SectionBehavior::Collapse);
 
-        fs::write(&path, "[sidebar]\nworking = 'expand'").unwrap();
+        fs::write(&path, "[sidebar]\nworking = 'inline-last'").unwrap();
         assert_eq!(
             Config::load_from(&path).unwrap().sidebar.working,
-            WorkingSection::Expand
+            WorkingSection::InlineLast
         );
         fs::write(&path, "invalid = true").unwrap();
         assert!(

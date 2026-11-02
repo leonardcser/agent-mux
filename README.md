@@ -96,15 +96,18 @@ Defaults:
 new_window_command = "" # shell | smelt | opencode | codex | claude
 
 [sidebar]
-sort = "recent"      # recent | creation; unset: saved choice
-select = "unread"    # unread | last | first
-working = "collapse" # collapse | expand | inline
-stashed = "collapse" # collapse | expand
+sort = "recent"              # recent | creation; unset: saved choice
+select = "unread"            # unread | last | first
+working = "section"          # inline | inline-last | section
+working_section = "collapse" # collapse | expand
+stashed_section = "collapse" # collapse | expand
 ```
 
-Set `working = "inline"` to keep busy sessions in the normal list, without a
-Working section. Stashed sessions remain separate. Reopen agent-mux to apply
-changes.
+`working` keeps busy sessions inline, puts them last within each project
+(`inline-last`), or moves them to a dedicated section (`section`, default).
+`working_section` and `stashed_section` control section behavior: `collapse`
+opens on focus; `expand` keeps the section open. Stashed sessions stay separate.
+Reopen agent-mux to apply changes.
 
 ## Development
 

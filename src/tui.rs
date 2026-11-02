@@ -777,6 +777,11 @@ impl App {
                             .then(a.order.cmp(&b.order))
                     }),
                 }
+                if section.is_none() && self.sidebar_config.working == WorkingSection::InlineLast {
+                    group
+                        .panes
+                        .sort_by_key(|pane| pane.status == PaneStatus::Busy);
+                }
                 if matches!(&group.key, GroupKey::Project(_)) {
                     items.push(TreeItem::ProjectGroup(group.header_id));
                 } else {
@@ -896,7 +901,7 @@ impl App {
         if pane.stashed {
             Some(Section::Stashed)
         } else if pane.status == PaneStatus::Busy
-            && self.sidebar_config.working != WorkingSection::Inline
+            && self.sidebar_config.working == WorkingSection::Section
         {
             Some(Section::Working)
         } else {
@@ -906,8 +911,8 @@ impl App {
 
     fn section_is_always_expanded(&self, section: Section) -> bool {
         match section {
-            Section::Working => self.sidebar_config.working == WorkingSection::Expand,
-            Section::Stashed => self.sidebar_config.stashed == SectionBehavior::Expand,
+            Section::Working => self.sidebar_config.working_section == SectionBehavior::Expand,
+            Section::Stashed => self.sidebar_config.stashed_section == SectionBehavior::Expand,
         }
     }
 
@@ -2746,8 +2751,8 @@ mod tests {
         let mut stashed = pane("%3", 2);
         stashed.stashed = true;
         let mut app = app_with_panes(vec![pane("%1", 0), busy, stashed]);
-        app.sidebar_config.working = WorkingSection::Expand;
-        app.sidebar_config.stashed = SectionBehavior::Expand;
+        app.sidebar_config.working_section = SectionBehavior::Expand;
+        app.sidebar_config.stashed_section = SectionBehavior::Expand;
         app.focus_startup_session();
         for (section, id) in [(Section::Working, "%2"), (Section::Stashed, "%3")] {
             click_title(&mut app, section);
@@ -2779,6 +2784,52 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, TreeItem::SectionHeader(Section::Working, _)))
         );
+    }
+
+    #[test]
+    fn inline_last_preserves_sort_order_within_each_project() {
+        let panes = (0..6)
+            .map(|i| {
+                let root = if i < 4 { "/a" } else { "/b" };
+                let mut p = pane_at(&format!("%{i}"), i, root, i as i64);
+                p.project_root = root.to_string();
+                if i % 2 == 0 {
+                    p.status = PaneStatus::Busy;
+                }
+                p
+            })
+            .collect();
+        let mut app = app_with_panes(panes);
+        app.sidebar_config.working = WorkingSection::InlineLast;
+        for (sort, expected) in [
+            (SortMode::Order, ["%1", "%3", "%0", "%2", "%5", "%4"]),
+            (SortMode::Recent, ["%5", "%4", "%3", "%1", "%2", "%0"]),
+        ] {
+            app.sort_mode = sort;
+            app.rebuild_items();
+            assert_eq!(pane_ids(&app), expected);
+        }
+    }
+
+    #[test]
+    fn inline_last_preserves_selection_when_status_changes() {
+        let mut busy = pane("%1", 0);
+        busy.status = PaneStatus::Busy;
+        let idle = pane("%2", 1);
+        let mut app = app_with_panes(vec![busy.clone(), idle.clone()]);
+        app.sidebar_config.working = WorkingSection::InlineLast;
+        app.sort_mode = SortMode::Order;
+        app.rebuild_items();
+        app.cursor = app.find_pane_by_id("%1").unwrap();
+        assert_eq!(pane_ids(&app), ["%2", "%1"]);
+        busy.status = PaneStatus::Unread;
+        app.replace_panes(vec![busy.clone(), idle.clone()]);
+        assert_eq!(pane_ids(&app), ["%1", "%2"]);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        busy.status = PaneStatus::Busy;
+        app.replace_panes(vec![busy, idle]);
+        assert_eq!(pane_ids(&app), ["%2", "%1"]);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
     }
 
     #[test]
@@ -2833,7 +2884,7 @@ mod tests {
             deferred.status = PaneStatus::Unread;
             deferred.stashed = true;
             let mut app = app_with_panes(vec![pane_at("%1", 0, "/repo", 100), deferred]);
-            app.sidebar_config.stashed = behavior;
+            app.sidebar_config.stashed_section = behavior;
             app.focus_startup_session();
             assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
         }
@@ -2960,10 +3011,11 @@ mod tests {
 
     #[test]
     fn section_configuration_controls_visibility_without_selecting_headers() {
-        for working in [
-            WorkingSection::Collapse,
-            WorkingSection::Expand,
-            WorkingSection::Inline,
+        for (working, working_section) in [
+            (WorkingSection::Section, SectionBehavior::Collapse),
+            (WorkingSection::Section, SectionBehavior::Expand),
+            (WorkingSection::Inline, SectionBehavior::Collapse),
+            (WorkingSection::InlineLast, SectionBehavior::Collapse),
         ] {
             for stashed_behavior in [SectionBehavior::Collapse, SectionBehavior::Expand] {
                 let mut busy = pane("%2", 1);
@@ -2973,13 +3025,15 @@ mod tests {
                 let mut app = app_with_panes(vec![pane("%1", 0), busy, stashed]);
                 app.sidebar_config = SidebarConfig {
                     working,
-                    stashed: stashed_behavior,
+                    working_section,
+                    stashed_section: stashed_behavior,
                     ..SidebarConfig::default()
                 };
                 app.focus_startup_session();
                 assert_eq!(
                     app.find_pane_by_id("%2").is_some(),
-                    working != WorkingSection::Collapse
+                    working != WorkingSection::Section
+                        || working_section == SectionBehavior::Expand
                 );
                 assert_eq!(
                     app.find_pane_by_id("%3").is_some(),
@@ -2992,7 +3046,8 @@ mod tests {
                 }
                 assert_eq!(
                     app.find_pane_by_id("%2").is_some(),
-                    working != WorkingSection::Collapse
+                    working != WorkingSection::Section
+                        || working_section == SectionBehavior::Expand
                 );
                 assert_eq!(
                     app.find_pane_by_id("%3").is_some(),
@@ -3004,7 +3059,8 @@ mod tests {
                 }
                 assert_eq!(
                     app.find_pane_by_id("%2").is_some(),
-                    working != WorkingSection::Collapse
+                    working != WorkingSection::Section
+                        || working_section == SectionBehavior::Expand
                 );
                 assert_eq!(
                     app.find_pane_by_id("%3").is_some(),
