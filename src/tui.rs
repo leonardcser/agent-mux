@@ -36,7 +36,7 @@ const SIDEBAR: PaintId = PaintId(1);
 const PREVIEW: PaintId = PaintId(3);
 const MIN_SIDEBAR: u16 = 20;
 const MIN_PREVIEW: u16 = 20;
-const SYNCING_MSG: &str = "Refreshing session status";
+const LOADING_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug)]
 enum Hit {
@@ -193,8 +193,6 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
     let mut dirty = true;
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut last_panes = Instant::now() - Duration::from_millis(500);
-    let startup_deadline = Instant::now() + Duration::from_secs(2);
-    let mut startup_fresh = false;
     let mut last_subscribe = Instant::now() - Duration::from_secs(1);
     let mut panes_pending = false;
     let preview_tx = tx.clone();
@@ -237,7 +235,8 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                     live,
                 } => {
                     if live {
-                        startup_fresh = true;
+                        dirty |= app.loading_since.take().is_some();
+                        dirty |= app.err.take().is_some();
                         subscribed = true;
                         subscribe_pending = false;
                     } else {
@@ -245,11 +244,6 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                     }
                     if let Some(snapshot) = snapshot {
                         dirty |= app.apply_snapshot(snapshot, ui_state);
-                    }
-                    let err = (!startup_fresh).then(|| SYNCING_MSG.to_string());
-                    if app.err != err {
-                        app.err = err;
-                        dirty = true;
                     }
                 }
                 Msg::PreviewReady => {
@@ -323,11 +317,7 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
             last_subscribe = Instant::now();
         }
 
-        if !subscribed
-            && (startup_fresh || Instant::now() >= startup_deadline)
-            && last_panes.elapsed() >= Duration::from_millis(500)
-            && !panes_pending
-        {
+        if !subscribed && last_panes.elapsed() >= Duration::from_millis(500) && !panes_pending {
             spawn_load_panes(&tx);
             panes_pending = true;
             last_panes = Instant::now();
@@ -340,6 +330,9 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
             generation: app.preview_gen,
         }));
 
+        if let Some(since) = app.loading_since {
+            dirty |= last_draw < since + LOADING_DELAY && since.elapsed() >= LOADING_DELAY;
+        }
         if (dirty && last_draw.elapsed() >= FRAME_INTERVAL)
             || last_draw.elapsed() >= Duration::from_secs(1)
         {
@@ -541,6 +534,7 @@ struct App {
     count: usize,
     err: Option<String>,
     daemon_err: Option<String>,
+    loading_since: Option<Instant>,
     ui_state: UiState,
     pending_unread_changes: HashMap<String, bool>,
     pending_kills: HashMap<String, Pane>,
@@ -565,7 +559,7 @@ fn sidebar_split(width: u16) -> Split {
 
 impl App {
     fn new(tmux_session: String, sidebar_config: SidebarConfig) -> Self {
-        // Startup selection must use a completed status scan, not the cached layout.
+        let snapshot = load_snapshot();
         let ui_state = load_ui_state();
         let mut app = Self {
             panes: HashMap::new(),
@@ -588,8 +582,9 @@ impl App {
             sidebar_config,
             new_window_command: None,
             count: 0,
-            err: Some(SYNCING_MSG.to_string()),
+            err: None,
             daemon_err: None,
+            loading_since: Some(Instant::now()),
             ui_state,
             pending_unread_changes: HashMap::new(),
             pending_kills: HashMap::new(),
@@ -597,6 +592,9 @@ impl App {
             _tmux_session: tmux_session,
         };
         app.focus_startup_session();
+        if let Some(snapshot) = snapshot {
+            app.apply_snapshot(snapshot, app.ui_state.clone());
+        }
         app
     }
 
@@ -1244,13 +1242,17 @@ impl App {
         }
         if let Some(p) = self.current_pane() {
             let pane_id = p.pane_id.clone();
+            let unread = p.status == PaneStatus::Unread;
+            if let Err(err) = switch_to_pane(&pane_id) {
+                self.err = Some(format!("{err:#}"));
+                return Action::Redraw;
+            }
             // Opening a pane reads it, even if it was force-marked unread,
             // consistent with Space/`A`, which clear a manual Unread too.
-            if p.status == PaneStatus::Unread {
+            if unread {
                 self.pending_unread_changes
                     .insert(pane_id.to_string(), false);
             }
-            let _ = switch_to_pane(&pane_id);
         }
         self.save_state();
         Action::Quit
@@ -1385,11 +1387,8 @@ fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
     };
     let list_height = slice.height().saturating_sub(status_height);
     if let Some(err) = err {
-        let (message, style) = if err == SYNCING_MSG {
-            (err.clone(), Style::new().fg(Color::DarkGrey))
-        } else {
-            (format!("Error: {err}"), Style::new().fg(Color::Red))
-        };
+        let message = format!("Error: {err}");
+        let style = Style::new().fg(Color::Red);
         let mut remaining = message.as_str();
         for row in list_height..slice.height() {
             let line = smelt_term::grid::truncate_width(remaining, slice.width());
@@ -1401,13 +1400,8 @@ fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
         }
     }
     if app.items.is_empty() {
-        if list_height > 1 {
-            let label = if app.err.as_deref() == Some(SYNCING_MSG) {
-                "Loading sessions"
-            } else {
-                "No active sessions"
-            };
-            slice.put_str(2, 1, label, Style::new().fg(Color::DarkGrey));
+        if list_height > 1 && app.loading_since.is_none() {
+            slice.put_str(2, 1, "No active sessions", Style::new().fg(Color::DarkGrey));
         }
         return;
     }
@@ -1742,16 +1736,25 @@ fn render_preview(slice: &mut GridSlice<'_>, app: &App) {
 }
 
 fn render_empty_preview(slice: &mut GridSlice<'_>, app: &App) {
-    let title = if app.err.as_deref() == Some(SYNCING_MSG) {
-        "Looking for sessions"
-    } else if !app.panes.is_empty() {
+    if app.panes.is_empty()
+        && let Some(since) = app.loading_since
+    {
+        if since.elapsed() >= LOADING_DELAY {
+            slice.put_str(
+                2,
+                1,
+                "Loading sessions...",
+                Style::new().fg(Color::DarkGrey),
+            );
+        }
+        return;
+    }
+    let title = if !app.panes.is_empty() {
         "Select a session"
     } else {
         "No active sessions"
     };
-    let detail = if app.err.as_deref() == Some(SYNCING_MSG) {
-        "Checking current agent status before showing sessions."
-    } else if app.panes.is_empty() {
+    let detail = if app.panes.is_empty() {
         "Start a supported agent in tmux and it will appear here."
     } else {
         "Move into a section or press Enter to expand it."
@@ -1989,6 +1992,7 @@ mod tests {
             count: 0,
             err: None,
             daemon_err: None,
+            loading_since: None,
             ui_state: UiState::default(),
             pending_unread_changes: HashMap::new(),
             pending_kills: HashMap::new(),
@@ -2203,24 +2207,36 @@ mod tests {
     }
 
     #[test]
-    fn startup_loading_does_not_claim_no_sessions_or_show_error() {
+    fn empty_startup_delays_loading_until_needed() {
         let mut app = app_with_panes(Vec::new());
-        app.err = Some(SYNCING_MSG.into());
-        let mut grid = smelt_term::grid::Grid::new(100, 12);
-        render_sidebar(&mut grid.slice_mut(Rect::new(0, 0, 40, 12)), &mut app);
-        render_empty_preview(&mut grid.slice_mut(Rect::new(0, 40, 60, 12)), &app);
-        let text = (0..12)
-            .map(|row| {
-                (0..100)
-                    .map(|col| grid.cell(col, row).symbol.as_str())
-                    .collect::<String>()
-            })
-            .collect::<String>();
-        assert!(text.contains("Loading sessions"));
-        assert!(text.contains("Checking current agent status"));
-        assert!(!text.contains("No active sessions"));
-        assert!(!text.contains("Error:"));
-        assert!(!text.contains("Start a supported agent"));
+        for (loading_since, expected) in [
+            (Some(Instant::now() + Duration::from_secs(1)), ""),
+            (Some(Instant::now() - LOADING_DELAY), "Loading sessions..."),
+            (None, "No active sessions"),
+        ] {
+            app.loading_since = loading_since;
+            let mut grid = smelt_term::grid::Grid::new(100, 12);
+            render_sidebar(&mut grid.slice_mut(Rect::new(0, 0, 40, 12)), &mut app);
+            render_empty_preview(&mut grid.slice_mut(Rect::new(0, 40, 60, 12)), &app);
+            let text = (0..12)
+                .map(|row| {
+                    (0..100)
+                        .map(|col| grid.cell(col, row).symbol.as_str())
+                        .collect::<String>()
+                })
+                .collect::<String>();
+            if expected.is_empty() {
+                assert!(text.trim().is_empty());
+            } else {
+                assert!(text.contains(expected));
+            }
+            assert!(!text.contains("Error:"));
+            assert!(!text.contains("Refreshing"));
+            if loading_since.is_some() {
+                assert!(!text.contains("No active sessions"));
+                assert!(!text.contains("Start a supported agent"));
+            }
+        }
     }
 
     #[test]

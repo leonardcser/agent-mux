@@ -39,9 +39,10 @@ the session list; agent sessions and saved UI state are preserved.
 
 The read-only preview updates when the selected pane produces output, with a
 60 FPS ceiling and no idle capture polling. It does not resize or control the
-source pane. Startup checks current agent status before showing the list. If
-that check takes more than two seconds, the cached list appears with a refresh
-indicator while monitoring recovers.
+source pane. Startup shows cached sessions immediately, then updates their
+status silently without changing the selected session if it still exists.
+When no cached sessions exist, a loading message appears only if the first
+status check takes longer than 200 ms.
 
 Optional shortcut in `~/.tmux.conf`:
 

@@ -1,5 +1,4 @@
 import signal
-import time
 
 import pytest
 from harness import atomic_write, wait_for
@@ -84,51 +83,73 @@ def test_live_preview_updates_reconnects_and_resizes_without_focus(mux, source_p
     )
 
 
-@pytest.mark.slow
-def test_startup_waits_for_fresh_status_with_bounded_cached_fallback(mux, source_pane):
-    _, pid, _ = source_pane
-    watcher = mux.spawn(str(mux.binary), "watch")
-    mux.ready()
-    wait_for(lambda: len(mux.snapshot().get("panes", [])) == 1, "cached idle snapshot")
+@pytest.fixture
+def watcher(mux):
+    process = mux.spawn(str(mux.binary), "watch")
     try:
-        watcher.send_signal(signal.SIGSTOP)
-        mux.write_statuses([{"pid": pid, "state": "busy"}])
-        sidebar = mux.launch()
-        end = time.monotonic() + 0.3
-        while time.monotonic() < end:
-            frame = mux.screen(sidebar)
-            assert "source" not in frame or "working (1)" in frame, (
-                "startup exposed stale idle list"
-            )
-            time.sleep(0.01)
-        watcher.send_signal(signal.SIGCONT)
-        mux.wait_screen(
-            sidebar,
-            lambda frame: "working (1)" in frame,
-            "fresh startup reflects busy agent",
-        )
-        mux.wait_screen(
-            sidebar, lambda frame: "initial-preview" in frame, "fresh startup preview"
-        )
-        mux.send(sidebar, "q")
-        wait_for(lambda: not mux.tmux("list-clients"), "first preview observer exits")
-
-        watcher.send_signal(signal.SIGSTOP)
-        sidebar = mux.launch()
-        wait_for(
-            lambda: (
-                "source" in mux.screen(sidebar)
-                and "Refreshing session status" in mux.screen(sidebar)
-            ),
-            "bounded startup shows cached list while status is unavailable",
-            timeout=3.5,
-        )
-        watcher.send_signal(signal.SIGCONT)
-        mux.wait_screen(
-            sidebar,
-            lambda frame: "Refreshing session status" not in frame,
-            "fresh status replaces cached fallback",
-        )
+        mux.ready()
+        yield process
     finally:
-        if watcher.poll() is None:
-            watcher.send_signal(signal.SIGCONT)
+        if process.poll() is None:
+            process.send_signal(signal.SIGCONT)
+
+
+def test_empty_startup_loads_until_live_scan_confirms_no_sessions(mux, watcher):
+    watcher.send_signal(signal.SIGSTOP)
+    sidebar = mux.launch()
+    mux.wait_screen(
+        sidebar, lambda frame: "Loading sessions..." in frame, "delayed loading"
+    )
+    frame = mux.screen(sidebar)
+    assert frame.count("Loading sessions...") == 1
+    assert "No active sessions" not in frame
+    assert "Refreshing session status" not in frame
+    assert "Error:" not in frame
+
+    watcher.send_signal(signal.SIGCONT)
+    mux.wait_screen(
+        sidebar,
+        lambda frame: "No active sessions" in frame and "Loading sessions" not in frame,
+        "live empty scan ends loading",
+    )
+
+
+def test_startup_shows_cache_then_silently_refreshes(mux, source_pane, watcher):
+    source, pid, _ = source_pane
+    wait_for(lambda: len(mux.snapshot().get("panes", [])) == 1, "cached idle snapshot")
+    watcher.send_signal(signal.SIGSTOP)
+    mux.write_statuses([{"pid": pid, "state": "busy"}])
+    sidebar = mux.launch()
+    wait_for(
+        lambda: "initial-preview" in mux.screen(sidebar),
+        "cached session and live preview appear before fresh scan",
+        timeout=1,
+    )
+    frame = mux.screen(sidebar)
+    assert "source" in frame and "working (1)" not in frame
+    assert "Refreshing session status" not in frame
+    assert "Loading sessions" not in frame
+
+    watcher.send_signal(signal.SIGCONT)
+    mux.wait_screen(
+        sidebar,
+        lambda frame: "working (1)" in frame and "initial-preview" in frame,
+        "fresh status moves selected session into Working without losing preview",
+    )
+    assert "Refreshing session status" not in mux.screen(sidebar)
+
+    watcher.send_signal(signal.SIGSTOP)
+    mux.attach()
+    mux.tmux("kill-pane", "-t", source)
+    mux.send(sidebar, "Enter")
+    mux.wait_screen(
+        sidebar,
+        lambda frame: "Error:" in frame and "source" in frame,
+        "opening closed cached session keeps sidebar visible with error",
+    )
+    watcher.send_signal(signal.SIGCONT)
+    mux.wait_screen(
+        sidebar,
+        lambda frame: "No active sessions" in frame and "source" not in frame,
+        "fresh state removes closed cached session",
+    )
