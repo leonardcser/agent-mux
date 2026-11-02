@@ -48,7 +48,12 @@ def main():
                 time.sleep(1)
                 assert tmux("display-message", "-p", "-t", pane, "#{pane_dead}") == "0"
                 tmux("resize-window", "-t", pane, "-x", "50", "-y", "10")
-                wait_for(lambda: "j / k: scroll" in screen(), "resize error screen")
+                # The footer is also present before resize; wait for wrapped content.
+                first_line = "  " + f"parse config {config}"[:46]
+                wait_for(
+                    lambda: screen().splitlines()[2:3] == [first_line],
+                    "resize error screen",
+                )
                 first_page = screen()
                 tmux("send-keys", "-t", pane, "j")
                 wait_for(lambda: screen() != first_page, "scroll diagnostic down")
