@@ -1,6 +1,4 @@
-use std::fs::OpenOptions;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -245,64 +243,6 @@ fn run_tmux<const N: usize>(args: [&str; N]) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("tmux exited with {status}"))
-    }
-}
-
-pub fn start_watch() -> Result<()> {
-    if crate::agent::watch::is_running() {
-        for _ in 0..5 {
-            if crate::agent::ipc::get_state().is_ok_and(|(snapshot, _)| snapshot.is_some()) {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        stop_watch_process();
-        thread::sleep(Duration::from_millis(200));
-    }
-
-    std::fs::create_dir_all(crate::agent::persist::state_dir()).context("create state dir")?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(crate::agent::watch::log_path())
-        .context("open watch log")?;
-    let stderr = log.try_clone().context("clone watch log")?;
-
-    let exe = std::env::current_exe().context("current executable")?;
-    Command::new(exe)
-        .arg("watch")
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("start watch")?;
-
-    for _ in 0..10 {
-        if crate::agent::ipc::get_state().is_ok_and(|(snapshot, _)| snapshot.is_some()) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    Ok(())
-}
-
-pub fn restart_watch() -> Result<()> {
-    stop_watch_process();
-    thread::sleep(Duration::from_millis(200));
-    start_watch()
-}
-
-fn stop_watch_process() {
-    if let Ok(data) = std::fs::read_to_string(crate::agent::watch::lock_path())
-        && let Ok(pid) = data.trim().parse::<i32>()
-        && pid > 0
-    {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status();
     }
 }
 

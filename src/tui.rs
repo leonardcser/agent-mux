@@ -25,9 +25,7 @@ use crate::agent::persist::{
 };
 #[cfg(not(test))]
 use crate::agent::persist::{ui_pane_state_is_empty, update_ui_state};
-use crate::agent::{
-    Pane, PaneId, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane,
-};
+use crate::agent::{Pane, PaneId, PaneStatus, capture_pane, kill_pane, switch_to_pane};
 use crate::config::{Config, SectionBehavior, SidebarConfig, SortMode, StartupSelection};
 
 const SIDEBAR: PaintId = PaintId(1);
@@ -95,6 +93,7 @@ enum Msg {
         err: Option<String>,
     },
     SubscriptionEnded,
+    DaemonChecked(Option<String>),
 }
 
 pub fn run(tmux_session: String) -> Result<()> {
@@ -123,6 +122,21 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
     let mut subscribed = false;
     let mut subscribe_pending = true;
 
+    let mut daemon = crate::agent::daemon::Manager::new().map_err(io::Error::other)?;
+    let daemon_tx = tx.clone();
+    thread::spawn(move || {
+        loop {
+            let err = daemon
+                .ensure_running()
+                .and_then(|info| info.check_compatibility())
+                .err()
+                .map(|err| format!("{err:#}"));
+            if daemon_tx.send(Msg::DaemonChecked(err)).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(3));
+        }
+    });
     spawn_subscribe_panes(&tx);
     load_preview(app);
 
@@ -200,6 +214,12 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                     }
                     dirty = true;
                 }
+                Msg::DaemonChecked(err) => {
+                    if app.daemon_err != err {
+                        app.daemon_err = err;
+                        dirty = true;
+                    }
+                }
                 Msg::SubscriptionEnded => {
                     subscribed = false;
                     subscribe_pending = false;
@@ -261,13 +281,6 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                     preview_pending = spawn_preview(&tx, app);
                     dirty = true;
                 }
-                Action::LoadPanes => {
-                    if !panes_pending {
-                        spawn_load_panes(&tx);
-                        panes_pending = true;
-                    }
-                    dirty = true;
-                }
                 Action::None => {}
             }
         }
@@ -291,6 +304,7 @@ fn spawn_subscribe_panes(tx: &mpsc::Sender<Msg>) {
 }
 
 fn subscribe_panes(tx: &mpsc::Sender<Msg>) -> Result<()> {
+    ipc::check_compatibility()?;
     let mut stream = UnixStream::connect(ipc::socket_path())?;
     let request = serde_json::to_string(&ipc::Request::Subscribe)?;
     writeln!(stream, "{request}")?;
@@ -313,6 +327,7 @@ fn subscribe_panes(tx: &mpsc::Sender<Msg>) -> Result<()> {
                     live: true,
                 });
             }
+            _ => anyhow::bail!("unexpected subscription response"),
         }
     }
     Ok(())
@@ -411,7 +426,6 @@ enum Action {
     None,
     Redraw,
     Preview,
-    LoadPanes,
     Quit,
 }
 
@@ -459,6 +473,7 @@ struct App {
     sidebar_config: SidebarConfig,
     count: usize,
     err: Option<String>,
+    daemon_err: Option<String>,
     ui_state: UiState,
     pending_unread_changes: HashMap<String, bool>,
     pending_kills: HashMap<String, Pane>,
@@ -516,6 +531,7 @@ impl App {
             sidebar_config,
             count: 0,
             err: snapshot.is_none().then(|| SYNCING_MSG.to_string()),
+            daemon_err: None,
             ui_state,
             pending_unread_changes: HashMap::new(),
             pending_kills: HashMap::new(),
@@ -1020,10 +1036,6 @@ impl App {
                     Action::None
                 }
             }
-            KeyCode::Char('R') => {
-                let _ = restart_watch();
-                Action::LoadPanes
-            }
             KeyCode::Char('o') => {
                 let selected = self.current_pane().map(|p| p.pane_id.to_string());
                 self.sort_mode = self.sort_mode.toggled();
@@ -1234,7 +1246,7 @@ fn render<W: Write>(surface: &mut Surface, app: &mut App, out: &mut W) -> io::Re
 }
 
 fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
-    let err = app.err.as_ref();
+    let err = app.daemon_err.as_ref().or(app.err.as_ref());
     let status_height = if err.is_some() {
         slice.height().saturating_sub(1).min(3)
     } else {
@@ -1629,7 +1641,6 @@ fn render_help(slice: &mut GridSlice<'_>) {
         ("G", "go to last"),
         ("M->", "go to last"),
         ("o", "toggle sort order"),
-        ("R", "reload watch"),
         ("H/L", "resize sidebar"),
         ("drag", "resize sidebar"),
         ("?", "toggle help"),
@@ -1835,6 +1846,7 @@ mod tests {
             sidebar_config: SidebarConfig::default(),
             count: 0,
             err: None,
+            daemon_err: None,
             ui_state: UiState::default(),
             pending_unread_changes: HashMap::new(),
             pending_kills: HashMap::new(),
@@ -1855,6 +1867,30 @@ mod tests {
         ));
         assert!(!spawn_preview(&tx, &app));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn recovery_error_keeps_sessions_visible_above_bounded_status_area() {
+        let mut cached = pane("%1", 0);
+        cached.window_name = "cached".into();
+        let mut app = app_with_panes(vec![cached]);
+        app.daemon_err =
+            Some("validate installed executable: replacement validation timed out".into());
+        let mut grid = smelt_term::grid::Grid::new(25, 8);
+        render_sidebar(&mut grid.slice_mut(Rect::new(0, 0, 25, 8)), &mut app);
+        let text = |start, end| {
+            (start..end)
+                .map(|row| {
+                    (0..25)
+                        .map(|column| grid.cell(column, row).symbol.as_str())
+                        .collect::<String>()
+                })
+                .collect::<String>()
+        };
+        assert!(text(0, 5).contains("cached"));
+        assert!(!text(0, 5).contains("Error:"));
+        assert!(text(5, 8).starts_with("Error:"));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
     }
 
     #[test]

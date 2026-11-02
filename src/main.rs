@@ -8,12 +8,18 @@ static ALLOC: smelt_perf::alloc::Counting = smelt_perf::alloc::Counting;
 use anyhow::{Result, bail};
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--daemon-info"] {
+        agent::daemon::initialize()?;
+        println!("{}", serde_json::to_string(agent::daemon::build_info())?);
+        return Ok(());
+    }
     if std::env::var_os("TMUX").is_none() {
         bail!("agent-mux must be run inside tmux");
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "watch") {
+        agent::daemon::initialize()?;
         return agent::watch::run();
     }
     if args.iter().any(|arg| arg == "refresh") {
@@ -29,7 +35,6 @@ fn main() -> Result<()> {
 
     let tmux = std::env::var("TMUX").unwrap_or_default();
     let session_id = tmux.rsplit('/').next().unwrap_or(&tmux).to_string();
-    let _ = agent::start_watch();
     tui::run(session_id)
 }
 

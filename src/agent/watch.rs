@@ -51,14 +51,22 @@ pub fn run() -> Result<()> {
 
     let latest_snapshot = Arc::new(Mutex::new(None));
     let subscribers = Arc::new(Mutex::new(Vec::new()));
-    start_socket_server(latest_snapshot.clone(), subscribers.clone());
+    let last_refresh = Arc::new(Mutex::new(None));
+    start_socket_server(
+        latest_snapshot.clone(),
+        subscribers.clone(),
+        stopped.clone(),
+        last_refresh.clone(),
+    )?;
     start_metadata_worker(latest_snapshot.clone(), subscribers.clone());
 
     let fast_interval = Duration::from_millis(500);
     while !stopped.load(Ordering::SeqCst) {
         let start = Instant::now();
         match refresh_once_with(&mut reconciler, Some(&latest_snapshot), Some(&subscribers)) {
-            Ok(()) => {}
+            Ok(()) => {
+                *last_refresh.lock().unwrap() = Some(Instant::now());
+            }
             Err(err) => log_error(&format!("refresh failed: {err:#}")),
         }
 
@@ -299,32 +307,41 @@ fn apply_cached_metadata(panes: &mut [Pane], snapshot: &Snapshot) {
     }
 }
 
-fn start_socket_server(latest_snapshot: SharedSnapshot, subscribers: Subscribers) {
+fn start_socket_server(
+    latest_snapshot: SharedSnapshot,
+    subscribers: Subscribers,
+    stopped: Arc<AtomicBool>,
+    last_refresh: Arc<Mutex<Option<Instant>>>,
+) -> Result<()> {
+    let path = socket_path();
+    let _ = fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).context("bind daemon socket")?;
     std::thread::spawn(move || {
-        let path = socket_path();
-        let _ = fs::remove_file(&path);
-        let listener = match UnixListener::bind(&path) {
-            Ok(listener) => listener,
-            Err(err) => {
-                log_error(&format!("bind daemon socket failed: {err:#}"));
-                return;
-            }
-        };
-
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => handle_socket_client(stream, &latest_snapshot, &subscribers),
+                Ok(stream) => handle_socket_client(
+                    stream,
+                    &latest_snapshot,
+                    &subscribers,
+                    &stopped,
+                    &last_refresh,
+                ),
                 Err(err) => log_error(&format!("accept daemon socket failed: {err:#}")),
             }
         }
     });
+    Ok(())
 }
 
 fn handle_socket_client(
     mut stream: UnixStream,
     latest_snapshot: &SharedSnapshot,
     subscribers: &Subscribers,
+    stopped: &AtomicBool,
+    last_refresh: &Mutex<Option<Instant>>,
 ) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
     let mut line = String::new();
     let request = match stream.try_clone() {
         Ok(read_stream) => {
@@ -338,6 +355,22 @@ fn handle_socket_client(
     };
 
     match request {
+        Ok(Request::Status) => {
+            let healthy = last_refresh.lock().ok().is_some_and(|last| {
+                last.is_some_and(|time| time.elapsed() < Duration::from_secs(10))
+            });
+            write_response(
+                &mut stream,
+                Response::Status {
+                    build: crate::agent::daemon::build_info().clone(),
+                    healthy,
+                },
+            );
+        }
+        Ok(Request::Shutdown) => {
+            stopped.store(true, Ordering::SeqCst);
+            write_response(&mut stream, Response::Stopping);
+        }
         Ok(Request::GetState) => {
             write_response(&mut stream, state_response(latest_snapshot));
         }

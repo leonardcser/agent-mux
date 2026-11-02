@@ -343,7 +343,7 @@ fn lock_file(path: PathBuf) -> Result<File> {
     Ok(file)
 }
 
-fn write_json_file<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
+pub(super) fn write_json_file<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
     let parent = path
         .parent()
         .context("state file has no parent directory")?;
