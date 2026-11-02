@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -21,6 +22,9 @@ def main():
     samples = 0
     with tempfile.TemporaryDirectory(prefix="mux-e2e-") as directory:
         root = Path(directory).resolve()
+        source = binary
+        binary = root / "agent-mux"
+        shutil.copy2(source, binary)
         repo = root / "mux-fixture"
         repo.mkdir()
         run("git", "init", "--initial-branch=main", str(repo))
@@ -54,7 +58,11 @@ def main():
             str(provider),
             input="#include <unistd.h>\nint main(void) { sleep(120); return 0; }\n",
         )
-        env = dict(os.environ, AGENT_MUX_STATE_DIR=str(root / "state"))
+        env = dict(
+            os.environ,
+            AGENT_MUX_STATE_DIR=str(root / "state"),
+            XDG_CONFIG_HOME=str(root / "config"),
+        )
 
         def tmux(*args):
             return run("tmux", "-f", "/dev/null", "-L", server, *args)
@@ -89,6 +97,7 @@ def main():
                 "-c",
                 str(repo),
                 f"env AGENT_MUX_STATE_DIR={shlex.quote(env['AGENT_MUX_STATE_DIR'])} "
+                f"XDG_CONFIG_HOME={shlex.quote(env['XDG_CONFIG_HOME'])} "
                 f"{shlex.quote(str(binary))}",
             )
             snapshot_path = root / "state/snapshot.json"

@@ -32,6 +32,7 @@ pub struct Reconciler {
     prev_dimensions: HashMap<String, (u16, u16)>,
     resize_settling: HashMap<String, usize>,
     last_active: HashMap<String, DateTime<Utc>>,
+    status_changed_at: HashMap<String, DateTime<Utc>>,
 }
 
 impl Reconciler {
@@ -52,7 +53,10 @@ impl Reconciler {
             }
             self.prev_window_active.insert(id.clone(), cp.window_active);
             if let Some(t) = cp.last_active {
-                self.last_active.insert(id, t);
+                self.last_active.insert(id.clone(), t);
+            }
+            if let Some(t) = cp.status_changed_at.or(cp.last_active) {
+                self.status_changed_at.insert(id, t);
             }
         }
     }
@@ -103,7 +107,7 @@ impl Reconciler {
                 }
                 p.last_active = self.last_active.get(&id).copied();
                 p.status = activity_status(prev_status, observed_busy, p.window_active);
-                self.track_pane(p);
+                self.track_pane(p, now);
                 continue;
             }
 
@@ -127,7 +131,7 @@ impl Reconciler {
                 activity_status(prev_status, active_now, p.window_active)
             };
 
-            self.track_pane(p);
+            self.track_pane(p, now);
         }
 
         self.prev_content.retain(|k, _| alive.contains_key(k));
@@ -137,10 +141,16 @@ impl Reconciler {
         self.prev_dimensions.retain(|k, _| alive.contains_key(k));
         self.resize_settling.retain(|k, _| alive.contains_key(k));
         self.last_active.retain(|k, _| alive.contains_key(k));
+        self.status_changed_at.retain(|k, _| alive.contains_key(k));
     }
 
-    fn track_pane(&mut self, p: &Pane) {
+    fn track_pane(&mut self, p: &mut Pane, now: DateTime<Utc>) {
         let id = p.pane_id.to_string();
+        let changed_at = self.status_changed_at.entry(id.clone()).or_insert(now);
+        if self.prev_statuses.get(&id) != Some(&p.status) {
+            *changed_at = now;
+        }
+        p.status_changed_at = Some(*changed_at);
         if !p.content_hash.is_empty() {
             self.prev_content.insert(id.clone(), p.content_hash.clone());
         }
@@ -161,6 +171,7 @@ impl Reconciler {
             if let Some(active) = self.prev_window_active.get(&id) {
                 cp.window_active = *active;
             }
+            cp.status_changed_at = self.status_changed_at.get(&id).copied();
             if let Some(t) = self.last_active.get(&id) {
                 cp.last_active = Some(*t);
             }
@@ -212,6 +223,37 @@ mod tests {
             observed_busy: Some(busy),
             ..pane(content_hash, window_active)
         }
+    }
+
+    #[test]
+    fn state_change_time_ignores_output_and_survives_restart() {
+        let started = DateTime::from_timestamp(100, 0).unwrap();
+        let mut initial = snapshot(PaneStatus::Busy, "one", false);
+        initial.panes[0].status_changed_at = Some(started);
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&initial);
+        let mut panes = vec![pane_with_observed("one", false, true)];
+        reconciler.reconcile(&mut panes);
+        panes[0].content_hash = "two".into();
+        reconciler.reconcile(&mut panes);
+        assert_eq!(panes[0].status_changed_at, Some(started));
+
+        let mut cached = vec![CachedPane {
+            pane_id: "%1".into(),
+            ..Default::default()
+        }];
+        reconciler.apply_to_cache(&mut cached);
+        let mut restarted = Reconciler::new();
+        restarted.seed_from_snapshot(&Snapshot {
+            panes: cached,
+            ..Default::default()
+        });
+        restarted.reconcile(&mut panes);
+        assert_eq!(panes[0].status_changed_at, Some(started));
+        panes[0].observed_busy = Some(false);
+        restarted.reconcile(&mut panes);
+        assert!(panes[0].status_changed_at.unwrap() > started);
+        assert_eq!(panes[0].status, PaneStatus::Unread);
     }
 
     #[test]

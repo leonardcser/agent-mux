@@ -1,116 +1,91 @@
 # agent-mux
 
-A TUI for multiplexing AI coding agent sessions in tmux.
-
-Lists all active agent panes (Smelt, Claude Code, Open Code, Gemini CLI, Codex CLI,
-Kimi CLI) grouped by workspace, with a live preview panel showing each session's output.
-Select a session and press enter to jump to it.
+Browse AI coding agents in tmux, preview their output, and jump between
+sessions. Supports Smelt, Claude Code, Open Code, Gemini CLI, Codex CLI, and
+Kimi CLI.
 
 <p align="center">
   <img src="assets/demo.gif" alt="agent-mux demo" />
 </p>
 
-## Requirements
+## Install
 
-- Rust 1.88+
-- tmux (must be run inside a tmux session)
+Requires Rust 1.88+ and tmux. From this checkout:
 
-## Setup
-
-### Install
-
-```
+```sh
 cargo install --path .
 ```
 
-### Run from source
+Use the same command to upgrade. Open TUIs pick up validated updates
+automatically; otherwise, updates take effect on the next launch.
 
-```
-cargo run --release
-```
+## Use
 
-Run the watcher directly:
+Run inside tmux:
 
-```
-cargo run --release -- watch
-```
-
-### Configure tmux
-
-Add to your `~/.tmux.conf` to start the background watcher, keep its snapshot
-fresh on tmux topology changes, and set up a key binding. This assumes
-`agent-mux` resolves to the Rust binary in tmux's `PATH`.
-
-```tmux
-run-shell -b "agent-mux watch"
-bind j run-shell "tmux neww agent-mux"
-
-set-hook -g after-kill-pane 'run-shell -b "agent-mux refresh"'
-set-hook -g window-unlinked 'run-shell -b "agent-mux refresh"'
-set-hook -g session-closed 'run-shell -b "agent-mux refresh"'
-set-hook -g after-new-window 'run-shell -b "agent-mux refresh"'
-set-hook -g after-split-window 'run-shell -b "agent-mux refresh"'
-```
-
-The watcher owns the canonical pane snapshot used by the TUI. It polls session
-statuses every 500ms, while the hooks trigger an immediate refresh when panes,
-windows, or sessions are created or removed.
-
-Reload tmux: `tmux source-file ~/.tmux.conf`
-
-## Usage
-
-From inside tmux:
-
-```
+```sh
 agent-mux
 ```
 
-Or use the key binding: `prefix + j`
+Hover to preview a session. Click or press Enter to open it. Background
+monitoring starts and recovers automatically. Watcher errors appear alongside
+the session list; agent sessions and saved UI state are preserved.
+
+Optional shortcut in `~/.tmux.conf`:
+
+```tmux
+bind j new-window agent-mux
+```
+
+Reload with `tmux source-file ~/.tmux.conf`, then use `prefix + j`.
 
 ### Keys
 
-| Key              | Action               |
-| ---------------- | -------------------- |
-| `j` / `k`        | Navigate up/down     |
-| `Ctrl-n` / `Ctrl-p` | Navigate up/down  |
-| `[count]j` / `k` | Move N sessions      |
-| `gg` / `M-<`     | Go to first session  |
-| `G` / `M->`      | Go to last session   |
-| `space`          | Toggle read/unread   |
-| `a`              | Mark all read        |
-| `s` / `u`        | Stash/unstash        |
-| `enter`          | Switch to session    |
-| `dd`             | Kill session         |
-| `o`              | Toggle sort order    |
-| `R`              | Reload watch process |
-| `H` / `L`        | Resize sidebar       |
-| `?`              | Toggle help          |
-| `q` / `esc`      | Quit                 |
+| Key                       | Action                             |
+| ------------------------- | ---------------------------------- |
+| `j` / `k` or arrows       | Move down/up                       |
+| `gg` / `G`                | First/last session                 |
+| `Enter`                   | Open session                       |
+| `s` / `u`                 | Stash/unstash                      |
+| `space` / `a`             | Toggle read/unread / mark all read |
+| `dd`                      | Kill session                       |
+| `o`                       | Toggle recent/creation order       |
+| `H` / `L` or drag divider | Resize sidebar                     |
+| `?`                       | Full key help                      |
+| `q` / `Esc`               | Quit                               |
 
-The sidebar separator can also be dragged with the mouse.
+### Sidebar
 
-A session becomes unread when its agent finishes working while the session is not
-focused. Opening or focusing the session marks it read. Press `space` to toggle
-an idle session between read and unread, or `a` to mark every session read.
+Sessions are grouped by project, with the latest state changes first.
 
-Sessions are grouped by folder. Press `o` to switch between the default
-stable order and sorting by most recent change first - folders are ordered by
-their most recently active session, and sessions within each folder likewise.
-The choice is remembered across restarts.
+- **Working**: busy agents, returned to the main list when finished.
+- **Stashed**: sessions set aside with `s`, including busy ones.
 
-State is stored in `~/.local/state/agent-mux`. Set `AGENT_MUX_STATE_DIR` to use
-another directory without changing your home directory or Git configuration.
+Sections expand when entered and collapse when left. Startup selects an unread,
+non-stashed session, then falls back to your last selection or the first session.
+Finished, unfocused sessions become unread; opening them marks them read.
 
-## Testing
+## Configuration
 
-```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
-python3 tests/e2e_dirty_status.py
+Optional file: `~/.config/agent-mux/config.toml` (or
+`$XDG_CONFIG_HOME/agent-mux/config.toml` if set).
+
+```toml
+[sidebar]
+# sort = "recent"    # "recent" | "creation"; unset: saved choice or "recent"
+select = "unread"    # "unread" | "last" | "first"
+working = "collapse" # "collapse" | "expand"
+stashed = "collapse" # "collapse" | "expand"
 ```
 
-The E2E test uses an isolated tmux server and state directory. It checks Git
-status and rendered dirty markers through edits, restores, and concurrent hook
-refreshes, without starting an AI session or changing your running watcher.
+Reopen agent-mux to apply changes.
+
+## Development
+
+```sh
+cargo run --release
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+Build with `cargo build --release` before running the [E2E tests](tests/).

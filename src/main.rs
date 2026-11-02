@@ -1,4 +1,5 @@
 mod agent;
+mod config;
 mod tui;
 
 #[global_allocator]

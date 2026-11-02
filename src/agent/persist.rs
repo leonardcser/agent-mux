@@ -76,6 +76,12 @@ pub struct CachedPane {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_active: Option<DateTime<Utc>>,
+    #[serde(
+        rename = "statusChangedAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub status_changed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -106,8 +112,12 @@ pub struct UiState {
     pub version: i32,
     #[serde(default)]
     pub panes: std::collections::HashMap<String, UiPaneState>,
-    #[serde(rename = "lastPosition", default)]
-    pub last_position: LastPosition,
+    #[serde(
+        rename = "selectedPaneID",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub selected_pane_id: String,
     #[serde(rename = "sidebarWidth", default, skip_serializing_if = "is_zero_u16")]
     pub sidebar_width: u16,
     #[serde(rename = "sortMode", default, skip_serializing_if = "String::is_empty")]
@@ -128,22 +138,6 @@ pub struct UiPaneState {
         skip_serializing_if = "Option::is_none"
     )]
     pub read_content_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct LastPosition {
-    #[serde(rename = "pane_id", default, skip_serializing_if = "String::is_empty")]
-    pub pane_id: String,
-    #[serde(
-        rename = "pane_target",
-        default,
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub pane_target: String,
-    #[serde(default)]
-    pub cursor: usize,
-    #[serde(rename = "scroll_start", default)]
-    pub scroll_start: usize,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -317,7 +311,7 @@ pub fn update_ui_state_if_changed(mut f: impl FnMut(&mut UiState)) -> Result<boo
 }
 
 #[cfg(not(test))]
-pub fn update_ui_state(mut f: impl FnMut(&mut UiState)) -> Result<()> {
+pub fn update_ui_state(f: impl FnOnce(&mut UiState)) -> Result<UiState> {
     let lock_file = lock_file(ui_state_write_lock_path())?;
     let mut state = load_ui_state();
     f(&mut state);
@@ -325,7 +319,7 @@ pub fn update_ui_state(mut f: impl FnMut(&mut UiState)) -> Result<()> {
     state.updated_at = Some(Utc::now());
     write_json_file(ui_state_path(), &state)?;
     drop(lock_file);
-    Ok(())
+    Ok(state)
 }
 
 fn load_json_file<T: DeserializeOwned>(path: PathBuf) -> Option<T> {
@@ -388,6 +382,7 @@ pub fn cache_panes(panes: &[Pane]) -> Vec<CachedPane> {
             provider: p.provider.clone(),
             window_active: p.window_active,
             last_active: p.last_active,
+            status_changed_at: p.status_changed_at,
             ..CachedPane::default()
         })
         .collect()
@@ -423,6 +418,7 @@ fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
                 content_hash: cp.content_hash.clone(),
                 status: cp.last_status.map(PaneStatus::from_i32).unwrap_or_default(),
                 last_active: cp.last_active,
+                status_changed_at: cp.status_changed_at.or(cp.last_active),
                 ..Pane::new(pane_id)
             })
         })

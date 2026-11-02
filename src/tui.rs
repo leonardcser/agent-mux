@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -20,14 +20,15 @@ use smelt_term::{
 };
 
 use crate::agent::ipc;
-#[cfg(not(test))]
-use crate::agent::persist::{LastPosition, ui_pane_state_is_empty, update_ui_state};
 use crate::agent::persist::{
     Snapshot, UiState, apply_ui_state, load_snapshot, load_ui_state, panes_from_snapshot,
 };
+#[cfg(not(test))]
+use crate::agent::persist::{ui_pane_state_is_empty, update_ui_state};
 use crate::agent::{
     Pane, PaneId, PaneStatus, capture_pane, kill_pane, restart_watch, switch_to_pane,
 };
+use crate::config::{Config, SectionBehavior, SidebarConfig, SortMode, StartupSelection};
 
 const SIDEBAR: PaintId = PaintId(1);
 const PREVIEW: PaintId = PaintId(3);
@@ -37,13 +38,39 @@ const SYNCING_MSG: &str = "syncing agent-mux snapshot";
 
 #[derive(Clone, Debug)]
 enum Hit {
-    /// A clickable sidebar row, carrying its index into `items`.
-    Row(usize),
+    Pane(String),
+    Section(Section),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Working,
+    Stashed,
+}
+
+impl Section {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Stashed => "stashed",
+        }
+    }
+}
+
+fn pane_section(pane: &Pane) -> Option<Section> {
+    if pane.stashed {
+        Some(Section::Stashed)
+    } else if pane.status == PaneStatus::Busy {
+        Some(Section::Working)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
 enum TreeItem {
-    SectionHeader(Option<String>),
+    SectionSpacer,
+    SectionHeader(Section, usize),
     Workspace(String),
     ProjectGroup(String),
     Pane(String),
@@ -71,6 +98,7 @@ enum Msg {
 }
 
 pub fn run(tmux_session: String) -> Result<()> {
+    let config = Config::load()?;
     let mut term = TerminalSession::builder()
         .buffer_capacity(128 * 1024)
         .focus_events(true)
@@ -78,7 +106,7 @@ pub fn run(tmux_session: String) -> Result<()> {
     let (w, h) = term.size()?;
     let mut surface = Surface::new(w, h);
 
-    let mut app = App::new(tmux_session);
+    let mut app = App::new(tmux_session, config.sidebar);
     app.resize(w, h);
     run_loop(&mut surface, term.writer(), &mut app).map_err(Into::into)
 }
@@ -153,9 +181,11 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                     preview_seq,
                 } => {
                     preview_pending = false;
-                    if preview_seq >= app.preview_applied_gen {
-                        app.preview_applied_gen = preview_seq;
-                        app.preview_for = pane_id;
+                    if preview_seq == app.preview_gen
+                        && app
+                            .current_pane()
+                            .is_some_and(|pane| pane.pane_id.as_str() == pane_id)
+                    {
                         app.preview_lines = preview_lines(&content);
                         dirty = true;
                     }
@@ -189,10 +219,11 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
             last_panes = Instant::now();
         }
 
-        if last_preview.elapsed() >= Duration::from_millis(100) && !preview_pending {
-            app.preview_for.clear();
-            spawn_preview(&tx, app);
-            preview_pending = true;
+        if last_preview.elapsed() >= Duration::from_millis(100)
+            && !preview_pending
+            && app.current_pane().is_some()
+        {
+            preview_pending = spawn_preview(&tx, app);
             last_preview = Instant::now();
         }
 
@@ -206,42 +237,38 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
             .saturating_sub(last_draw.elapsed())
             .max(Duration::from_millis(1));
         if event::poll(poll_for)? {
-            match event::read()? {
+            let action = match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     dirty |= app.split_interaction.active_id().is_some();
-                    match app.handle_key(key, &tx) {
-                        Action::Quit => return Ok(()),
-                        Action::Redraw => dirty = true,
-                        Action::Preview => {
-                            spawn_preview(&tx, app);
-                            preview_pending = true;
-                            dirty = true;
-                        }
-                        Action::LoadPanes => {
-                            if !panes_pending {
-                                spawn_load_panes(&tx);
-                                panes_pending = true;
-                            }
-                            dirty = true;
-                        }
-                        Action::None => {}
-                    }
+                    app.handle_key(key, &tx)
                 }
-                Event::Mouse(mouse) => match app.handle_mouse(mouse) {
-                    Action::Quit => return Ok(()),
-                    Action::Redraw => dirty = true,
-                    _ => {}
-                },
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
                 Event::Resize(w, h) => {
                     surface.set_terminal_size(w, h);
                     app.resize(w, h);
-                    dirty = true;
+                    Action::Redraw
                 }
                 Event::FocusLost => {
                     app.cancel_resize();
+                    Action::Redraw
+                }
+                _ => Action::None,
+            };
+            match action {
+                Action::Quit => return Ok(()),
+                Action::Redraw => dirty = true,
+                Action::Preview => {
+                    preview_pending = spawn_preview(&tx, app);
                     dirty = true;
                 }
-                _ => {}
+                Action::LoadPanes => {
+                    if !panes_pending {
+                        spawn_load_panes(&tx);
+                        panes_pending = true;
+                    }
+                    dirty = true;
+                }
+                Action::None => {}
             }
         }
     }
@@ -258,10 +285,8 @@ fn load_pane_state() -> (Option<Snapshot>, UiState) {
 fn spawn_subscribe_panes(tx: &mpsc::Sender<Msg>) {
     let tx = tx.clone();
     thread::spawn(move || {
-        let result = subscribe_panes(&tx);
-        if result.is_err() {
-            let _ = tx.send(Msg::SubscriptionEnded);
-        }
+        let _ = subscribe_panes(&tx);
+        let _ = tx.send(Msg::SubscriptionEnded);
     });
 }
 
@@ -351,13 +376,13 @@ fn load_preview(app: &mut App) {
     let pane_id = p.pane_id.clone();
     let lines = app.height.max(50) as usize;
     let content = capture_pane(&pane_id, lines).unwrap_or_else(|err| format!("error: {err}"));
-    app.preview_for = pane_id.to_string();
-    app.preview_applied_gen = app.preview_gen;
     app.preview_lines = preview_lines(&content);
 }
 
-fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) {
-    let Some(p) = app.current_pane() else { return };
+fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) -> bool {
+    let Some(p) = app.current_pane() else {
+        return false;
+    };
     let pane_id = p.pane_id.clone();
     let lines = app.height.max(50) as usize;
     let preview_seq = app.preview_gen;
@@ -370,6 +395,7 @@ fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) {
             preview_seq,
         });
     });
+    true
 }
 
 fn ui_state_is_older_than(incoming: &UiState, current: &UiState) -> bool {
@@ -389,17 +415,6 @@ enum Action {
     Quit,
 }
 
-/// How sessions are ordered in the sidebar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum SortMode {
-    /// Stable creation order (the default), grouped by folder.
-    #[default]
-    Order,
-    /// Most recently changed first: folders are ordered by their most
-    /// recently active session, and sessions within a folder likewise.
-    Recent,
-}
-
 impl SortMode {
     #[cfg(not(test))]
     fn as_str(self) -> &'static str {
@@ -411,8 +426,8 @@ impl SortMode {
 
     fn from_str(s: &str) -> Self {
         match s {
-            "recent" => SortMode::Recent,
-            _ => SortMode::Order,
+            "order" => SortMode::Order,
+            _ => SortMode::Recent,
         }
     }
 
@@ -428,11 +443,8 @@ struct App {
     panes: HashMap<String, Pane>,
     items: Vec<TreeItem>,
     cursor: usize,
-    scroll_start: usize,
-    preview_for: String,
     preview_lines: Vec<Line<'static>>,
     preview_gen: u64,
-    preview_applied_gen: u64,
     snapshot_generation: u64,
     project_win_width: HashMap<String, usize>,
     width: u16,
@@ -443,6 +455,8 @@ struct App {
     pending_d: bool,
     pending_g: bool,
     sort_mode: SortMode,
+    expanded_section: Option<Section>,
+    sidebar_config: SidebarConfig,
     count: usize,
     err: Option<String>,
     ui_state: UiState,
@@ -468,7 +482,7 @@ fn sidebar_split(width: u16) -> Split {
 }
 
 impl App {
-    fn new(tmux_session: String) -> Self {
+    fn new(tmux_session: String, sidebar_config: SidebarConfig) -> Self {
         let (snapshot, ui_state) = load_pane_state();
         let snapshot_generation = snapshot
             .as_ref()
@@ -486,11 +500,8 @@ impl App {
                 .collect(),
             items: Vec::new(),
             cursor: 0,
-            scroll_start: 0,
-            preview_for: String::new(),
             preview_lines: Vec::new(),
             preview_gen: 1,
-            preview_applied_gen: 0,
             snapshot_generation,
             project_win_width: HashMap::new(),
             width: 0,
@@ -500,7 +511,9 @@ impl App {
             show_help: false,
             pending_d: false,
             pending_g: false,
-            sort_mode: SortMode::from_str(&ui_state.sort_mode),
+            sort_mode: SortMode::default(),
+            expanded_section: None,
+            sidebar_config,
             count: 0,
             err: snapshot.is_none().then(|| SYNCING_MSG.to_string()),
             ui_state,
@@ -509,24 +522,7 @@ impl App {
             hits: HitRegistry::new(),
             _tmux_session: tmux_session,
         };
-        app.rebuild_items();
-        if let Some(att) = app.first_unread_pane() {
-            app.cursor = att;
-        } else if !app.ui_state.last_position.pane_id.is_empty()
-            || !app.ui_state.last_position.pane_target.is_empty()
-        {
-            let id = if app.ui_state.last_position.pane_id.is_empty() {
-                app.ui_state.last_position.pane_target.clone()
-            } else {
-                app.ui_state.last_position.pane_id.clone()
-            };
-            app.cursor = app
-                .find_pane_by_id(&id)
-                .unwrap_or_else(|| first_pane(&app.items).unwrap_or(0));
-            app.scroll_start = app.ui_state.last_position.scroll_start;
-        } else {
-            app.cursor = first_pane(&app.items).unwrap_or(0);
-        }
+        app.focus_startup_session();
         app
     }
 
@@ -566,12 +562,22 @@ impl App {
             .into_iter()
             .map(|p| (p.pane_id.to_string(), p))
             .collect();
-        self.rebuild_items();
-        self.cursor = selected
-            .and_then(|id| self.find_pane_by_id(&id))
-            .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
+        if let Some(pane) = selected.as_ref().and_then(|id| self.panes.get(id)) {
+            self.expanded_section = pane_section(pane);
+        }
+        if selected.is_none() {
+            self.focus_startup_session();
+        } else {
+            self.rebuild_items();
+            self.cursor = selected
+                .and_then(|id| self.find_pane_by_id(&id))
+                .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
+            self.collapse_unfocused_section();
+            if self.current_pane().is_none() {
+                self.focus_first_session();
+            }
+        }
         if self.current_pane().is_none() {
-            self.preview_for.clear();
             self.preview_lines.clear();
             self.preview_gen += 1;
         }
@@ -579,16 +585,9 @@ impl App {
 
     fn rebuild_items(&mut self) {
         let panes: Vec<&Pane> = self.panes.values().collect();
-        let mut grouped_projects = HashSet::new();
-        for p in &panes {
-            if !p.project_root.is_empty() && p.path != p.project_root {
-                grouped_projects.insert(p.project_root.clone());
-            }
-        }
-
         let mut project_win_width: HashMap<String, usize> = HashMap::new();
         for p in &panes {
-            if grouped_projects.contains(&p.project_root) {
+            if !p.project_root.is_empty() {
                 let label = pane_label(p);
                 let width = display_width(&label);
                 project_win_width
@@ -613,11 +612,27 @@ impl App {
         }
 
         let mut items = Vec::new();
-        for stashed in [false, true] {
+        for section in [None, Some(Section::Working), Some(Section::Stashed)] {
+            if let Some(section) = section {
+                let count = panes
+                    .iter()
+                    .filter(|p| pane_section(p) == Some(section))
+                    .count();
+                if count == 0 {
+                    continue;
+                }
+                if !items.is_empty() {
+                    items.push(TreeItem::SectionSpacer);
+                }
+                items.push(TreeItem::SectionHeader(section, count));
+                if !self.section_is_expanded(section) {
+                    continue;
+                }
+            }
             let mut groups: Vec<Group<'_>> = Vec::new();
             let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
-            for p in panes.iter().copied().filter(|p| p.stashed == stashed) {
-                let key = if grouped_projects.contains(&p.project_root) {
+            for p in panes.iter().copied().filter(|p| pane_section(p) == section) {
+                let key = if !p.project_root.is_empty() {
                     GroupKey::Project(p.project_root.clone())
                 } else {
                     GroupKey::Workspace(p.path.clone())
@@ -640,16 +655,8 @@ impl App {
                 }
             }
 
-            if groups.is_empty() {
-                continue;
-            }
-            if stashed {
-                items.push(TreeItem::SectionHeader(None));
-                items.push(TreeItem::SectionHeader(Some("stashed".into())));
-            }
-
-            // Most recent change first: the newest last_active in a group.
-            let group_recency = |g: &Group<'_>| g.panes.iter().filter_map(|p| p.last_active).max();
+            let group_recency =
+                |g: &Group<'_>| g.panes.iter().filter_map(|p| p.status_changed_at).max();
             match self.sort_mode {
                 SortMode::Order => {
                     groups.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.key.cmp(&b.key)));
@@ -668,8 +675,8 @@ impl App {
                         .panes
                         .sort_by(|a, b| a.order.cmp(&b.order).then(a.target.cmp(&b.target))),
                     SortMode::Recent => group.panes.sort_by(|a, b| {
-                        b.last_active
-                            .cmp(&a.last_active)
+                        b.status_changed_at
+                            .cmp(&a.status_changed_at)
                             .then(a.order.cmp(&b.order))
                     }),
                 }
@@ -710,12 +717,43 @@ impl App {
             .position(|it| matches!(it, TreeItem::Pane(id) if id == pane_id))
     }
 
-    fn first_unread_pane(&self) -> Option<usize> {
-        self.items.iter().enumerate().find_map(|(i, it)| {
-            let TreeItem::Pane(id) = it else { return None };
-            let p = self.panes.get(id)?;
-            (!p.stashed && p.status == PaneStatus::Unread).then_some(i)
-        })
+    fn focus_startup_session(&mut self) {
+        self.sort_mode = self
+            .sidebar_config
+            .sort
+            .unwrap_or_else(|| SortMode::from_str(&self.ui_state.sort_mode));
+        self.expanded_section = None;
+        self.rebuild_items();
+        let selected = match self.sidebar_config.select {
+            StartupSelection::Unread => self
+                .items
+                .iter()
+                .find_map(|item| {
+                    let TreeItem::Pane(id) = item else {
+                        return None;
+                    };
+                    let pane = &self.panes[id];
+                    (!pane.stashed && pane.status == PaneStatus::Unread).then(|| id.clone())
+                })
+                .unwrap_or_else(|| self.ui_state.selected_pane_id.clone()),
+            StartupSelection::Last => self.ui_state.selected_pane_id.clone(),
+            StartupSelection::First => String::new(),
+        };
+        if let Some(section) = self.panes.get(&selected).and_then(pane_section)
+            && !self.section_is_expanded(section)
+        {
+            self.expanded_section = Some(section);
+            self.rebuild_items();
+        }
+        if let Some(cursor) = self.find_pane_by_id(&selected) {
+            self.cursor = cursor;
+        } else {
+            self.focus_first_session();
+        }
+    }
+
+    fn focus_first_session(&mut self) {
+        self.select_cursor(first_pane(&self.items).unwrap_or(0), false);
     }
 
     fn has_display_snapshot(&self) -> bool {
@@ -730,11 +768,8 @@ impl App {
         self.pending_kills.insert(pane_key.clone(), pane);
         self.panes.remove(&pane_key);
         self.rebuild_items();
-        self.cursor = nearest_pane(&self.items, self.cursor);
-        if self.preview_for == pane_key {
-            self.preview_for.clear();
-            self.preview_lines.clear();
-        }
+        self.select_cursor(nearest_pane(&self.items, self.cursor), false);
+        self.preview_lines.clear();
         self.preview_gen += 1;
         Some(pane_id)
     }
@@ -743,6 +778,7 @@ impl App {
         let Some(pane) = self.pending_kills.remove(pane_id) else {
             return;
         };
+        self.expanded_section = pane_section(&pane);
         self.panes.insert(pane_id.to_string(), pane);
         self.rebuild_items();
         self.cursor = self
@@ -760,14 +796,68 @@ impl App {
         panes.retain(|pane| !self.pending_kills.contains_key(pane.pane_id.as_str()));
     }
 
+    fn section_is_expanded(&self, section: Section) -> bool {
+        let behavior = match section {
+            Section::Working => self.sidebar_config.working,
+            Section::Stashed => self.sidebar_config.stashed,
+        };
+        behavior == SectionBehavior::Expand || self.expanded_section == Some(section)
+    }
+
+    fn select_cursor(&mut self, cursor: usize, backwards: bool) {
+        self.cursor = cursor;
+        // Skip expanded headers when navigating between sessions.
+        if let Some(TreeItem::SectionHeader(section, _)) = self.items.get(self.cursor)
+            && self.section_is_expanded(*section)
+        {
+            self.cursor = if backwards {
+                prev_pane(&self.items, self.cursor)
+            } else {
+                next_pane(&self.items, self.cursor)
+            };
+        }
+        if let Some(TreeItem::SectionHeader(section, _)) = self.items.get(self.cursor) {
+            let section = *section;
+            self.expanded_section = Some(section);
+            self.rebuild_items();
+            let in_section = |item: &TreeItem| matches!(item, TreeItem::Pane(id) if pane_section(&self.panes[id]) == Some(section));
+            self.cursor = if backwards {
+                self.items.iter().rposition(in_section)
+            } else {
+                self.items.iter().position(in_section)
+            }
+            .unwrap_or(self.cursor);
+        }
+        self.collapse_unfocused_section();
+    }
+
+    fn collapse_unfocused_section(&mut self) {
+        let section = self.current_pane().and_then(pane_section);
+        if let Some(expanded) = self.expanded_section
+            && section != Some(expanded)
+        {
+            self.expanded_section = None;
+            if self.section_is_expanded(expanded) {
+                return;
+            }
+            let selected = self.current_pane().map(|p| p.pane_id.to_string());
+            self.rebuild_items();
+            self.cursor = selected
+                .and_then(|id| self.find_pane_by_id(&id))
+                .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
+        }
+    }
+
     fn toggle_current_stash(&mut self) -> Option<bool> {
         let previous_cursor = self.cursor;
-        let (pane_id, stashed) = {
+        let (pane_id, stashed, section) = {
             let pane = self.current_pane_mut()?;
             pane.stashed = !pane.stashed;
-            (pane.pane_id.to_string(), pane.stashed)
+            (pane.pane_id.to_string(), pane.stashed, pane_section(pane))
         };
-
+        if !stashed {
+            self.expanded_section = section;
+        }
         self.rebuild_items();
         self.cursor = if stashed {
             nearest_pane(&self.items, previous_cursor)
@@ -775,6 +865,7 @@ impl App {
             self.find_pane_by_id(&pane_id)
                 .unwrap_or_else(|| nearest_pane(&self.items, previous_cursor))
         };
+        self.select_cursor(self.cursor, false);
         Some(stashed)
     }
 
@@ -812,13 +903,13 @@ impl App {
         // Emacs go-to-top / go-to-bottom: M-< and M->.
         if alt && matches!(key.code, KeyCode::Char('<')) {
             self.pending_g = false;
-            self.cursor = first_pane(&self.items).unwrap_or(0);
+            self.select_cursor(first_pane(&self.items).unwrap_or(0), false);
             self.preview_gen += 1;
             return Action::Preview;
         }
         if alt && matches!(key.code, KeyCode::Char('>')) {
             self.pending_g = false;
-            self.cursor = last_pane(&self.items).unwrap_or(0);
+            self.select_cursor(last_pane(&self.items).unwrap_or(0), true);
             self.preview_gen += 1;
             return Action::Preview;
         }
@@ -849,7 +940,7 @@ impl App {
         if key.code == KeyCode::Char('g') {
             if self.pending_g {
                 self.pending_g = false;
-                self.cursor = first_pane(&self.items).unwrap_or(0);
+                self.select_cursor(first_pane(&self.items).unwrap_or(0), false);
                 self.preview_gen += 1;
                 return Action::Preview;
             }
@@ -864,7 +955,7 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('G') => {
-                self.cursor = last_pane(&self.items).unwrap_or(0);
+                self.select_cursor(last_pane(&self.items).unwrap_or(0), true);
                 self.preview_gen += 1;
                 Action::Preview
             }
@@ -921,22 +1012,13 @@ impl App {
                 Action::None
             }
             KeyCode::Char('u') => {
-                let mut selected = None;
-                if let Some(p) = self.current_pane_mut()
-                    && p.stashed
-                {
-                    p.stashed = false;
-                    selected = Some(p.pane_id.to_string());
-                }
-                if let Some(id) = selected {
-                    self.rebuild_items();
-                    self.cursor = self
-                        .find_pane_by_id(&id)
-                        .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
+                if self.current_pane().is_some_and(|pane| pane.stashed) {
+                    self.toggle_current_stash();
                     self.save_state();
-                    return Action::Redraw;
+                    Action::Redraw
+                } else {
+                    Action::None
                 }
-                Action::None
             }
             KeyCode::Char('R') => {
                 let _ = restart_watch();
@@ -970,10 +1052,11 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => {
                 for _ in 0..count {
                     let next = next_pane(&self.items, self.cursor);
-                    if next == self.cursor {
+                    let previous = self.cursor;
+                    self.select_cursor(next, false);
+                    if next == previous {
                         break;
                     }
-                    self.cursor = next;
                 }
                 self.preview_gen += 1;
                 Action::Preview
@@ -981,10 +1064,11 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 for _ in 0..count {
                     let prev = prev_pane(&self.items, self.cursor);
-                    if prev == self.cursor {
+                    let previous = self.cursor;
+                    self.select_cursor(prev, true);
+                    if prev == previous {
                         break;
                     }
-                    self.cursor = prev;
                 }
                 self.preview_gen += 1;
                 Action::Preview
@@ -996,6 +1080,14 @@ impl App {
 
     /// Read the pane under the cursor (if unread), switch tmux to it, and quit.
     fn open_current_pane(&mut self) -> Action {
+        if matches!(
+            self.items.get(self.cursor),
+            Some(TreeItem::SectionHeader(_, _))
+        ) {
+            self.select_cursor(self.cursor, false);
+            self.preview_gen += 1;
+            return Action::Preview;
+        }
         if let Some(p) = self.current_pane() {
             let pane_id = p.pane_id.clone();
             // Opening a pane reads it, even if it was force-marked unread,
@@ -1036,11 +1128,35 @@ impl App {
             }
             return Action::Redraw;
         }
-        // Clicking a row selects it and opens it, like pressing Enter.
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-            && let Some(Hit::Row(idx)) = self.hits.hit(mouse.row, mouse.column).cloned()
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left)
+        ) && self.split_interaction.active_id().is_none()
+            && let Some(hit) = self.hits.hit(mouse.row, mouse.column).cloned()
         {
-            self.cursor = idx;
+            let (idx, section) = match hit {
+                Hit::Pane(id) => (self.find_pane_by_id(&id), None),
+                Hit::Section(section) => (
+                    self.items.iter().position(
+                        |item| matches!(item, TreeItem::SectionHeader(s, _) if *s == section),
+                    ),
+                    Some(section),
+                ),
+            };
+            let Some(idx) = idx else { return Action::None };
+            if mouse.kind == MouseEventKind::Moved
+                && (idx == self.cursor
+                    || section.is_some_and(|section| {
+                        self.current_pane().and_then(pane_section) == Some(section)
+                    }))
+            {
+                return Action::None;
+            }
+            self.select_cursor(idx, false);
+            if mouse.kind == MouseEventKind::Moved || section.is_some() {
+                self.preview_gen += 1;
+                return Action::Preview;
+            }
             return self.open_current_pane();
         }
         Action::None
@@ -1056,46 +1172,24 @@ impl App {
 
     #[cfg(not(test))]
     fn save_state(&mut self) {
-        let mut cursor = self.cursor;
-        let mut scroll_start = self.scroll_start;
-        if let Some(att) = self.first_unread_pane() {
-            cursor = att;
-            scroll_start = 0;
-        }
-        let (pane_id, pane_target) = self
-            .items
-            .get(cursor)
-            .and_then(|it| match it {
-                TreeItem::Pane(id) => self.panes.get(id),
-                _ => None,
-            })
-            .map(|p| (p.pane_id.to_string(), p.target.clone()))
-            .unwrap_or_default();
-        let pane_ids: std::collections::HashMap<String, bool> = self
-            .items
-            .iter()
-            .filter_map(|it| match it {
-                TreeItem::Pane(id) => Some((id.clone(), true)),
-                _ => None,
-            })
-            .collect();
-        let panes: Vec<Pane> = pane_ids
-            .keys()
-            .filter_map(|id| self.panes.get(id).cloned())
-            .collect();
-        let pending = self.pending_unread_changes.clone();
+        let panes = &self.panes;
+        let pending = &self.pending_unread_changes;
         let sidebar_width = self.sidebar_width();
         let sort_mode = self.sort_mode;
-        if update_ui_state(|state| {
-            for p in &panes {
+        let selected_pane_id = self
+            .current_pane()
+            .map(|pane| pane.pane_id.to_string())
+            .unwrap_or_default();
+        if let Ok(state) = update_ui_state(|state| {
+            for p in panes.values() {
                 if !state.panes.contains_key(p.pane_id.as_str())
                     && let Some(ui) = state.panes.remove(&p.target)
                 {
                     state.panes.insert(p.pane_id.to_string(), ui);
                 }
             }
-            state.panes.retain(|id, _| pane_ids.contains_key(id));
-            for p in &panes {
+            state.panes.retain(|id, _| panes.contains_key(id));
+            for p in panes.values() {
                 let entry = state.panes.entry(p.pane_id.to_string()).or_default();
                 entry.stashed = p.stashed;
                 if let Some(unread) = pending.get(p.pane_id.as_str()) {
@@ -1104,18 +1198,11 @@ impl App {
                 }
             }
             state.panes.retain(|_, ui| !ui_pane_state_is_empty(ui));
-            state.last_position = LastPosition {
-                pane_id: pane_id.clone(),
-                pane_target: pane_target.clone(),
-                cursor,
-                scroll_start,
-            };
+            state.selected_pane_id = selected_pane_id.clone();
             state.sidebar_width = sidebar_width;
             state.sort_mode = sort_mode.as_str().to_string();
-        })
-        .is_ok()
-        {
-            self.ui_state = load_ui_state();
+        }) {
+            self.ui_state = state;
             self.pending_unread_changes.clear();
         }
     }
@@ -1123,6 +1210,10 @@ impl App {
     #[cfg(test)]
     fn save_state(&mut self) {
         self.ui_state.sidebar_width = self.sidebar_width();
+        self.ui_state.selected_pane_id = self
+            .current_pane()
+            .map(|pane| pane.pane_id.to_string())
+            .unwrap_or_default();
     }
 }
 
@@ -1143,20 +1234,36 @@ fn render<W: Write>(surface: &mut Surface, app: &mut App, out: &mut W) -> io::Re
 }
 
 fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
-    if let Some(err) = &app.err {
+    let err = app.err.as_ref();
+    let status_height = if err.is_some() {
+        slice.height().saturating_sub(1).min(3)
+    } else {
+        0
+    };
+    let list_height = slice.height().saturating_sub(status_height);
+    if let Some(err) = err {
         let (message, style) = if err == SYNCING_MSG {
             (err.clone(), Style::new().fg(Color::DarkGrey))
         } else {
             (format!("Error: {err}"), Style::new().fg(Color::Red))
         };
-        slice.put_str(0, 0, &message, style);
-        return;
+        let mut remaining = message.as_str();
+        for row in list_height..slice.height() {
+            let line = smelt_term::grid::truncate_width(remaining, slice.width());
+            if line.is_empty() {
+                break;
+            }
+            slice.put_str(0, row, &line, style);
+            remaining = &remaining[line.len()..];
+        }
     }
     if app.items.is_empty() {
-        slice.put_str(2, 1, "No active sessions", Style::new().fg(Color::DarkGrey));
+        if list_height > 1 {
+            slice.put_str(2, 1, "No active sessions", Style::new().fg(Color::DarkGrey));
+        }
         return;
     }
-    let h = slice.height() as usize;
+    let h = list_height as usize;
     let start = visible_start(app.items.len(), app.cursor, h);
     let end = (start + h).min(app.items.len());
     let origin = slice.grid_rect();
@@ -1170,10 +1277,14 @@ fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
             idx == app.cursor,
             app,
         );
-        // Register the row as a click target so a click opens it like Enter.
-        if matches!(app.items[idx], TreeItem::Pane(_)) {
+        let hit = match &app.items[idx] {
+            TreeItem::Pane(id) => Some(Hit::Pane(id.clone())),
+            TreeItem::SectionHeader(section, _) => Some(Hit::Section(*section)),
+            _ => None,
+        };
+        if let Some(hit) = hit {
             app.hits
-                .record_local(origin, Rect::new(row as u16, 0, width, 1), Hit::Row(idx));
+                .record_local(origin, Rect::new(row as u16, 0, width, 1), hit);
         }
     }
 }
@@ -1187,14 +1298,23 @@ fn render_tree_item(
     app: &App,
 ) {
     match item {
-        TreeItem::SectionHeader(None) => {}
-        TreeItem::SectionHeader(Some(title)) => {
-            let label = format!(" {title} ");
-            let mut text = format!("─{label}");
+        TreeItem::SectionHeader(section, count) => {
+            let text = format!("─ {} ({count}) ", section.title());
             let fill = width.saturating_sub(display_width(&text) as u16);
-            text.push_str(&"─".repeat(fill as usize));
-            slice.put_str(0, row, &text, Style::new().fg(Color::AnsiValue(242)).dim());
+            let style = if selected {
+                Style::new().fg(Color::White).bg(Color::DarkGrey).bold()
+            } else {
+                Style::new().fg(Color::AnsiValue(242)).dim()
+            };
+            slice.fill_row(row, style);
+            slice.put_str(
+                0,
+                row,
+                &format!("{text}{}", "─".repeat(fill as usize)),
+                style,
+            );
         }
+        TreeItem::SectionSpacer => {}
         TreeItem::Workspace(id) => {
             if let Some(p) = app.panes.get(id) {
                 render_header_row(
@@ -1476,10 +1596,16 @@ fn render_preview(slice: &mut GridSlice<'_>, app: &App) {
 fn render_empty_preview(slice: &mut GridSlice<'_>, app: &App) {
     let title = if app.err.as_deref() == Some(SYNCING_MSG) {
         "Looking for sessions"
+    } else if !app.panes.is_empty() {
+        "Select a session"
     } else {
         "No active sessions"
     };
-    let detail = "Start a supported agent in tmux and it will appear here.";
+    let detail = if app.panes.is_empty() {
+        "Start a supported agent in tmux and it will appear here."
+    } else {
+        "Move into a section or press Enter to expand it."
+    };
     slice.put_str(2, 1, title, Style::new().fg(Color::White).bold());
     slice.put_str(2, 3, detail, Style::new().fg(Color::DarkGrey));
 }
@@ -1598,22 +1724,26 @@ fn visible_start(len: usize, cursor: usize, height: usize) -> usize {
     }
 }
 
+fn selectable(item: &TreeItem) -> bool {
+    matches!(item, TreeItem::Pane(_) | TreeItem::SectionHeader(_, _))
+}
+
 fn first_pane(items: &[TreeItem]) -> Option<usize> {
-    items.iter().position(|it| matches!(it, TreeItem::Pane(_)))
+    items.iter().position(selectable)
 }
 
 fn last_pane(items: &[TreeItem]) -> Option<usize> {
-    items.iter().rposition(|it| matches!(it, TreeItem::Pane(_)))
+    items.iter().rposition(selectable)
 }
 
 fn next_pane(items: &[TreeItem], from: usize) -> usize {
     for (i, item) in items.iter().enumerate().skip(from + 1) {
-        if matches!(item, TreeItem::Pane(_)) {
+        if selectable(item) {
             return i;
         }
     }
     for (i, item) in items.iter().enumerate().take(from.min(items.len())) {
-        if matches!(item, TreeItem::Pane(_)) {
+        if selectable(item) {
             return i;
         }
     }
@@ -1622,12 +1752,12 @@ fn next_pane(items: &[TreeItem], from: usize) -> usize {
 
 fn prev_pane(items: &[TreeItem], from: usize) -> usize {
     for i in (0..from).rev() {
-        if matches!(items[i], TreeItem::Pane(_)) {
+        if selectable(&items[i]) {
             return i;
         }
     }
     for i in ((from + 1)..items.len()).rev() {
-        if matches!(items[i], TreeItem::Pane(_)) {
+        if selectable(&items[i]) {
             return i;
         }
     }
@@ -1650,7 +1780,7 @@ fn nearest_pane(items: &[TreeItem], from: usize) -> usize {
             return from + offset;
         }
     }
-    0
+    first_pane(items).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1689,11 +1819,8 @@ mod tests {
                 .collect(),
             items: Vec::new(),
             cursor: 0,
-            scroll_start: 0,
-            preview_for: String::new(),
             preview_lines: Vec::new(),
             preview_gen: 0,
-            preview_applied_gen: 0,
             snapshot_generation: 0,
             project_win_width: HashMap::new(),
             width: 0,
@@ -1704,6 +1831,8 @@ mod tests {
             pending_d: false,
             pending_g: false,
             sort_mode: SortMode::default(),
+            expanded_section: None,
+            sidebar_config: SidebarConfig::default(),
             count: 0,
             err: None,
             ui_state: UiState::default(),
@@ -1712,8 +1841,20 @@ mod tests {
             hits: HitRegistry::new(),
             _tmux_session: String::new(),
         };
-        app.rebuild_items();
+        app.focus_startup_session();
         app
+    }
+
+    #[test]
+    fn startup_key_without_session_does_not_leave_preview_pending() {
+        let mut app = app_with_panes(Vec::new());
+        let (tx, rx) = mpsc::channel();
+        assert!(matches!(
+            app.handle_key(KeyEvent::from(KeyCode::Char('o')), &tx),
+            Action::Preview
+        ));
+        assert!(!spawn_preview(&tx, &app));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1846,14 +1987,11 @@ mod tests {
     }
 
     #[test]
-    fn stashing_keeps_cursor_row_instead_of_following_pane() {
+    fn stashing_selects_next_main_session() {
         let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1), pane("%3", 2)]);
         app.cursor = app.find_pane_by_id("%2").unwrap();
-        let previous_cursor = app.cursor;
 
         assert_eq!(app.toggle_current_stash(), Some(true));
-
-        assert_eq!(app.cursor, previous_cursor);
         assert_eq!(
             app.current_pane().map(|pane| pane.pane_id.as_str()),
             Some("%3")
@@ -1861,12 +1999,74 @@ mod tests {
         assert!(app.panes["%2"].stashed);
     }
 
-    fn pane_at(id: &str, order: usize, path: &str, last_active_secs: i64) -> Pane {
+    #[test]
+    fn stashing_sessions_keeps_selection_on_available_session() {
+        let mut busy = pane("%3", 2);
+        busy.status = PaneStatus::Busy;
+        let mut other_busy = pane("%4", 3);
+        other_busy.status = PaneStatus::Busy;
+        let mut stashed = pane("%5", 4);
+        stashed.stashed = true;
+        let mut app = app_with_panes(vec![
+            pane("%1", 0),
+            pane("%2", 1),
+            busy,
+            other_busy,
+            stashed,
+        ]);
+        let (tx, _rx) = mpsc::channel();
+        for (id, section) in [
+            ("%2", None),
+            ("%3", Some(Section::Working)),
+            ("%4", Some(Section::Working)),
+            ("%1", Some(Section::Stashed)),
+        ] {
+            app.handle_key(KeyEvent::from(KeyCode::Char('s')), &tx);
+            assert_eq!(app.current_pane().unwrap().pane_id.as_str(), id);
+            assert_eq!(app.expanded_section, section);
+        }
+    }
+
+    #[test]
+    fn failed_kill_restores_selected_session_inside_working_section() {
+        let mut busy = pane("%2", 1);
+        busy.status = PaneStatus::Busy;
+        let mut app = app_with_panes(vec![pane("%1", 0), busy]);
+        let (tx, _rx) = mpsc::channel();
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')), &tx);
+        app.remove_current_pane();
+        app.restore_pending_kill("%2");
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+        assert_eq!(app.expanded_section, Some(Section::Working));
+    }
+
+    #[test]
+    fn unstashing_busy_session_preserves_selection_in_working_section() {
+        let mut busy = pane("%2", 1);
+        busy.status = PaneStatus::Busy;
+        let mut stashed = pane("%3", 2);
+        stashed.status = PaneStatus::Busy;
+        stashed.stashed = true;
+        let mut app = app_with_panes(vec![pane("%1", 0), busy, stashed]);
+        let header = app
+            .items
+            .iter()
+            .position(|item| matches!(item, TreeItem::SectionHeader(Section::Stashed, _)))
+            .unwrap();
+        app.select_cursor(header, false);
+        let (tx, _rx) = mpsc::channel();
+        app.handle_key(KeyEvent::from(KeyCode::Char('u')), &tx);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%3");
+        assert_eq!(app.expanded_section, Some(Section::Working));
+        assert_eq!(pane_ids(&app), ["%1", "%2", "%3"]);
+    }
+
+    fn pane_at(id: &str, order: usize, path: &str, status_changed_secs: i64) -> Pane {
         Pane {
             target: format!("session:1.{order}"),
             path: path.to_string(),
             order,
-            last_active: chrono::DateTime::from_timestamp(last_active_secs, 0),
+            status_changed_at: chrono::DateTime::from_timestamp(status_changed_secs, 0),
             ..Pane::new(PaneId::parse(id).unwrap())
         }
     }
@@ -1882,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_sort_orders_folders_and_sessions_by_last_active() {
+    fn default_sort_orders_projects_and_sessions_by_state_change() {
         let (tx, _rx) = mpsc::channel();
         let mut app = app_with_panes(vec![
             pane_at("%1", 0, "/a", 100),
@@ -1890,20 +2090,466 @@ mod tests {
             pane_at("%3", 2, "/b", 500),
         ]);
 
-        // Default order: grouped by folder, in creation order.
-        assert_eq!(app.sort_mode, SortMode::Order);
-        assert_eq!(pane_ids(&app), ["%1", "%2", "%3"]);
-
-        // Toggle to recent: folder /b (500) sorts ahead of /a (300), and the
-        // newer session within /a (300) sorts ahead of the older one (100).
-        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
+        assert_eq!(SortMode::from_str(""), SortMode::Recent);
+        assert_eq!(SortMode::from_str("order"), SortMode::Order);
         assert_eq!(app.sort_mode, SortMode::Recent);
         assert_eq!(pane_ids(&app), ["%3", "%2", "%1"]);
 
-        // Toggling again returns to the stable order.
+        app.panes.get_mut("%1").unwrap().last_active = chrono::DateTime::from_timestamp(1000, 0);
+        app.rebuild_items();
+        assert_eq!(pane_ids(&app), ["%3", "%2", "%1"]);
+
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
         assert_eq!(app.sort_mode, SortMode::Order);
         assert_eq!(pane_ids(&app), ["%1", "%2", "%3"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.sort_mode, SortMode::Recent);
+        assert_eq!(pane_ids(&app), ["%3", "%2", "%1"]);
+    }
+
+    #[test]
+    fn project_group_keeps_worktrees_together_in_recent_order() {
+        let mut main = pane_at("%1", 0, "/repo", 100);
+        main.project_root = "/repo".into();
+        let mut worktree = pane_at("%2", 1, "/repo-feature", 500);
+        worktree.project_root = "/repo".into();
+        let mut other = pane_at("%3", 2, "/other", 300);
+        other.project_root = "/other".into();
+        let app = app_with_panes(vec![main, worktree, other]);
+        assert_eq!(pane_ids(&app), ["%2", "%1", "%3"]);
+        assert_eq!(
+            app.items
+                .iter()
+                .filter(|item| matches!(item, TreeItem::ProjectGroup(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn hover_selects_session_and_requests_preview_only_when_selection_changes() {
+        let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1)]);
+        let mut surface = Surface::new(120, 24);
+        app.resize(120, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 4,
+            row: app.find_pane_by_id("%2").unwrap() as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        let generation = app.preview_gen;
+        assert!(matches!(app.handle_mouse(mouse), Action::Preview));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+        assert_eq!(app.preview_gen, generation + 1);
+        assert!(matches!(app.handle_mouse(mouse), Action::None));
+        assert_eq!(app.preview_gen, generation + 1);
+        assert!(matches!(
+            app.handle_mouse(MouseEvent {
+                column: 80,
+                ..mouse
+            }),
+            Action::None
+        ));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+    }
+
+    #[test]
+    fn working_rows_use_provider_and_busy_status_colors() {
+        let mut busy = pane("%1", 0);
+        busy.status = PaneStatus::Busy;
+        busy.provider = "smelt".into();
+        let app = app_with_panes(vec![busy]);
+        let busy = &app.panes["%1"];
+        let mut grid = smelt_term::grid::Grid::new(40, 1);
+        render_pane_row(
+            &mut grid.slice_mut(Rect::new(0, 0, 40, 1)),
+            0,
+            40,
+            busy,
+            false,
+            &app,
+        );
+        assert_eq!(
+            grid.cell(3, 0).style.fg,
+            Some(Color::Rgb {
+                r: 217,
+                g: 119,
+                b: 6
+            })
+        );
+        assert_eq!(grid.cell(5, 0).style.fg, provider_style("smelt").fg);
+    }
+
+    #[test]
+    fn hover_during_sidebar_resize_preserves_session_selection() {
+        let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1)]);
+        let mut surface = Surface::new(120, 24);
+        app.resize(120, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.sidebar_width(),
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(app.handle_mouse(mouse), Action::Redraw));
+        assert!(app.split_interaction.active_id().is_some());
+        assert!(matches!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 4,
+                row: app.find_pane_by_id("%2").unwrap() as u16,
+                ..mouse
+            }),
+            Action::None
+        ));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+    }
+
+    #[test]
+    fn hover_switches_between_collapsible_sections() {
+        let mut busy = pane("%2", 1);
+        busy.status = PaneStatus::Busy;
+        let mut stashed = pane("%3", 2);
+        stashed.stashed = true;
+        let mut app = app_with_panes(vec![pane("%1", 0), busy, stashed]);
+        let mut surface = Surface::new(120, 24);
+        app.resize(120, 24);
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        let header = app
+            .items
+            .iter()
+            .position(|item| matches!(item, TreeItem::SectionHeader(Section::Stashed, _)))
+            .unwrap();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 4,
+            row: header as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(app.handle_mouse(mouse), Action::Preview));
+        assert_eq!(app.expanded_section, Some(Section::Stashed));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%3");
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+        assert!(matches!(app.handle_mouse(mouse), Action::None));
+        let busy_row = app
+            .items
+            .iter()
+            .position(|item| matches!(item, TreeItem::SectionHeader(Section::Working, _)))
+            .unwrap() as u16;
+        assert!(matches!(
+            app.handle_mouse(MouseEvent {
+                row: busy_row,
+                ..mouse
+            }),
+            Action::Preview
+        ));
+        assert_eq!(app.expanded_section, Some(Section::Working));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+        assert_eq!(pane_ids(&app), ["%1", "%2"]);
+    }
+
+    #[test]
+    fn startup_selects_first_session_in_sidebar_order() {
+        let first = pane_at("%1", 0, "/repo", 200);
+        let mut unread = pane_at("%2", 1, "/repo", 100);
+        unread.status = PaneStatus::Unread;
+        let mut app = app_with_panes(vec![first, unread]);
+        app.sidebar_config.select = StartupSelection::First;
+        app.focus_startup_session();
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+    }
+
+    #[test]
+    fn startup_prioritizes_unread_without_marking_it_read() {
+        let first = pane_at("%1", 0, "/repo", 200);
+        let mut unread = pane_at("%2", 1, "/repo", 100);
+        unread.status = PaneStatus::Unread;
+        let mut app = app_with_panes(vec![first, unread]);
+        app.ui_state.selected_pane_id = "%1".into();
+        app.focus_startup_session();
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+        assert_eq!(app.panes["%2"].status, PaneStatus::Unread);
+        assert!(app.pending_unread_changes.is_empty());
+    }
+
+    #[test]
+    fn startup_selection_modes_control_priority_and_fallback() {
+        for (mode, expected, missing_expected) in [
+            (StartupSelection::Unread, "%2", "%2"),
+            (StartupSelection::Last, "%3", "%1"),
+            (StartupSelection::First, "%1", "%1"),
+        ] {
+            let first = pane_at("%1", 0, "/repo", 300);
+            let mut unread = pane_at("%2", 1, "/repo", 200);
+            unread.status = PaneStatus::Unread;
+            let saved = pane_at("%3", 2, "/repo", 100);
+            let mut app = app_with_panes(vec![first, unread, saved]);
+            app.sidebar_config.select = mode;
+            for (id, selected) in [("%3", expected), ("%99", missing_expected)] {
+                app.ui_state.selected_pane_id = id.into();
+                app.focus_startup_session();
+                assert_eq!(app.current_pane().unwrap().pane_id.as_str(), selected);
+            }
+        }
+    }
+
+    #[test]
+    fn startup_unread_selection_excludes_stashed_sessions() {
+        for behavior in [SectionBehavior::Collapse, SectionBehavior::Expand] {
+            let mut deferred = pane_at("%2", 1, "/repo", 300);
+            deferred.status = PaneStatus::Unread;
+            deferred.stashed = true;
+            let mut app = app_with_panes(vec![pane_at("%1", 0, "/repo", 100), deferred]);
+            app.sidebar_config.stashed = behavior;
+            app.focus_startup_session();
+            assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        }
+    }
+
+    #[test]
+    fn startup_sort_uses_config_or_saved_order() {
+        for configured in [None, Some(SortMode::Recent), Some(SortMode::Order)] {
+            for (saved, saved_mode) in [
+                ("", SortMode::Recent),
+                ("recent", SortMode::Recent),
+                ("order", SortMode::Order),
+            ] {
+                let mut app = app_with_panes(vec![
+                    pane_at("%1", 0, "/repo", 100),
+                    pane_at("%2", 1, "/repo", 200),
+                ]);
+                app.sidebar_config.sort = configured;
+                app.ui_state.sort_mode = saved.into();
+                app.focus_startup_session();
+                let expected = configured.unwrap_or(saved_mode);
+                assert_eq!(app.sort_mode, expected);
+                assert_eq!(
+                    pane_ids(&app),
+                    if expected == SortMode::Order {
+                        ["%1", "%2"]
+                    } else {
+                        ["%2", "%1"]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unread_completion_does_not_steal_selection_after_startup() {
+        let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1)]);
+        let mut completed = pane("%2", 1);
+        completed.status = PaneStatus::Unread;
+        app.replace_panes(vec![pane("%1", 0), completed]);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+    }
+
+    #[test]
+    fn first_loaded_snapshot_prioritizes_unread_session() {
+        let mut app = app_with_panes(Vec::new());
+        let mut unread = pane("%2", 1);
+        unread.status = PaneStatus::Unread;
+        app.replace_panes(vec![pane("%1", 0), unread]);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+    }
+
+    #[test]
+    fn first_loaded_snapshot_selects_first_stashed_session() {
+        let mut app = app_with_panes(Vec::new());
+        let mut stashed = pane("%1", 0);
+        stashed.stashed = true;
+        app.replace_panes(vec![stashed]);
+        assert_eq!(app.expanded_section, Some(Section::Stashed));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+    }
+
+    #[test]
+    fn busy_sessions_automatically_appear_in_collapsed_working_section() {
+        let mut busy = pane("%2", 1);
+        busy.status = PaneStatus::Busy;
+        let app = app_with_panes(vec![pane("%1", 0), busy]);
+        assert_eq!(pane_ids(&app), ["%1"]);
+        assert_eq!(pane_section(&app.panes["%2"]), Some(Section::Working));
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, TreeItem::SectionHeader(Section::Working, 1)))
+        );
+    }
+
+    #[test]
+    fn startup_restores_session_inside_section_before_first_render() {
+        for (id, section) in [("%2", Section::Working), ("%3", Section::Stashed)] {
+            let mut busy = pane("%2", 1);
+            busy.status = PaneStatus::Busy;
+            let mut stashed = pane("%3", 2);
+            stashed.stashed = true;
+            let mut app = app_with_panes(vec![pane("%1", 0), busy, stashed]);
+            app.ui_state.selected_pane_id = id.into();
+            app.focus_startup_session();
+            assert_eq!(app.current_pane().unwrap().pane_id.as_str(), id);
+            assert_eq!(app.expanded_section, Some(section));
+            assert_eq!(pane_ids(&app), ["%1", id]);
+            let mut surface = Surface::new(120, 24);
+            app.resize(120, 24);
+            render(&mut surface, &mut app, &mut Vec::new()).unwrap();
+            assert_eq!(app.current_pane().unwrap().pane_id.as_str(), id);
+            assert_eq!(app.expanded_section, Some(section));
+        }
+    }
+
+    #[test]
+    fn startup_falls_back_to_first_session_when_saved_session_is_unavailable() {
+        let mut app = app_with_panes(vec![pane("%1", 0)]);
+        app.ui_state.selected_pane_id = "%99".into();
+        app.focus_startup_session();
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+    }
+
+    #[test]
+    fn startup_expands_only_working_and_selects_first_session() {
+        let mut busy = pane("%1", 0);
+        busy.status = PaneStatus::Busy;
+        let app = app_with_panes(vec![busy]);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        assert_eq!(app.expanded_section, Some(Section::Working));
+    }
+
+    #[test]
+    fn busy_stashed_sessions_remain_in_stash() {
+        let mut stashed = pane("%2", 1);
+        stashed.status = PaneStatus::Busy;
+        stashed.stashed = true;
+        let app = app_with_panes(vec![pane("%1", 0), stashed]);
+        assert_eq!(pane_section(&app.panes["%2"]), Some(Section::Stashed));
+        assert_eq!(pane_ids(&app), ["%1"]);
+    }
+
+    #[test]
+    fn section_configuration_controls_visibility_without_selecting_headers() {
+        for working in [SectionBehavior::Collapse, SectionBehavior::Expand] {
+            for stashed_behavior in [SectionBehavior::Collapse, SectionBehavior::Expand] {
+                let mut busy = pane("%2", 1);
+                busy.status = PaneStatus::Busy;
+                let mut stashed = pane("%3", 2);
+                stashed.stashed = true;
+                let mut app = app_with_panes(vec![pane("%1", 0), busy, stashed]);
+                app.sidebar_config = SidebarConfig {
+                    working,
+                    stashed: stashed_behavior,
+                    ..SidebarConfig::default()
+                };
+                app.focus_startup_session();
+                assert_eq!(
+                    app.find_pane_by_id("%2").is_some(),
+                    working == SectionBehavior::Expand
+                );
+                assert_eq!(
+                    app.find_pane_by_id("%3").is_some(),
+                    stashed_behavior == SectionBehavior::Expand
+                );
+                let (tx, _rx) = mpsc::channel();
+                for id in ["%2", "%3", "%1"] {
+                    app.handle_key(KeyEvent::from(KeyCode::Char('j')), &tx);
+                    assert_eq!(app.current_pane().unwrap().pane_id.as_str(), id);
+                }
+                assert_eq!(
+                    app.find_pane_by_id("%2").is_some(),
+                    working == SectionBehavior::Expand
+                );
+                assert_eq!(
+                    app.find_pane_by_id("%3").is_some(),
+                    stashed_behavior == SectionBehavior::Expand
+                );
+                for id in ["%3", "%2", "%1"] {
+                    app.handle_key(KeyEvent::from(KeyCode::Char('k')), &tx);
+                    assert_eq!(app.current_pane().unwrap().pane_id.as_str(), id);
+                }
+                assert_eq!(
+                    app.find_pane_by_id("%2").is_some(),
+                    working == SectionBehavior::Expand
+                );
+                assert_eq!(
+                    app.find_pane_by_id("%3").is_some(),
+                    stashed_behavior == SectionBehavior::Expand
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sections_expand_on_entry_and_collapse_on_exit_in_both_directions() {
+        let (tx, _rx) = mpsc::channel();
+        let mut working = pane("%2", 1);
+        working.status = PaneStatus::Busy;
+        let mut stashed = pane("%3", 2);
+        stashed.stashed = true;
+        let mut app = app_with_panes(vec![pane("%1", 0), working, stashed]);
+        app.cursor = app.find_pane_by_id("%1").unwrap();
+        assert_eq!(pane_ids(&app), ["%1"]);
+        for (key, id, section) in [
+            ('j', "%2", Some(Section::Working)),
+            ('j', "%3", Some(Section::Stashed)),
+            ('j', "%1", None),
+            ('k', "%3", Some(Section::Stashed)),
+            ('k', "%2", Some(Section::Working)),
+            ('k', "%1", None),
+        ] {
+            app.handle_key(KeyEvent::from(KeyCode::Char(key)), &tx);
+            assert_eq!(app.current_pane().unwrap().pane_id.as_str(), id);
+            assert_eq!(app.expanded_section, section);
+            assert_eq!(pane_ids(&app).len(), if section.is_some() { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn startup_expands_only_stash_and_selects_first_session() {
+        let (tx, _rx) = mpsc::channel();
+        let mut stashed = pane("%1", 0);
+        stashed.stashed = true;
+        let mut app = app_with_panes(vec![stashed]);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        assert_eq!(app.expanded_section, Some(Section::Stashed));
+        app.handle_key(KeyEvent::from(KeyCode::Char('u')), &tx);
+        assert!(!app.panes["%1"].stashed);
+        assert_eq!(app.expanded_section, None);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        assert_eq!(pane_ids(&app), ["%1"]);
+    }
+
+    #[test]
+    fn selected_session_keeps_focus_when_it_starts_working() {
+        let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1)]);
+        let mut busy = pane("%1", 0);
+        busy.status = PaneStatus::Busy;
+        app.replace_panes(vec![busy, pane("%2", 1)]);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        assert_eq!(app.expanded_section, Some(Section::Working));
+        assert_eq!(pane_ids(&app), ["%2", "%1"]);
+    }
+
+    #[test]
+    fn completed_working_session_returns_to_main_list() {
+        let mut working = pane("%2", 1);
+        working.status = PaneStatus::Busy;
+        let mut app = app_with_panes(vec![pane("%1", 0), working.clone()]);
+        app.cursor = app.find_pane_by_id("%1").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')), &tx);
+        assert_eq!(
+            pane_section(app.current_pane().unwrap()),
+            Some(Section::Working)
+        );
+        working.status = PaneStatus::Unread;
+        app.replace_panes(vec![pane("%1", 0), working]);
+        assert_eq!(pane_section(&app.panes["%2"]), None);
+        assert_eq!(app.panes["%2"].status, PaneStatus::Unread);
+        assert_eq!(app.expanded_section, None);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+        assert_eq!(pane_ids(&app), ["%1", "%2"]);
     }
 
     #[test]
