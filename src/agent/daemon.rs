@@ -202,13 +202,28 @@ fn validate(executable: &Path, expected: &str) -> Result<()> {
     // Darwin rejects socket options after the peer closes. Configure this before
     // spawning; it also bounds reads when a descendant inherits stdout.
     output.set_read_timeout(Some(timeout))?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("--daemon-info")
         .stdin(Stdio::null())
         .stdout(Stdio::from(OwnedFd::from(child_output)))
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
     let deadline = Instant::now() + timeout;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            // An installer or a forked child can briefly retain a writable fd.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    // Close the parent's stdout writer so the reader can observe EOF.
+    drop(command);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -349,6 +364,30 @@ mod tests {
         let (root, path) = executable("invalid executable\n");
         assert!(validate(&path, &fingerprint(&path).unwrap()).is_err());
         assert!(fingerprint(&root.path().join("missing")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validation_waits_for_transient_executable_writer() {
+        let (_root, path) = executable("#!/bin/sh\ncat \"$0.json\"\n");
+        let expected = fingerprint(&path).unwrap();
+        fs::write(
+            path.with_extension("json"),
+            serde_json::to_vec(&BuildInfo {
+                build_id: expected.clone(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let writer = OpenOptions::new().write(true).open(&path).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(writer);
+        });
+        let result = validate(&path, &expected);
+        release.join().unwrap();
+        result.unwrap();
     }
 
     #[test]
