@@ -212,7 +212,7 @@ fn publish_snapshot(
 ) {
     // Keep publication ordered with the shared state update.
     let mut latest = latest_snapshot.and_then(|latest| latest.lock().ok());
-    let mut was_empty = false;
+    let mut needs_broadcast = changed;
     if let Some(latest) = latest.as_mut() {
         if latest
             .as_ref()
@@ -220,12 +220,13 @@ fn publish_snapshot(
         {
             return;
         }
-        was_empty = latest.is_none();
+        // A hook refresh can commit a newer snapshot without this poll writing it.
+        needs_broadcast |= latest
+            .as_ref()
+            .is_none_or(|current| current.revision < snapshot.revision);
         **latest = Some(snapshot.clone());
     }
-    if (changed || was_empty)
-        && let Some(subscribers) = subscribers
-    {
+    if needs_broadcast && let Some(subscribers) = subscribers {
         broadcast_snapshot(subscribers, snapshot);
     }
 }
@@ -629,6 +630,36 @@ mod tests {
         apply_metadata(&mut snapshot, &metadata, &clean);
         assert!(!snapshot.panes[0].git_dirty);
         assert!(!snapshot.panes[0].project_dirty);
+    }
+
+    #[test]
+    fn externally_written_snapshot_notifies_subscribers_once() {
+        let latest = Arc::new(Mutex::new(Some(Snapshot {
+            generation: 1,
+            revision: 1,
+            ..Snapshot::default()
+        })));
+        let (tx, rx) = mpsc::channel();
+        let subscribers = Arc::new(Mutex::new(vec![tx]));
+        let external = Snapshot {
+            generation: 2,
+            revision: 2,
+            ..Snapshot::default()
+        };
+        publish_snapshot(Some(&latest), Some(&subscribers), external.clone(), false);
+        let Response::State {
+            snapshot: Some(snapshot),
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected external snapshot");
+        };
+        assert_eq!(snapshot.revision, 2);
+        publish_snapshot(Some(&latest), Some(&subscribers), external, false);
+        assert!(
+            rx.try_recv().is_err(),
+            "unchanged polls must not rebroadcast"
+        );
     }
 
     #[test]
