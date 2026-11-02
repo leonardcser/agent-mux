@@ -548,15 +548,8 @@ mod tests {
 
     #[test]
     fn fast_poll_preserves_metadata_committed_after_pane_discovery() {
-        let root = std::env::temp_dir().join(format!(
-            "agent-mux-poll-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = root.join("snapshot.json");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("snapshot.json");
         let panes = vec![Pane {
             path: "/repo".to_string(),
             ..Pane::new(crate::agent::PaneId::parse("%1").unwrap())
@@ -577,7 +570,6 @@ mod tests {
         assert!(snapshot.panes[0].project_dirty);
         assert!(!changed);
         assert_eq!(snapshot.revision, 2);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

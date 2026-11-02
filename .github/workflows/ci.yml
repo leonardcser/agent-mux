@@ -20,17 +20,34 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Test
-        run: cargo test --locked --all-targets
-      - name: Build
-        run: cargo build --locked --release
+      - name: Check native macOS build
+        if: runner.os == 'macOS'
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+          cargo build --locked --release
+      - uses: astral-sh/setup-uv@v7
+        if: runner.os == 'Linux'
+        with:
+          enable-cache: true
       - name: Install tmux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y tmux
-      - name: Test tmux integration
+      - name: Check full suite
         if: runner.os == 'Linux'
-        run: |
-          for test in tests/e2e_*.py; do
-            python3 "$test"
-          done
+        run: scripts/check --all
+      - name: Upload failed E2E diagnostics
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-diagnostics
+          if-no-files-found: ignore
+          path: |
+            /tmp/am-test-*/*.txt
+            /tmp/am-test-*/child-*.log
+            /tmp/am-test-*/state/*.log
+            /tmp/am-test-*/state/*.json

@@ -473,16 +473,8 @@ mod tests {
 
     #[test]
     fn concurrent_snapshot_updates_read_the_latest_state_under_lock() {
-        let root = std::env::temp_dir().join(format!(
-            "agent-mux-snapshot-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("snapshot.json");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("snapshot.json");
         let mut workers = Vec::new();
         for _ in 0..4 {
             let path = path.clone();
@@ -508,13 +500,12 @@ mod tests {
         assert_eq!(snapshot.panes[0].order, 80);
         assert_eq!(snapshot.generation, 80);
         assert_eq!(snapshot.revision, 80);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn revision_advances_for_writes_that_do_not_change_display_generation() {
-        let root = std::env::temp_dir().join(format!("agent-mux-revision-{}", std::process::id()));
-        let path = root.join("nested/snapshot.json");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nested/snapshot.json");
         let (initial, _) = super::update_snapshot_at(path.clone(), |_| {
             Some(super::Snapshot {
                 panes: vec![CachedPane::default()],
@@ -538,8 +529,12 @@ mod tests {
             .unwrap();
         assert!(!changed);
         assert_eq!(unchanged.revision, updated.revision);
-        assert_eq!(std::fs::read_dir(root.join("nested")).unwrap().count(), 2);
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.path().join("nested"))
+                .unwrap()
+                .count(),
+            2
+        );
     }
 
     #[test]

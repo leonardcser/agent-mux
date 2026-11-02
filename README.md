@@ -109,8 +109,7 @@ changes.
 
 ```sh
 cargo run --release
-cargo test
-cargo clippy --all-targets -- -D warnings
+scripts/check
 ```
 
-Build with `cargo build --release` before running the [E2E tests](tests/).
+See [Testing](tests/README.md) for setup, full-suite checks, and focused runs.

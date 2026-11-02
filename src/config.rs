@@ -153,6 +153,7 @@ mod tests {
     #[test]
     fn invalid_settings_report_errors() {
         for source in [
+            "unknown_option = true",
             "[unknown]",
             "[sidebar]\nworkng = 'collapse'",
             "[sidebar]\nworking = true",
@@ -191,20 +192,12 @@ mod tests {
 
     #[test]
     fn file_loading_defaults_only_when_file_is_missing() {
-        let root = std::env::temp_dir().join(format!(
-            "agent-mux-config-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = root.join("config.toml");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
         let config = Config::load_from(&path).unwrap();
         assert_eq!(config.sidebar.working, WorkingSection::Collapse);
         assert_eq!(config.sidebar.stashed, SectionBehavior::Collapse);
 
-        fs::create_dir_all(&root).unwrap();
         fs::write(&path, "[sidebar]\nworking = 'expand'").unwrap();
         assert_eq!(
             Config::load_from(&path).unwrap().sidebar.working,
@@ -217,7 +210,6 @@ mod tests {
                 .to_string()
                 .contains(path.to_str().unwrap())
         );
-        assert!(Config::load_from(&root).is_err());
-        fs::remove_dir_all(root).unwrap();
+        assert!(Config::load_from(root.path()).is_err());
     }
 }

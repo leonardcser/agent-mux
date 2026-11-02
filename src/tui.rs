@@ -20,11 +20,12 @@ use smelt_term::{
 };
 
 use crate::agent::ipc;
+#[cfg(not(test))]
+use crate::agent::persist::update_ui_state;
 use crate::agent::persist::{
     Snapshot, UiState, apply_ui_state, load_snapshot, load_ui_state, panes_from_snapshot,
+    ui_pane_state_is_empty,
 };
-#[cfg(not(test))]
-use crate::agent::persist::{ui_pane_state_is_empty, update_ui_state};
 use crate::agent::{Pane, PaneId, PaneStatus, kill_pane, switch_to_pane};
 use crate::config::{
     Config, SectionBehavior, SidebarConfig, SortMode, StartupSelection, WorkingSection,
@@ -495,7 +496,6 @@ enum Action {
 }
 
 impl SortMode {
-    #[cfg(not(test))]
     fn as_str(self) -> &'static str {
         match self {
             SortMode::Order => "order",
@@ -1317,38 +1317,35 @@ impl App {
         }
     }
 
-    #[cfg(not(test))]
-    fn save_state(&mut self) {
-        let panes = &self.panes;
-        let pending = &self.pending_unread_changes;
-        let sidebar_width = self.sidebar_width();
-        let sort_mode = self.sort_mode;
-        let selected_pane_id = self
+    fn update_saved_state(&self, state: &mut UiState) {
+        for p in self.panes.values() {
+            if !state.panes.contains_key(p.pane_id.as_str())
+                && let Some(ui) = state.panes.remove(&p.target)
+            {
+                state.panes.insert(p.pane_id.to_string(), ui);
+            }
+        }
+        state.panes.retain(|id, _| self.panes.contains_key(id));
+        for p in self.panes.values() {
+            let entry = state.panes.entry(p.pane_id.to_string()).or_default();
+            entry.stashed = p.stashed;
+            if let Some(unread) = self.pending_unread_changes.get(p.pane_id.as_str()) {
+                entry.forced_unread = *unread;
+                entry.read_content_hash = (!*unread).then(|| p.content_hash.clone());
+            }
+        }
+        state.panes.retain(|_, ui| !ui_pane_state_is_empty(ui));
+        state.selected_pane_id = self
             .current_pane()
             .map(|pane| pane.pane_id.to_string())
             .unwrap_or_default();
-        if let Ok(state) = update_ui_state(|state| {
-            for p in panes.values() {
-                if !state.panes.contains_key(p.pane_id.as_str())
-                    && let Some(ui) = state.panes.remove(&p.target)
-                {
-                    state.panes.insert(p.pane_id.to_string(), ui);
-                }
-            }
-            state.panes.retain(|id, _| panes.contains_key(id));
-            for p in panes.values() {
-                let entry = state.panes.entry(p.pane_id.to_string()).or_default();
-                entry.stashed = p.stashed;
-                if let Some(unread) = pending.get(p.pane_id.as_str()) {
-                    entry.forced_unread = *unread;
-                    entry.read_content_hash = (!*unread).then(|| p.content_hash.clone());
-                }
-            }
-            state.panes.retain(|_, ui| !ui_pane_state_is_empty(ui));
-            state.selected_pane_id = selected_pane_id.clone();
-            state.sidebar_width = sidebar_width;
-            state.sort_mode = sort_mode.as_str().to_string();
-        }) {
+        state.sidebar_width = self.sidebar_width();
+        state.sort_mode = self.sort_mode.as_str().to_string();
+    }
+
+    #[cfg(not(test))]
+    fn save_state(&mut self) {
+        if let Ok(state) = update_ui_state(|state| self.update_saved_state(state)) {
             self.ui_state = state;
             self.pending_unread_changes.clear();
         }
@@ -1356,11 +1353,10 @@ impl App {
 
     #[cfg(test)]
     fn save_state(&mut self) {
-        self.ui_state.sidebar_width = self.sidebar_width();
-        self.ui_state.selected_pane_id = self
-            .current_pane()
-            .map(|pane| pane.pane_id.to_string())
-            .unwrap_or_default();
+        let mut state = std::mem::take(&mut self.ui_state);
+        self.update_saved_state(&mut state);
+        self.ui_state = state;
+        self.pending_unread_changes.clear();
     }
 }
 
@@ -2012,6 +2008,66 @@ mod tests {
             panes: cached,
             ..Snapshot::default()
         }
+    }
+
+    #[test]
+    fn saved_state_merges_current_changes_without_losing_read_state() {
+        use crate::agent::persist::UiPaneState;
+
+        let mut first = pane("%1", 0);
+        first.stashed = true;
+        first.content_hash = "current".into();
+        let mut app = app_with_panes(vec![first, pane("%2", 1)]);
+        app.cursor = app.find_pane_by_id("%2").unwrap();
+        app.sort_mode = SortMode::Order;
+        app.pending_unread_changes.insert("%1".into(), false);
+        let mut state = UiState::default();
+        state.panes.insert(
+            app.panes["%1"].target.clone(),
+            UiPaneState {
+                forced_unread: true,
+                ..UiPaneState::default()
+            },
+        );
+        state.panes.insert(
+            "%2".into(),
+            UiPaneState {
+                read_content_hash: Some("other-client-read".into()),
+                ..UiPaneState::default()
+            },
+        );
+        state.panes.insert("%99".into(), UiPaneState::default());
+
+        app.update_saved_state(&mut state);
+        assert_eq!(state.panes.len(), 2);
+        assert!(state.panes["%1"].stashed);
+        assert!(!state.panes["%1"].forced_unread);
+        assert_eq!(
+            state.panes["%1"].read_content_hash.as_deref(),
+            Some("current")
+        );
+        assert_eq!(
+            state.panes["%2"].read_content_hash.as_deref(),
+            Some("other-client-read")
+        );
+        assert_eq!(state.selected_pane_id, "%2");
+        assert_eq!(state.sort_mode, "order");
+    }
+
+    #[test]
+    fn saved_state_removes_empty_entries_after_unstash() {
+        let mut app = app_with_panes(vec![pane("%1", 0)]);
+        let mut state = UiState::default();
+        app.panes.get_mut("%1").unwrap().stashed = true;
+        app.update_saved_state(&mut state);
+        assert!(state.panes["%1"].stashed);
+        app.panes.get_mut("%1").unwrap().stashed = false;
+        app.update_saved_state(&mut state);
+        assert!(state.panes.is_empty());
+        app.pending_unread_changes.insert("%1".into(), true);
+        app.update_saved_state(&mut state);
+        assert!(state.panes["%1"].forced_unread);
+        assert!(state.panes["%1"].read_content_hash.is_none());
     }
 
     #[test]
@@ -3035,11 +3091,17 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         assert_eq!(app.panes["%1"].status, PaneStatus::Unread);
-        assert_eq!(app.pending_unread_changes.get("%1"), Some(&true));
+        assert!(app.ui_state.panes["%1"].forced_unread);
+        assert!(app.pending_unread_changes.is_empty());
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         assert_eq!(app.panes["%1"].status, PaneStatus::Idle);
-        assert_eq!(app.pending_unread_changes.get("%1"), Some(&false));
+        assert!(!app.ui_state.panes["%1"].forced_unread);
+        assert_eq!(
+            app.ui_state.panes["%1"].read_content_hash.as_deref(),
+            Some("")
+        );
+        assert!(app.pending_unread_changes.is_empty());
 
         app.panes.get_mut("%1").unwrap().status = PaneStatus::Busy;
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);

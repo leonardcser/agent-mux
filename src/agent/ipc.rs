@@ -42,7 +42,11 @@ pub fn socket_path() -> PathBuf {
 }
 
 pub fn request(request: &Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(socket_path()).context("connect daemon socket")?;
+    let stream = UnixStream::connect(socket_path()).context("connect daemon socket")?;
+    exchange(stream, request)
+}
+
+fn exchange(mut stream: UnixStream, request: &Request) -> Result<Response> {
     let timeout = if matches!(request, Request::SubscribeFresh) {
         Duration::from_secs(2)
     } else {
@@ -83,18 +87,57 @@ pub fn get_state() -> Result<(Option<Snapshot>, UiState)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn status_preserves_flat_build_fields_on_wire() {
-        let value = serde_json::json!({
-            "type": "Status", "build_id": "future-build", "protocol_version": 999, "healthy": true,
+    fn exchange_response(response: &[u8]) -> Result<Response> {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let response = response.to_vec();
+        let peer = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(&server).read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                serde_json::json!({"type": "Status"})
+            );
+            server.write_all(&response).unwrap();
         });
-        let response: Response = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&response).unwrap(), value);
-        let Response::Status { build, healthy } = response else {
-            panic!("expected status")
-        };
-        assert!(healthy);
-        assert_eq!(build.build_id, "future-build");
-        assert!(build.check_compatibility().is_err());
+        let result = exchange(client, &Request::Status);
+        peer.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn socket_round_trip_preserves_wire_fields_and_compatibility() {
+        let current = crate::agent::daemon::PROTOCOL_VERSION;
+        for protocol_version in [current, current + 1] {
+            let value = serde_json::json!({
+                "type": "Status", "build_id": "fixture", "healthy": true,
+                "protocol_version": protocol_version,
+            });
+            let mut bytes = serde_json::to_vec(&value).unwrap();
+            bytes.push(b'\n');
+            let response = exchange_response(&bytes).unwrap();
+            assert_eq!(serde_json::to_value(&response).unwrap(), value);
+            let Response::Status { build, .. } = response else {
+                panic!("expected status")
+            };
+            assert_eq!(
+                build.check_compatibility().is_ok(),
+                protocol_version == current
+            );
+        }
+    }
+
+    #[test]
+    fn socket_rejects_disconnects_and_malformed_responses() {
+        for response in [b"".as_slice(), b"not-json\n", b"{}\n"] {
+            let error = exchange_response(response).unwrap_err();
+            assert!(error.to_string().contains("decode daemon response"));
+        }
+    }
+
+    #[test]
+    fn socket_read_deadline_bounds_unresponsive_peer() {
+        let (client, _server) = UnixStream::pair().unwrap();
+        let error = exchange(client, &Request::Status).unwrap_err();
+        assert!(error.to_string().contains("read daemon response"));
     }
 }

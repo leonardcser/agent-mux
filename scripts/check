@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+
+case "${1:-}" in
+    "") selection='not slow' ;;
+    --all) selection='' ;;
+    *) echo "Usage: scripts/check [--all]" >&2; exit 2 ;;
+esac
+if [ "$#" -gt 1 ]; then
+    echo "Usage: scripts/check [--all]" >&2
+    exit 2
+fi
+for tool in cargo uv tmux cc git; do
+    command -v "$tool" >/dev/null || { echo "Missing prerequisite: $tool" >&2; exit 1; }
+done
+
+uv --no-config sync --locked
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+uv --no-config run --locked ruff check tests
+uv --no-config run --locked ruff format --check tests
+# The session fixture builds the release executable once, using Cargo's target directory.
+uv --no-config run --locked pytest -m "$selection" --durations=10

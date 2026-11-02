@@ -178,18 +178,10 @@ fn git_dirty(dir: &str) -> Option<bool> {
 mod tests {
     use super::*;
     use crate::agent::PaneId;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("agent-mux-{name}-{}-{nanos}", std::process::id()))
-    }
-
     fn git(repo: &Path, args: &[&str]) {
         let output = Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .current_dir(repo)
             .args(args)
             .output()
@@ -203,7 +195,8 @@ mod tests {
 
     #[test]
     fn dirty_status_tracks_changes_without_index_updates() -> std::io::Result<()> {
-        let repo = temp_dir("dirty");
+        let root = tempfile::tempdir()?;
+        let repo = root.path().join("repo");
         fs::create_dir_all(&repo)?;
         git(&repo, &["init"]);
         fs::write(repo.join("tracked"), "original")?;
@@ -246,22 +239,24 @@ mod tests {
                 index_mtime
             );
         }
-        fs::remove_dir_all(repo)
+        Ok(())
     }
 
     #[test]
     fn dirty_status_detects_untracked_files_before_first_commit() -> std::io::Result<()> {
-        let repo = temp_dir("unborn");
+        let root = tempfile::tempdir()?;
+        let repo = root.path().join("repo");
         fs::create_dir_all(&repo)?;
         git(&repo, &["init"]);
         fs::write(repo.join("untracked"), "new")?;
         assert_eq!(git_dirty(repo.to_str().unwrap()), Some(true));
-        fs::remove_dir_all(repo)
+        Ok(())
     }
 
     #[test]
     fn failed_git_status_preserves_dirty_metadata() -> std::io::Result<()> {
-        let repo = temp_dir("invalid");
+        let root = tempfile::tempdir()?;
+        let repo = root.path().join("repo");
         fs::create_dir_all(repo.join(".git"))?;
         let mut panes = vec![Pane {
             path: repo.to_string_lossy().to_string(),
@@ -272,12 +267,13 @@ mod tests {
         enrich_panes(&mut panes);
         assert!(panes[0].git_dirty);
         assert!(panes[0].project_dirty);
-        fs::remove_dir_all(repo)
+        Ok(())
     }
 
     #[test]
     fn fast_enriches_worktree_structure() -> std::io::Result<()> {
-        let root = temp_dir("worktree");
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path();
         let repo = root.join("repo");
         let worktree = root.join("repo-feature");
         let worktree_git_dir = repo.join(".git/worktrees/repo-feature");
@@ -307,7 +303,6 @@ mod tests {
         assert!(panes[0].git_dirty);
         assert!(panes[0].project_dirty);
 
-        fs::remove_dir_all(root)?;
         Ok(())
     }
 }

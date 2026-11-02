@@ -299,3 +299,80 @@ fn wait_stopped(timeout: Duration) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executable(source: &str) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("replacement");
+        fs::write(&path, source).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        (root, path)
+    }
+
+    #[test]
+    fn validation_accepts_identified_builds_without_assuming_protocol() {
+        let (_root, path) = executable("#!/bin/sh\ncat \"$0.json\"\n");
+        let expected = fingerprint(&path).unwrap();
+        for protocol_version in [PROTOCOL_VERSION, 999] {
+            let info = BuildInfo {
+                build_id: expected.clone(),
+                protocol_version,
+            };
+            fs::write(
+                path.with_extension("json"),
+                serde_json::to_vec(&info).unwrap(),
+            )
+            .unwrap();
+            validate(&path, &expected).unwrap();
+        }
+    }
+
+    #[test]
+    fn validation_rejects_failed_malformed_or_misidentified_builds() {
+        for (source, message) in [
+            ("#!/bin/sh\nexit 1\n", "replacement validation exited"),
+            (
+                "#!/bin/sh\nprintf 'not-json'\n",
+                "invalid build information",
+            ),
+            ("#!/bin/sh\nprintf '{}'\n", "invalid build information"),
+            (
+                "#!/bin/sh\nprintf '{\"build_id\":\"wrong\",\"protocol_version\":1}'\n",
+                "installed executable changed",
+            ),
+        ] {
+            let (_root, path) = executable(source);
+            let error = validate(&path, &fingerprint(&path).unwrap()).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+        let (root, path) = executable("invalid executable\n");
+        assert!(validate(&path, &fingerprint(&path).unwrap()).is_err());
+        assert!(fingerprint(&root.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn validation_bounds_hung_executable() {
+        let (_root, path) = executable("#!/bin/sh\nexec sleep 60\n");
+        let error = validate(&path, &fingerprint(&path).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("validation timed out"));
+    }
+
+    #[test]
+    fn validation_bounds_stdout_inherited_by_descendant() {
+        let (_root, path) =
+            executable("#!/bin/sh\nsleep 60 &\necho $! > \"$0.pid\"\nprintf '{}'\n");
+        let result = validate(&path, &fingerprint(&path).unwrap());
+        // This PID was created by this fixture, not taken from daemon state.
+        let pid = fs::read_to_string(path.with_extension("pid")).unwrap();
+        let _ = Command::new("kill").args(["-TERM", pid.trim()]).status();
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("read replacement validation output")
+        );
+    }
+}

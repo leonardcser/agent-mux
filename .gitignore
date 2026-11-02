@@ -1,6 +1,6 @@
-agent-mux
-
-
-# Added by cargo
-
-/target
+/agent-mux
+/target/
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+__pycache__/
