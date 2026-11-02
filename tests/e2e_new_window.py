@@ -42,7 +42,7 @@ def main():
         try:
             tmux("new-session", "-d", "-s", "browser", "-x", "120", "-y", "40")
             # The selected project belongs to another session, not the browser.
-            tmux("new-session", "-d", "-s", "agents", "-c", str(project), str(provider))
+            tmux("new-session", "-d", "-s", "agents", "-n", "agent-fixture", "-c", str(project), str(provider))
             tmux("new-window", "-d", "-t", "agents:7", "sleep 120")
             env["TMUX"] = tmux("display-message", "-p", "#{socket_path},#{pid},0")
             watcher = subprocess.Popen(
@@ -69,7 +69,7 @@ def main():
                     "new-window", "-t", "browser:", "-P", "-F", "#{pane_id}", launch
                 )
                 wait_for(
-                    lambda: "claude" in tmux("capture-pane", "-p", "-t", sidebar),
+                    lambda: "agent-fixture" in tmux("capture-pane", "-p", "-t", sidebar),
                     "render selected agent",
                 )
                 before = windows("agents")
@@ -88,7 +88,10 @@ def main():
                 )
                 target = f"agents:{indexes[-1]}"
                 assert tmux("display-message", "-p", "-t", target, "#{window_active}") == "1"
-                assert tmux("display-message", "-p", "-t", target, "#{pane_current_path}") == str(project)
+                wait_for(
+                    lambda: tmux("display-message", "-p", "-t", target, "#{pane_current_path}") == str(project),
+                    "new process enters project directory",
+                )
                 wait_for(
                     lambda: len(windows("browser")) == len(browser_before) - 1,
                     "close browser after opening window",
