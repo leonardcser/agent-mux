@@ -53,11 +53,15 @@ pub fn list_panes_fast() -> Result<Vec<Pane>> {
 
 fn fetch_panes() -> Result<Vec<Pane>> {
     let _g = smelt_perf::perf::begin("tmux.fetch_panes");
-    let tmux_out = list_tmux_panes()?;
+    let (tmux_out, focused) = list_tmux_panes()?;
     let pt = load_process_table();
     let raw = {
         let _g = smelt_perf::perf::begin("provider.resolve_panes");
-        resolve_agent_panes(parse_tmux_panes(&tmux_out), &pt)
+        let mut panes = parse_tmux_panes(&tmux_out);
+        for pane in &mut panes {
+            pane.window_focused = focused.contains(&pane.pane_id);
+        }
+        resolve_agent_panes(panes, &pt)
     };
     smelt_perf::perf::record_value("tmux.agent_panes", raw.len() as u64);
     Ok(raw
@@ -82,19 +86,27 @@ fn fetch_panes() -> Result<Vec<Pane>> {
         .collect())
 }
 
-fn list_tmux_panes() -> Result<String> {
+fn list_tmux_panes() -> Result<(String, std::collections::HashSet<PaneId>)> {
     let _g = smelt_perf::perf::begin("tmux.list_panes");
     let out = Command::new("tmux")
         .arg("list-panes")
         .arg("-a")
         .arg("-F")
         .arg("#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{?session_attached,1,0}#{pane_active}\t#{pane_id}\t#{pane_width}x#{pane_height}")
+        .args([";", "list-clients", "-F", "@client\t#{&&:#{client_control_mode},#{m:*read-only*,#{client_flags}}}\t#{pane_id}"])
         .output()
         .context("tmux list-panes")?;
     if !out.status.success() {
         return Err(anyhow!("tmux list-panes exited with {}", out.status));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let output = String::from_utf8_lossy(&out.stdout).into_owned();
+    // Read-only control clients observe panes. Interactive control clients (for
+    // example iTerm2) still count as user focus.
+    let focused = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("@client\t0\t").and_then(PaneId::parse))
+        .collect();
+    Ok((output, focused))
 }
 
 fn parse_tmux_panes(out: &str) -> Vec<RawPane> {

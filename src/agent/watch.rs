@@ -12,7 +12,7 @@ use fs2::FileExt;
 use crate::agent::git::{dirty_statuses, enrich_panes_fast};
 use crate::agent::ipc::{Request, Response, socket_path};
 use crate::agent::persist::{
-    Snapshot, UiPaneState, cache_panes, load_snapshot, load_ui_state, panes_from_snapshot,
+    Snapshot, UiPaneState, UiState, cache_panes, load_snapshot, load_ui_state, panes_from_snapshot,
     snapshot_path, state_dir, ui_pane_state_is_empty, update_snapshot, update_snapshot_at,
     update_ui_state_if_changed, write_heartbeat,
 };
@@ -52,27 +52,43 @@ pub fn run() -> Result<()> {
     let latest_snapshot = Arc::new(Mutex::new(None));
     let subscribers = Arc::new(Mutex::new(Vec::new()));
     let last_refresh = Arc::new(Mutex::new(None));
+    let (refresh_tx, refresh_rx) = mpsc::channel();
     start_socket_server(
         latest_snapshot.clone(),
         subscribers.clone(),
         stopped.clone(),
         last_refresh.clone(),
+        refresh_tx,
     )?;
     start_metadata_worker(latest_snapshot.clone(), subscribers.clone());
 
     let fast_interval = Duration::from_millis(500);
+    let mut waiting: Vec<UnixStream> = Vec::new();
     while !stopped.load(Ordering::SeqCst) {
+        waiting.extend(refresh_rx.try_iter());
         let start = Instant::now();
-        match refresh_once_with(&mut reconciler, Some(&latest_snapshot), Some(&subscribers)) {
+        let result = refresh_once_with(&mut reconciler, Some(&latest_snapshot), Some(&subscribers))
+            .map_err(|err| format!("{err:#}"));
+        match &result {
             Ok(()) => {
                 *last_refresh.lock().unwrap() = Some(Instant::now());
             }
-            Err(err) => log_error(&format!("refresh failed: {err:#}")),
+            Err(err) => log_error(&format!("refresh failed: {err}")),
         }
-
-        let elapsed = start.elapsed();
-        if elapsed < fast_interval {
-            std::thread::sleep(fast_interval - elapsed);
+        // Only initialize subscriptions requested before this status check started.
+        for mut stream in waiting.drain(..) {
+            match &result {
+                Ok(()) => subscribe_client(stream, &latest_snapshot, &subscribers),
+                Err(message) => {
+                    let response = Response::Error {
+                        message: message.clone(),
+                    };
+                    std::thread::spawn(move || write_response(&mut stream, response));
+                }
+            }
+        }
+        if let Ok(stream) = refresh_rx.recv_timeout(fast_interval.saturating_sub(start.elapsed())) {
+            waiting.push(stream);
         }
     }
 
@@ -312,6 +328,7 @@ fn start_socket_server(
     subscribers: Subscribers,
     stopped: Arc<AtomicBool>,
     last_refresh: Arc<Mutex<Option<Instant>>>,
+    refresh_tx: mpsc::Sender<UnixStream>,
 ) -> Result<()> {
     let path = socket_path();
     let _ = fs::remove_file(&path);
@@ -325,6 +342,7 @@ fn start_socket_server(
                     &subscribers,
                     &stopped,
                     &last_refresh,
+                    &refresh_tx,
                 ),
                 Err(err) => log_error(&format!("accept daemon socket failed: {err:#}")),
             }
@@ -339,6 +357,7 @@ fn handle_socket_client(
     subscribers: &Subscribers,
     stopped: &AtomicBool,
     last_refresh: &Mutex<Option<Instant>>,
+    refresh_tx: &mpsc::Sender<UnixStream>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
@@ -374,6 +393,16 @@ fn handle_socket_client(
         Ok(Request::GetState) => {
             write_response(&mut stream, state_response(latest_snapshot));
         }
+        Ok(Request::SubscribeFresh) => {
+            if let Err(mut err) = refresh_tx.send(stream) {
+                write_response(
+                    &mut err.0,
+                    Response::Error {
+                        message: "watcher stopped".into(),
+                    },
+                );
+            }
+        }
         Ok(Request::Subscribe) => subscribe_client(stream, latest_snapshot, subscribers),
         Err(err) => {
             write_response(
@@ -391,11 +420,7 @@ fn subscribe_client(
     latest_snapshot: &SharedSnapshot,
     subscribers: &Subscribers,
 ) {
-    write_response(&mut stream, state_response(latest_snapshot));
-    let (tx, rx) = mpsc::channel();
-    if let Ok(mut subscribers) = subscribers.lock() {
-        subscribers.push(tx);
-    }
+    let rx = register_subscriber(latest_snapshot, subscribers, load_ui_state());
     std::thread::spawn(move || {
         for response in rx {
             if !write_response(&mut stream, response) {
@@ -403,6 +428,25 @@ fn subscribe_client(
             }
         }
     });
+}
+
+fn register_subscriber(
+    latest_snapshot: &SharedSnapshot,
+    subscribers: &Subscribers,
+    ui_state: UiState,
+) -> mpsc::Receiver<Response> {
+    let (tx, rx) = mpsc::channel();
+    // Match publication lock order. Queue initial state before registering, with
+    // no disk or socket I/O under either lock.
+    let latest = latest_snapshot.lock().unwrap();
+    let mut subscribers = subscribers.lock().unwrap();
+    tx.send(Response::State {
+        snapshot: latest.clone(),
+        ui_state,
+    })
+    .expect("new subscriber receiver");
+    subscribers.push(tx);
+    rx
 }
 
 fn state_response(latest_snapshot: &SharedSnapshot) -> Response {
@@ -467,6 +511,39 @@ pub fn lock_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unread_subscriber_does_not_block_publication_or_reorder_initial_state() {
+        let latest = Arc::new(Mutex::new(Some(Snapshot {
+            revision: 1,
+            ..Snapshot::default()
+        })));
+        let subscribers = Arc::new(Mutex::new(Vec::new()));
+        let rx = register_subscriber(&latest, &subscribers, UiState::default());
+        assert!(latest.try_lock().is_ok());
+        assert!(subscribers.try_lock().is_ok());
+        // Publish while the subscriber has not consumed its initial state.
+        publish_snapshot(
+            Some(&latest),
+            Some(&subscribers),
+            Snapshot {
+                revision: 2,
+                ..Snapshot::default()
+            },
+            true,
+        );
+        for revision in [1, 2] {
+            let Response::State {
+                snapshot: Some(snapshot),
+                ..
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("expected snapshot");
+            };
+            assert_eq!(snapshot.revision, revision);
+        }
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn fast_poll_preserves_metadata_committed_after_pane_discovery() {

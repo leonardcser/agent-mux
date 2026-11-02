@@ -13,6 +13,7 @@ use crate::agent::persist::{Snapshot, UiState, state_dir};
 #[serde(tag = "type")]
 pub enum Request {
     GetState,
+    SubscribeFresh,
     Subscribe,
     Status,
     Shutdown,
@@ -42,9 +43,12 @@ pub fn socket_path() -> PathBuf {
 
 pub fn request(request: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket_path()).context("connect daemon socket")?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(150)))
-        .ok();
+    let timeout = if matches!(request, Request::SubscribeFresh) {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(150)
+    };
+    stream.set_read_timeout(Some(timeout)).ok();
     stream
         .set_write_timeout(Some(Duration::from_millis(150)))
         .ok();

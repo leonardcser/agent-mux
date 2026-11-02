@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,16 +25,17 @@ use crate::agent::persist::{
 };
 #[cfg(not(test))]
 use crate::agent::persist::{ui_pane_state_is_empty, update_ui_state};
-use crate::agent::{Pane, PaneId, PaneStatus, capture_pane, kill_pane, switch_to_pane};
+use crate::agent::{Pane, PaneId, PaneStatus, kill_pane, switch_to_pane};
 use crate::config::{
     Config, SectionBehavior, SidebarConfig, SortMode, StartupSelection, WorkingSection,
 };
+use crate::preview::{FRAME_INTERVAL, Preview, Target as PreviewTarget};
 
 const SIDEBAR: PaintId = PaintId(1);
 const PREVIEW: PaintId = PaintId(3);
 const MIN_SIDEBAR: u16 = 20;
 const MIN_PREVIEW: u16 = 20;
-const SYNCING_MSG: &str = "syncing agent-mux snapshot";
+const SYNCING_MSG: &str = "Refreshing session status";
 
 #[derive(Clone, Debug)]
 enum Hit {
@@ -69,23 +70,36 @@ enum TreeItem {
 #[derive(Debug)]
 enum Msg {
     PanesLoaded {
-        panes: Vec<Pane>,
-        snapshot_generation: u64,
+        snapshot: Option<Snapshot>,
         ui_state: UiState,
-        err: Option<String>,
         live: bool,
     },
-    PreviewLoaded {
-        pane_id: String,
-        content: String,
-        preview_seq: u64,
-    },
+    PreviewReady,
     PaneKilled {
         pane_id: String,
         err: Option<String>,
     },
     SubscriptionEnded,
     DaemonChecked(Option<String>),
+    Input(io::Result<Event>),
+}
+
+#[derive(Default)]
+struct LatestPreview {
+    frame: Mutex<Option<(PreviewTarget, String)>>,
+}
+
+impl LatestPreview {
+    fn replace(&self, target: PreviewTarget, content: String) -> bool {
+        let mut frame = self.frame.lock().unwrap();
+        let notify = frame.is_none();
+        *frame = Some((target, content));
+        notify
+    }
+
+    fn take(&self) -> Option<(PreviewTarget, String)> {
+        self.frame.lock().unwrap().take()
+    }
 }
 
 pub fn run(tmux_session: String) -> Result<()> {
@@ -176,12 +190,22 @@ fn render_config_error(slice: &mut GridSlice<'_>, error: &str, scroll: &mut usiz
 fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut dirty = true;
-    let mut last_draw = Instant::now() - Duration::from_millis(33);
+    let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut last_panes = Instant::now() - Duration::from_millis(500);
-    let mut last_preview = Instant::now();
+    let startup_deadline = Instant::now() + Duration::from_secs(2);
+    let mut startup_fresh = false;
     let mut last_subscribe = Instant::now() - Duration::from_secs(1);
     let mut panes_pending = false;
-    let mut preview_pending = false;
+    let preview_tx = tx.clone();
+    let latest_preview = Arc::new(LatestPreview::default());
+    let preview_mailbox = latest_preview.clone();
+    let mut preview = Preview::new(move |target, content| {
+        if preview_mailbox.replace(target, content) {
+            let _ = preview_tx.send(Msg::PreviewReady);
+        }
+    });
+    let _input = InputReader::start(tx.clone());
+    let mut pending = None;
     let mut subscribed = false;
     let mut subscribe_pending = true;
 
@@ -201,70 +225,44 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
         }
     });
     spawn_subscribe_panes(&tx);
-    load_preview(app);
 
     loop {
-        while let Ok(msg) = rx.try_recv() {
+        let batch_start = Instant::now();
+        for msg in pending.take().into_iter().chain(rx.try_iter()) {
             match msg {
                 Msg::PanesLoaded {
-                    mut panes,
-                    snapshot_generation,
+                    snapshot,
                     ui_state,
-                    err,
                     live,
                 } => {
                     if live {
+                        startup_fresh = true;
                         subscribed = true;
                         subscribe_pending = false;
                     } else {
                         panes_pending = false;
                     }
-                    let mut changed = false;
-                    if let Some(err) = err {
-                        if err == SYNCING_MSG && app.has_display_snapshot() {
-                            if app.err.as_deref() == Some(SYNCING_MSG) {
-                                app.err = None;
-                                changed = true;
-                            }
-                        } else if app.err.as_deref() != Some(&err) {
-                            app.err = Some(err);
-                            changed = true;
-                        }
-                    } else {
-                        if app.err.is_some() {
-                            app.err = None;
-                            changed = true;
-                        }
-                        app.hide_pending_kills(&mut panes);
-                        let ui_is_older = ui_state_is_older_than(&ui_state, &app.ui_state);
-                        let ui_changed =
-                            !ui_is_older && ui_state.updated_at != app.ui_state.updated_at;
-                        if ui_changed {
-                            app.ui_state = ui_state;
-                        } else if ui_is_older {
-                            apply_ui_state(&mut panes, &app.ui_state);
-                        }
-                        if snapshot_generation != app.snapshot_generation || ui_changed {
-                            app.snapshot_generation = snapshot_generation;
-                            app.replace_panes(panes);
-                            changed = true;
-                        }
+                    if let Some(snapshot) = snapshot {
+                        dirty |= app.apply_snapshot(snapshot, ui_state);
                     }
-                    dirty |= changed;
+                    let err = (!startup_fresh).then(|| SYNCING_MSG.to_string());
+                    if app.err != err {
+                        app.err = err;
+                        dirty = true;
+                    }
                 }
-                Msg::PreviewLoaded {
-                    pane_id,
-                    content,
-                    preview_seq,
-                } => {
-                    preview_pending = false;
-                    if preview_seq == app.preview_gen
+                Msg::PreviewReady => {
+                    if let Some((target, content)) = latest_preview.take()
+                        && target.generation == app.preview_gen
                         && app
                             .current_pane()
-                            .is_some_and(|pane| pane.pane_id.as_str() == pane_id)
+                            .is_some_and(|pane| pane.pane_id == target.pane_id)
                     {
-                        app.preview_lines = preview_lines(&content);
-                        dirty = true;
+                        let lines = preview_lines(&content);
+                        if app.preview_lines != lines {
+                            app.preview_lines = lines;
+                            dirty = true;
+                        }
                     }
                 }
                 Msg::PaneKilled { pane_id, err } => {
@@ -287,6 +285,34 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                     subscribed = false;
                     subscribe_pending = false;
                 }
+                Msg::Input(event) => {
+                    let action = match event? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            dirty |= app.split_interaction.active_id().is_some();
+                            app.handle_key(key, &tx)
+                        }
+                        Event::Mouse(mouse) => app.handle_mouse(mouse),
+                        Event::Resize(w, h) => {
+                            surface.set_terminal_size(w, h);
+                            app.resize(w, h);
+                            Action::Redraw
+                        }
+                        Event::FocusLost => {
+                            app.cancel_resize();
+                            Action::Redraw
+                        }
+                        _ => Action::None,
+                    };
+                    match action {
+                        Action::Quit => return Ok(()),
+                        Action::Redraw => dirty = true,
+                        Action::None => {}
+                    }
+                }
+            }
+            // Give rendering a turn even while producers keep the queue nonempty.
+            if batch_start.elapsed() >= FRAME_INTERVAL {
+                break;
             }
         }
 
@@ -296,56 +322,78 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
             last_subscribe = Instant::now();
         }
 
-        if !subscribed && last_panes.elapsed() >= Duration::from_millis(500) && !panes_pending {
+        if !subscribed
+            && (startup_fresh || Instant::now() >= startup_deadline)
+            && last_panes.elapsed() >= Duration::from_millis(500)
+            && !panes_pending
+        {
             spawn_load_panes(&tx);
             panes_pending = true;
             last_panes = Instant::now();
         }
 
-        if last_preview.elapsed() >= Duration::from_millis(100)
-            && !preview_pending
-            && app.current_pane().is_some()
-        {
-            preview_pending = spawn_preview(&tx, app);
-            last_preview = Instant::now();
-        }
+        preview.select(app.current_pane().map(|pane| PreviewTarget {
+            pane_id: pane.pane_id.clone(),
+            session: pane.session.clone(),
+            lines: app.height.max(50) as usize,
+            generation: app.preview_gen,
+        }));
 
-        if dirty || last_draw.elapsed() >= Duration::from_millis(250) {
+        if (dirty && last_draw.elapsed() >= FRAME_INTERVAL)
+            || last_draw.elapsed() >= Duration::from_secs(1)
+        {
             render(surface, app, writer)?;
             dirty = false;
             last_draw = Instant::now();
         }
+        let wait = if dirty {
+            FRAME_INTERVAL.saturating_sub(last_draw.elapsed())
+        } else {
+            Duration::from_millis(250)
+        };
+        pending = rx.recv_timeout(wait).ok();
+    }
+}
 
-        let poll_for = Duration::from_millis(33)
-            .saturating_sub(last_draw.elapsed())
-            .max(Duration::from_millis(1));
-        if event::poll(poll_for)? {
-            let action = match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    dirty |= app.split_interaction.active_id().is_some();
-                    app.handle_key(key, &tx)
+struct InputReader {
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl InputReader {
+    fn start(tx: mpsc::Sender<Msg>) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        let thread = thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match event::poll(Duration::from_millis(100)) {
+                    Ok(false) => continue,
+                    Ok(true) => {
+                        if tx.send(Msg::Input(event::read())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Msg::Input(Err(err)));
+                        break;
+                    }
                 }
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
-                Event::Resize(w, h) => {
-                    surface.set_terminal_size(w, h);
-                    app.resize(w, h);
-                    Action::Redraw
-                }
-                Event::FocusLost => {
-                    app.cancel_resize();
-                    Action::Redraw
-                }
-                _ => Action::None,
-            };
-            match action {
-                Action::Quit => return Ok(()),
-                Action::Redraw => dirty = true,
-                Action::Preview => {
-                    preview_pending = spawn_preview(&tx, app);
-                    dirty = true;
-                }
-                Action::None => {}
             }
+        });
+        Self {
+            stopped,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for InputReader {
+    fn drop(&mut self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -369,7 +417,8 @@ fn spawn_subscribe_panes(tx: &mpsc::Sender<Msg>) {
 fn subscribe_panes(tx: &mpsc::Sender<Msg>) -> Result<()> {
     ipc::check_compatibility()?;
     let mut stream = UnixStream::connect(ipc::socket_path())?;
-    let request = serde_json::to_string(&ipc::Request::Subscribe)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let request = serde_json::to_string(&ipc::Request::SubscribeFresh)?;
     writeln!(stream, "{request}")?;
     let mut reader = BufReader::new(stream);
     loop {
@@ -378,18 +427,14 @@ fn subscribe_panes(tx: &mpsc::Sender<Msg>) -> Result<()> {
             break;
         }
         match serde_json::from_str::<ipc::Response>(&line)? {
-            ipc::Response::State { snapshot, ui_state } => {
-                send_panes_loaded(tx, snapshot, ui_state, true);
+            ipc::Response::State {
+                snapshot: Some(snapshot),
+                ui_state,
+            } => {
+                reader.get_ref().set_read_timeout(None)?;
+                send_panes_loaded(tx, Some(snapshot), ui_state, true);
             }
-            ipc::Response::Error { message } => {
-                let _ = tx.send(Msg::PanesLoaded {
-                    panes: Vec::new(),
-                    snapshot_generation: 0,
-                    ui_state: load_ui_state(),
-                    err: Some(message),
-                    live: true,
-                });
-            }
+            ipc::Response::Error { message } => anyhow::bail!(message),
             _ => anyhow::bail!("unexpected subscription response"),
         }
     }
@@ -402,24 +447,9 @@ fn send_panes_loaded(
     ui_state: UiState,
     live: bool,
 ) {
-    let Some(snapshot) = snapshot else {
-        let _ = tx.send(Msg::PanesLoaded {
-            panes: Vec::new(),
-            snapshot_generation: 0,
-            ui_state,
-            err: Some(SYNCING_MSG.into()),
-            live,
-        });
-        return;
-    };
-    let snapshot_generation = snapshot.generation;
-    let mut panes = panes_from_snapshot(&snapshot);
-    apply_ui_state(&mut panes, &ui_state);
     let _ = tx.send(Msg::PanesLoaded {
-        panes,
-        snapshot_generation,
+        snapshot,
         ui_state,
-        err: None,
         live,
     });
 }
@@ -449,33 +479,6 @@ fn shows_nothing(line: &Line<'_>) -> bool {
         .all(|span| span.text.trim().is_empty() && span.style.bg.is_none() && !span.style.reverse)
 }
 
-fn load_preview(app: &mut App) {
-    let Some(p) = app.current_pane() else { return };
-    let pane_id = p.pane_id.clone();
-    let lines = app.height.max(50) as usize;
-    let content = capture_pane(&pane_id, lines).unwrap_or_else(|err| format!("error: {err}"));
-    app.preview_lines = preview_lines(&content);
-}
-
-fn spawn_preview(tx: &mpsc::Sender<Msg>, app: &App) -> bool {
-    let Some(p) = app.current_pane() else {
-        return false;
-    };
-    let pane_id = p.pane_id.clone();
-    let lines = app.height.max(50) as usize;
-    let preview_seq = app.preview_gen;
-    let tx = tx.clone();
-    thread::spawn(move || {
-        let content = capture_pane(&pane_id, lines).unwrap_or_else(|err| format!("error: {err}"));
-        let _ = tx.send(Msg::PreviewLoaded {
-            pane_id: pane_id.to_string(),
-            content,
-            preview_seq,
-        });
-    });
-    true
-}
-
 fn ui_state_is_older_than(incoming: &UiState, current: &UiState) -> bool {
     match (incoming.updated_at, current.updated_at) {
         (Some(incoming), Some(current)) => incoming < current,
@@ -488,7 +491,6 @@ fn ui_state_is_older_than(incoming: &UiState, current: &UiState) -> bool {
 enum Action {
     None,
     Redraw,
-    Preview,
     Quit,
 }
 
@@ -523,6 +525,7 @@ struct App {
     preview_lines: Vec<Line<'static>>,
     preview_gen: u64,
     snapshot_generation: u64,
+    snapshot_revision: u64,
     project_win_width: HashMap<String, usize>,
     width: u16,
     height: u16,
@@ -562,26 +565,16 @@ fn sidebar_split(width: u16) -> Split {
 
 impl App {
     fn new(tmux_session: String, sidebar_config: SidebarConfig) -> Self {
-        let (snapshot, ui_state) = load_pane_state();
-        let snapshot_generation = snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.generation)
-            .unwrap_or_default();
-        let mut panes = snapshot
-            .as_ref()
-            .map(panes_from_snapshot)
-            .unwrap_or_default();
-        apply_ui_state(&mut panes, &ui_state);
+        // Startup selection must use a completed status scan, not the cached layout.
+        let ui_state = load_ui_state();
         let mut app = Self {
-            panes: panes
-                .into_iter()
-                .map(|p| (p.pane_id.to_string(), p))
-                .collect(),
+            panes: HashMap::new(),
             items: Vec::new(),
             cursor: 0,
             preview_lines: Vec::new(),
             preview_gen: 1,
-            snapshot_generation,
+            snapshot_generation: 0,
+            snapshot_revision: 0,
             project_win_width: HashMap::new(),
             width: 0,
             height: 0,
@@ -595,7 +588,7 @@ impl App {
             sidebar_config,
             new_window_command: None,
             count: 0,
-            err: snapshot.is_none().then(|| SYNCING_MSG.to_string()),
+            err: Some(SYNCING_MSG.to_string()),
             daemon_err: None,
             ui_state,
             pending_unread_changes: HashMap::new(),
@@ -635,6 +628,27 @@ impl App {
             .split(self.sidebar.id())
             .map_or(0, |split| split.geometry.available);
         self.sidebar.preferred_size().resolve(available)
+    }
+
+    fn apply_snapshot(&mut self, snapshot: Snapshot, ui_state: UiState) -> bool {
+        if snapshot.revision < self.snapshot_revision {
+            return false;
+        }
+        self.snapshot_revision = snapshot.revision;
+        let ui_is_older = ui_state_is_older_than(&ui_state, &self.ui_state);
+        let ui_changed = !ui_is_older && ui_state.updated_at != self.ui_state.updated_at;
+        if !ui_is_older {
+            self.ui_state = ui_state;
+        }
+        if snapshot.generation == self.snapshot_generation && !ui_changed {
+            return false;
+        }
+        let mut panes = panes_from_snapshot(&snapshot);
+        apply_ui_state(&mut panes, &self.ui_state);
+        self.hide_pending_kills(&mut panes);
+        self.snapshot_generation = snapshot.generation;
+        self.replace_panes(panes);
+        true
     }
 
     fn replace_panes(&mut self, panes: Vec<Pane>) {
@@ -844,10 +858,6 @@ impl App {
         self.select_cursor(first_pane(&self.items).unwrap_or(0), false);
     }
 
-    fn has_display_snapshot(&self) -> bool {
-        self.snapshot_generation > 0 || !self.panes.is_empty() || !self.pending_kills.is_empty()
-    }
-
     fn remove_current_pane(&mut self) -> Option<PaneId> {
         let pane = self.current_pane()?.clone();
         let pane_id = pane.pane_id.clone();
@@ -1031,13 +1041,13 @@ impl App {
             self.pending_g = false;
             self.select_cursor(first_pane(&self.items).unwrap_or(0), false);
             self.preview_gen += 1;
-            return Action::Preview;
+            return Action::Redraw;
         }
         if alt && matches!(key.code, KeyCode::Char('>')) {
             self.pending_g = false;
             self.select_cursor(last_pane(&self.items).unwrap_or(0), true);
             self.preview_gen += 1;
-            return Action::Preview;
+            return Action::Redraw;
         }
 
         if key.code == KeyCode::Char('d') {
@@ -1053,7 +1063,7 @@ impl App {
                             err,
                         });
                     });
-                    return Action::Preview;
+                    return Action::Redraw;
                 }
                 return Action::None;
             }
@@ -1068,7 +1078,7 @@ impl App {
                 self.pending_g = false;
                 self.select_cursor(first_pane(&self.items).unwrap_or(0), false);
                 self.preview_gen += 1;
-                return Action::Preview;
+                return Action::Redraw;
             }
             self.pending_g = true;
             return Action::None;
@@ -1083,7 +1093,7 @@ impl App {
             KeyCode::Char('G') => {
                 self.select_cursor(last_pane(&self.items).unwrap_or(0), true);
                 self.preview_gen += 1;
-                Action::Preview
+                Action::Redraw
             }
             KeyCode::Char(' ') => {
                 let mut changed = None;
@@ -1144,11 +1154,7 @@ impl App {
                         self.preview_gen += 1;
                     }
                     self.save_state();
-                    return if stashed {
-                        Action::Preview
-                    } else {
-                        Action::Redraw
-                    };
+                    return Action::Redraw;
                 }
                 Action::None
             }
@@ -1170,7 +1176,7 @@ impl App {
                     .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
                 self.preview_gen += 1;
                 self.save_state();
-                Action::Preview
+                Action::Redraw
             }
             KeyCode::Char('H' | 'L') => {
                 let delta = i32::try_from(count).unwrap_or(i32::MAX).saturating_mul(2);
@@ -1192,7 +1198,7 @@ impl App {
                     && self.collapse_section(section)
                 {
                     self.preview_gen += 1;
-                    Action::Preview
+                    Action::Redraw
                 } else {
                     Action::None
                 }
@@ -1207,7 +1213,7 @@ impl App {
                     }
                 }
                 self.preview_gen += 1;
-                Action::Preview
+                Action::Redraw
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 for _ in 0..count {
@@ -1219,7 +1225,7 @@ impl App {
                     }
                 }
                 self.preview_gen += 1;
-                Action::Preview
+                Action::Redraw
             }
             KeyCode::Enter => self.open_current_pane(),
             _ => Action::None,
@@ -1234,7 +1240,7 @@ impl App {
         ) {
             self.select_cursor(self.cursor, false);
             self.preview_gen += 1;
-            return Action::Preview;
+            return Action::Redraw;
         }
         if let Some(p) = self.current_pane() {
             let pane_id = p.pane_id.clone();
@@ -1295,7 +1301,7 @@ impl App {
                     self.select_cursor(idx, false);
                 }
                 self.preview_gen += 1;
-                return Action::Preview;
+                return Action::Redraw;
             }
             self.select_cursor(idx, false);
             return self.open_current_pane();
@@ -1400,7 +1406,12 @@ fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
     }
     if app.items.is_empty() {
         if list_height > 1 {
-            slice.put_str(2, 1, "No active sessions", Style::new().fg(Color::DarkGrey));
+            let label = if app.err.as_deref() == Some(SYNCING_MSG) {
+                "Loading sessions"
+            } else {
+                "No active sessions"
+            };
+            slice.put_str(2, 1, label, Style::new().fg(Color::DarkGrey));
         }
         return;
     }
@@ -1742,7 +1753,9 @@ fn render_empty_preview(slice: &mut GridSlice<'_>, app: &App) {
     } else {
         "No active sessions"
     };
-    let detail = if app.panes.is_empty() {
+    let detail = if app.err.as_deref() == Some(SYNCING_MSG) {
+        "Checking current agent status before showing sessions."
+    } else if app.panes.is_empty() {
         "Start a supported agent in tmux and it will appear here."
     } else {
         "Move into a section or press Enter to expand it."
@@ -1964,6 +1977,7 @@ mod tests {
             preview_lines: Vec::new(),
             preview_gen: 0,
             snapshot_generation: 0,
+            snapshot_revision: 0,
             project_win_width: HashMap::new(),
             width: 0,
             height: 0,
@@ -1987,6 +2001,17 @@ mod tests {
         };
         app.focus_startup_session();
         app
+    }
+
+    fn snapshot_with_pane(revision: u64, generation: u64, pane: Pane) -> Snapshot {
+        let mut cached = crate::agent::persist::cache_panes(std::slice::from_ref(&pane));
+        cached[0].last_status = Some(pane.status.as_i32());
+        Snapshot {
+            revision,
+            generation,
+            panes: cached,
+            ..Snapshot::default()
+        }
     }
 
     #[test]
@@ -2038,15 +2063,108 @@ mod tests {
     }
 
     #[test]
-    fn startup_key_without_session_does_not_leave_preview_pending() {
+    fn slow_ui_receives_latest_preview_with_one_wakeup() {
+        let latest = LatestPreview::default();
+        let mut wakeups = 0;
+        for generation in 0..1000 {
+            wakeups += usize::from(latest.replace(
+                PreviewTarget {
+                    pane_id: PaneId::parse("%1").unwrap(),
+                    session: "test".into(),
+                    lines: 50,
+                    generation,
+                },
+                format!("frame {generation}"),
+            ));
+        }
+        assert_eq!(wakeups, 1);
+        let (target, content) = latest.take().unwrap();
+        assert_eq!(target.generation, 999);
+        assert_eq!(content, "frame 999");
+        assert!(latest.take().is_none());
+        assert!(latest.replace(target, "next frame".into()));
+        assert_eq!(latest.take().unwrap().1, "next frame");
+    }
+
+    #[test]
+    fn late_cached_snapshot_cannot_undo_fresh_working_layout() {
+        let mut app = app_with_panes(Vec::new());
+        let mut busy = pane("%1", 0);
+        busy.status = PaneStatus::Busy;
+        assert!(app.apply_snapshot(snapshot_with_pane(5, 3, busy), UiState::default()));
+        assert!(!app.apply_snapshot(snapshot_with_pane(4, 2, pane("%1", 0)), UiState::default()));
+        assert_eq!(app.current_pane().unwrap().status, PaneStatus::Busy);
+        assert_eq!(app.expanded_section, Some(Section::Working));
+        assert_eq!(app.snapshot_revision, 5);
+    }
+
+    #[test]
+    fn revision_advances_even_when_display_generation_does_not() {
+        let mut app = app_with_panes(Vec::new());
+        assert!(app.apply_snapshot(snapshot_with_pane(10, 5, pane("%1", 0)), UiState::default()));
+        assert!(!app.apply_snapshot(snapshot_with_pane(12, 5, pane("%1", 0)), UiState::default()));
+        assert_eq!(app.snapshot_revision, 12);
+        assert!(!app.apply_snapshot(snapshot_with_pane(11, 6, pane("%2", 0)), UiState::default()));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        assert_eq!(app.snapshot_generation, 5);
+    }
+
+    #[test]
+    fn old_ui_state_cannot_reapply_a_removed_stash_entry() {
+        let mut app = app_with_panes(Vec::new());
+        let now = chrono::Utc::now();
+        let current = UiState {
+            updated_at: Some(now),
+            ..UiState::default()
+        };
+        assert!(app.apply_snapshot(snapshot_with_pane(1, 1, pane("%1", 0)), current));
+        let stale = UiState {
+            updated_at: Some(now - chrono::Duration::seconds(1)),
+            panes: HashMap::from([(
+                "%1".into(),
+                crate::agent::persist::UiPaneState {
+                    stashed: true,
+                    ..Default::default()
+                },
+            )]),
+            ..UiState::default()
+        };
+        assert!(app.apply_snapshot(snapshot_with_pane(2, 2, pane("%1", 0)), stale));
+        assert!(!app.panes["%1"].stashed);
+        assert!(app.ui_state.panes.is_empty());
+    }
+
+    #[test]
+    fn empty_sidebar_accepts_sort_key() {
         let mut app = app_with_panes(Vec::new());
         let (tx, rx) = mpsc::channel();
         assert!(matches!(
             app.handle_key(KeyEvent::from(KeyCode::Char('o')), &tx),
-            Action::Preview
+            Action::Redraw
         ));
-        assert!(!spawn_preview(&tx, &app));
+        assert!(app.current_pane().is_none());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn startup_loading_does_not_claim_no_sessions_or_show_error() {
+        let mut app = app_with_panes(Vec::new());
+        app.err = Some(SYNCING_MSG.into());
+        let mut grid = smelt_term::grid::Grid::new(100, 12);
+        render_sidebar(&mut grid.slice_mut(Rect::new(0, 0, 40, 12)), &mut app);
+        render_empty_preview(&mut grid.slice_mut(Rect::new(0, 40, 60, 12)), &app);
+        let text = (0..12)
+            .map(|row| {
+                (0..100)
+                    .map(|col| grid.cell(col, row).symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+        assert!(text.contains("Loading sessions"));
+        assert!(text.contains("Checking current agent status"));
+        assert!(!text.contains("No active sessions"));
+        assert!(!text.contains("Error:"));
+        assert!(!text.contains("Start a supported agent"));
     }
 
     #[test]
@@ -2453,11 +2571,11 @@ mod tests {
             Action::None
         ));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
-        assert!(matches!(app.handle_mouse(mouse), Action::Preview));
+        assert!(matches!(app.handle_mouse(mouse), Action::Redraw));
         assert_eq!(app.expanded_section, Some(Section::Stashed));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%3");
         render(&mut surface, &mut app, &mut Vec::new()).unwrap();
-        assert!(matches!(app.handle_mouse(mouse), Action::Preview));
+        assert!(matches!(app.handle_mouse(mouse), Action::Redraw));
         assert_eq!(app.expanded_section, None);
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
         render(&mut surface, &mut app, &mut Vec::new()).unwrap();
@@ -2471,7 +2589,7 @@ mod tests {
                 row: busy_row,
                 ..mouse
             }),
-            Action::Preview
+            Action::Redraw
         ));
         assert_eq!(app.expanded_section, Some(Section::Working));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
@@ -2494,7 +2612,7 @@ mod tests {
                 row: row as u16,
                 modifiers: KeyModifiers::NONE,
             }),
-            Action::Preview
+            Action::Redraw
         ));
     }
 
@@ -2541,7 +2659,7 @@ mod tests {
             assert_eq!(app.expanded_section, Some(Section::Stashed));
             assert!(matches!(
                 app.handle_key(KeyEvent::from(KeyCode::Left), &tx),
-                Action::Preview
+                Action::Redraw
             ));
             assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
             assert_eq!(app.expanded_section, Some(Section::Working));
