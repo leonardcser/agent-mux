@@ -1,0 +1,887 @@
+#!/usr/bin/env python3
+"""Record real smelt panes and agent-mux against an offline scripted model."""
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+COLS, ROWS = 120, 32
+MODEL = "scripted"
+FIX = "Fix the discount bug and run the tests."
+JOBS = {
+    "idle": ("cart-api", "Review the discount rules.", "yolo"),
+    "approval": ("cart-api", "Apply the pricing migration.", "normal"),
+    "fix": ("cart-api", FIX, "yolo"),
+    "storefront": ("storefront", "Check the cart totals and their tests.", "yolo"),
+    "docs": ("storefront", "Document the pricing API.", "yolo"),
+    "shipping": ("storefront", "Check shipping totals at checkout.", "yolo"),
+    "accessibility": ("storefront", "Review keyboard accessibility.", "yolo"),
+    "release": ("cart-api", "Draft the release notes.", "yolo"),
+}
+WORKING = ("fix", "storefront", "docs", "shipping")
+SOURCE = """def discount(price, percent):
+    return price - price * percent // 10
+"""
+TEST = """import unittest
+from pricing import discount
+
+class DiscountTests(unittest.TestCase):
+    def test_ten_percent(self):
+        self.assertEqual(discount(5000, 10), 4500)
+
+    def test_zero_percent(self):
+        self.assertEqual(discount(5000, 0), 5000)
+
+    def test_full_discount(self):
+        self.assertEqual(discount(5000, 100), 0)
+"""
+
+
+def run(*args, **kwargs):
+    result = subprocess.run(args, text=True, capture_output=True, timeout=30, **kwargs)
+    if result.returncode:
+        raise RuntimeError(f"{shlex.join(map(str, args))}\n{result.stderr}")
+    return result.stdout.rstrip("\n")
+
+
+def wait_for(check, label, timeout=30):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if result := check():
+            return result
+        time.sleep(0.1)
+    raise RuntimeError(f"Timed out waiting for {label}")
+
+
+def answer(messages, root):
+    last = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=0)
+    prompt = str(messages[last].get("content", "")) if messages else ""
+    role = next((role for role, (_, text, _) in JOBS.items() if text in prompt), None)
+    if (
+        role is None
+        or any(
+            "title" in str(m.get("content", "")).lower()
+            for m in messages
+            if m["role"] == "system"
+        )
+        and len(messages) <= 3
+    ):
+        return "Pricing update", None, None
+    step = sum(m["role"] == "tool" for m in messages[last + 1 :])
+    project = root / JOBS[role][0]
+    filename = "migrate.py" if role == "approval" else "pricing.py"
+    read = ("read_file", {"file_path": str(project / filename)})
+    test = (
+        "bash",
+        {
+            "command": "python3 -m unittest -v && smelt session complete",
+            "description": "Run tests and complete session",
+        },
+    )
+    summaries = {
+        "idle": "## Discount review\n\nPrices use whole cents. Clamp percentages to 0-100 and divide by 100.\n\nReview complete. No files changed.",
+        "accessibility": "## Keyboard accessibility\n\n- Keep checkout controls in tab order.\n- Return focus after closing the cart.\n- Announce validation errors.\n\nReview ready for later.",
+        "release": "## Release notes\n\n- Correct discount rounding.\n- Add checkout regression coverage.\n- Document the pricing API.\n\nDraft ready for later.",
+    }
+    if role in summaries:
+        return summaries[role], None, None
+    if step == 0:
+        text = {
+            "fix": "I'll check the discount calculation.",
+            "storefront": "I'll check cart totals and the checkout regression tests.",
+            "docs": "I'll read the pricing API before writing the integration guide.",
+            "shipping": "I'll check shipping totals and the checkout flow.",
+            "approval": "I'll check the migration before applying it.",
+        }[role]
+        return text, read, None
+    if role == "fix":
+        if step == 1:
+            return (
+                "The divisor is 10 instead of 100.",
+                (
+                    "edit_file",
+                    {
+                        "file_path": str(project / "pricing.py"),
+                        "old_string": "percent // 10\n",
+                        "new_string": "percent // 100\n",
+                    },
+                ),
+                "fix",
+            )
+        if step == 2:
+            return "I'll verify the fix.", test, None
+        return (
+            "Fixed the divisor. All 3 tests pass: 10%, 0%, and 100% discounts.",
+            None,
+            None,
+        )
+    if role == "approval":
+        if step == 1:
+            return (
+                "The migration is ready. I'll apply it now.",
+                (
+                    "bash",
+                    {
+                        "command": "python3 migrate.py",
+                        "description": "Apply pricing migration",
+                    },
+                ),
+                "approval",
+            )
+        return "Migration applied.", None, "migration"
+    return "Pricing review complete.", None, role if step == 1 else None
+
+
+class ModelServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, root):
+        super().__init__(("127.0.0.1", 0), ModelHandler)
+        self.root = root
+        self.gates = {
+            role: threading.Event() for role in (*WORKING, "approval", "migration")
+        }
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stopping.set()
+        for gate in self.gates.values():
+            gate.set()
+        self.shutdown()
+        self.server_close()
+        self.thread.join()
+
+
+class ModelHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        body = json.dumps({"data": [{"id": MODEL}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        messages = body.get("messages", [])
+        text, tool, gate = answer(messages, self.server.root)
+        if gate:
+            self.server.gates[gate].wait()
+        if self.server.stopping.is_set():
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+
+        def emit(delta, finish=None):
+            chunk = {
+                "id": "demo",
+                "object": "chat.completion.chunk",
+                "model": MODEL,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            self.wfile.flush()
+
+        try:
+            emit({"role": "assistant"})
+            for word in text.split(" "):
+                emit({"content": word + " "})
+                if self.server.stopping.wait(0.045):
+                    return
+            if tool:
+                name, args = tool
+                emit(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": f"demo_{time.monotonic_ns()}",
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(args),
+                                },
+                            }
+                        ]
+                    }
+                )
+            emit({}, "tool_calls" if tool else "stop")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+class Demo:
+    def __init__(self, root, smelt, mux):
+        self.root = root
+        (root / "bin").mkdir()
+        self.smelt = str(root / "bin/smelt")
+        Path(self.smelt).symlink_to(Path(smelt).resolve())
+        self.mux = root / "agent-mux"
+        shutil.copy2(mux, self.mux)
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("SMELT_", "LLM_"))
+        }
+        self.env.pop("TMUX", None)
+        self.env.update(
+            HOME=str(root),
+            PATH=f"{root / 'bin'}:{os.environ['PATH']}",
+            XDG_CONFIG_HOME=str(root / "config"),
+            XDG_STATE_HOME=str(root / "state"),
+            XDG_DATA_HOME=str(root / "data"),
+            XDG_CACHE_HOME=str(root / "cache"),
+            AGENT_MUX_STATE_DIR=str(root / "mux-state"),
+            SHELL="/bin/sh",
+            TERM="xterm-256color",
+            COLORTERM="truecolor",
+            COLORFGBG="15;0",
+            SMELT_CLAUDE_CODE_EXECUTABLE="/nonexistent/claude",
+            GIT_CONFIG_GLOBAL="/dev/null",
+            GIT_CONFIG_NOSYSTEM="1",
+        )
+        self.frames = []
+        self.recording = threading.Event()
+        self.recorder = None
+        self.error = None
+        self.client = None
+        self.server = None
+
+    def tmux(self, *args):
+        return run(
+            "tmux",
+            "-f",
+            "/dev/null",
+            "-S",
+            str(self.root / "tmux.sock"),
+            *args,
+            env=self.env,
+        )
+
+    def screen(self, pane, ansi=False):
+        return self.tmux(
+            "capture-pane", "-p", *(["-e", "-N"] if ansi else []), "-t", pane
+        )
+
+    def expect(self, pane, text):
+        try:
+            wait_for(lambda: text in self.screen(pane), text)
+        except RuntimeError as error:
+            raise RuntimeError(f"{error}\n{self.screen(pane)}") from error
+
+    def new_window(self, cwd, command):
+        pane = self.tmux(
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "demo:",
+            "-n",
+            Path(command[0]).name,
+            "-c",
+            str(cwd),
+            "exec " + shlex.join(command),
+        )
+        self.tmux("resize-window", "-t", pane, "-x", str(COLS), "-y", str(ROWS))
+        return pane
+
+    def prepare(self):
+        for name in dict.fromkeys(project for project, _, _ in JOBS.values()):
+            project = self.root / name
+            project.mkdir()
+            for file, content in {
+                "pricing.py": SOURCE,
+                "test_pricing.py": TEST,
+                ".gitignore": "__pycache__/\n",
+                "migrate.py": "print('Applied pricing migration.')\n",
+            }.items():
+                (project / file).write_text(content)
+            run("git", "init", "-q", "-b", "main", str(project), env=self.env)
+            run("git", "-C", str(project), "add", ".", env=self.env)
+            run(
+                "git",
+                "-C",
+                str(project),
+                "-c",
+                "user.name=demo",
+                "-c",
+                "user.email=demo@example.invalid",
+                "commit",
+                "-qm",
+                "Initial example",
+                env=self.env,
+            )
+        project = self.root / "cart-api"
+        self.server = ModelServer(self.root)
+        config = self.root / "config"
+        (config / "smelt").mkdir(parents=True)
+        (config / "smelt/init.lua").write_text(f'''
+smelt.provider.register("demo", {{
+  type = "openai-compatible",
+  api_base = "http://127.0.0.1:{self.server.server_port}/v1",
+  models = {{ {{ name = "{MODEL}", context_window = 200000 }} }},
+}})
+smelt.defaults.set({{ model = "demo/{MODEL}" }})
+smelt.settings.autoupgrade = "off"
+smelt.settings.show_tips = false
+smelt.settings.show_slug = false
+smelt.settings.show_tps = false
+smelt.settings.auto_continue = "off"
+smelt.build.display = ""
+smelt.prompt.top:remove("model")
+''')
+        (config / "agent-mux").mkdir()
+        (config / "agent-mux/config.toml").write_text(
+            '[sidebar]\nsort = "creation"\nworking = "section"\n'
+        )
+        self.tmux(
+            "new-session",
+            "-d",
+            "-s",
+            "demo",
+            "-x",
+            str(COLS),
+            "-y",
+            str(ROWS),
+            "exec sleep 600",
+        )
+        self.tmux("set-option", "-g", "status", "off")
+        self.tmux("set-option", "-g", "default-shell", "/bin/sh")
+        self.tmux("set-option", "-g", "remain-on-exit", "on")
+        # A control client is a real interactive tmux client, needed for Enter to switch sessions.
+        self.client = subprocess.Popen(
+            [
+                "tmux",
+                "-S",
+                str(self.root / "tmux.sock"),
+                "-C",
+                "attach-session",
+                "-t",
+                "demo",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=self.env,
+        )
+        self.client_name = wait_for(
+            lambda: self.tmux("list-clients", "-F", "#{client_name}").strip(),
+            "tmux client",
+        )
+        self.tmux("refresh-client", "-t", self.client_name, "-C", f"{COLS},{ROWS}")
+        self.tmux(
+            "bind-key",
+            "j",
+            "new-window",
+            "-n",
+            "agent-mux",
+            "-c",
+            str(project),
+            "exec " + shlex.quote(str(self.mux)),
+        )
+        self.panes = {}
+        for role, (name, _, mode) in JOBS.items():
+            self.panes[role] = self.new_window(
+                self.root / name, [self.smelt, "--mode", mode]
+            )
+            self.expect(self.panes[role], mode)
+        self.browser = self.new_window(project, [str(self.mux)])
+        for pane in self.panes.values():
+            self.expect(self.browser, self.label(pane))
+        for role, done in (
+            ("idle", "Review complete."),
+            ("accessibility", "Review ready for later."),
+            ("release", "Draft ready for later."),
+        ):
+            self.submit(role)
+            self.wait_status(role, 1)
+            self.expect(self.panes[role], done)
+            self.wait_status(role, 3)
+        for count, (role, done) in enumerate(
+            (
+                ("accessibility", "Review ready for later."),
+                ("release", "Draft ready for later."),
+            ),
+            1,
+        ):
+            self.select(self.panes[role])
+            self.expect(self.browser, done)
+            self.keys("s")
+            self.expect(self.browser, f"stashed ({count})")
+        for role in (*WORKING[1:], "approval"):
+            self.submit(role)
+            self.wait_status(role, 1)
+        self.server.gates["approval"].set()
+        self.expect(self.panes["approval"], "Allow?")
+        self.wait_status("approval", 3)
+        self.tmux("select-window", "-t", self.panes["idle"])
+        self.wait_status("idle", 0)
+        self.keys("q")
+        wait_for(
+            lambda: (
+                self.tmux("display-message", "-p", "-t", self.browser, "#{pane_dead}")
+                == "1"
+            ),
+            "warm-up browser closes",
+        )
+        self.tmux("kill-window", "-t", self.browser)
+        self.tmux("select-window", "-t", self.panes["fix"])
+        self.tmux("send-keys", "-t", self.panes["fix"], "-l", FIX)
+
+    def submit(self, role):
+        self.tmux("send-keys", "-t", self.panes[role], "-l", JOBS[role][1])
+        self.tmux("send-keys", "-t", self.panes[role], "Enter")
+
+    def wait_status(self, role, status):
+        def ready():
+            panes = json.loads((self.root / "mux-state/snapshot.json").read_text())[
+                "panes"
+            ]
+            return any(
+                pane["paneID"] == self.panes[role] and pane.get("lastStatus") == status
+                for pane in panes
+            )
+
+        wait_for(ready, f"{role} reaches status {status}")
+
+    def capture(self):
+        try:
+            while self.recording.is_set():
+                pane = self.tmux("display-message", "-p", "-t", "demo", "#{pane_id}")
+                self.frames.append((time.monotonic(), self.screen(pane, ansi=True)))
+                time.sleep(0.12)
+        except Exception as error:
+            self.error = error
+
+    def hold(self, seconds):
+        time.sleep(seconds)
+        if self.error:
+            raise self.error
+
+    def keys(self, *keys):
+        self.tmux("send-keys", "-t", self.browser, *keys)
+
+    def label(self, pane):
+        return self.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{window_index}:#{window_name}.#{pane_index}",
+        )
+
+    def select(self, pane):
+        # Click opens a session; keyboard navigation changes only the preview.
+        label = self.label(pane)
+        rows = [
+            line.split("│", 1)[0] for line in self.screen(self.browser).splitlines()
+        ]
+        agents = [row for row in rows if ".0" in row]
+        index = next((i for i, row in enumerate(agents) if label in row.split()), None)
+        if index is None:
+            raise RuntimeError(
+                f"Session {label} missing from sidebar:\n{self.screen(self.browser)}"
+            )
+        self.keys("g", "g", *(["j"] * index))
+
+    def expect_stash(self, expanded):
+        labels = [self.label(self.panes[role]) for role in ("accessibility", "release")]
+
+        def visible():
+            screen = self.screen(self.browser)
+            return all((label in screen) == expanded for label in labels)
+
+        wait_for(visible, "stash expands" if expanded else "stash collapses")
+
+    def open_browser(self):
+        # Client key injection runs the real prefix binding, rather than sending Ctrl-b to smelt.
+        previous = self.tmux("display-message", "-p", "-t", "demo", "#{pane_id}")
+        self.tmux("send-keys", "-K", "-c", self.client_name, "C-b", "j")
+
+        def opened():
+            pane = self.tmux("display-message", "-p", "-t", "demo", "#{pane_id}")
+            return pane if pane != previous else None
+
+        self.browser = wait_for(opened, "prefix + j opens agent-mux")
+
+    def enter_session(self, pane):
+        self.keys("Enter")
+        wait_for(
+            lambda: (
+                self.tmux("display-message", "-p", "-t", "demo", "#{pane_id}") == pane
+            ),
+            "Enter opens smelt",
+        )
+
+    def verify_overview(self):
+        statuses = {
+            item["pid"]: item["state"]
+            for item in json.loads(
+                run(self.smelt, "status", "--all", "--json", env=self.env)
+            )
+        }
+        states = {
+            role: statuses[
+                int(self.tmux("display-message", "-p", "-t", pane, "#{pane_pid}"))
+            ]
+            for role, pane in self.panes.items()
+        }
+        expected = {
+            role: "busy"
+            if role in WORKING
+            else "needs_attention"
+            if role == "approval"
+            else "idle"
+            for role in JOBS
+        }
+        stashed = {
+            pane
+            for pane, state in json.loads(
+                (self.root / "mux-state/ui_state.json").read_text()
+            )["panes"].items()
+            if state.get("stashed")
+        }
+        if states != expected or stashed != {
+            self.panes["accessibility"],
+            self.panes["release"],
+        }:
+            raise RuntimeError(f"Unexpected demo setup: {states}, stashed={stashed}")
+        print(
+            f"Verified {len(JOBS)} sessions: {len(WORKING)} working, 2 stashed, 1 idle, 1 awaiting approval",
+            flush=True,
+        )
+
+    def scene(self):
+        fix = self.panes["fix"]
+        self.recording.set()
+        self.recorder = threading.Thread(target=self.capture, daemon=True)
+        self.recorder.start()
+        self.hold(0.35)
+        self.tmux("send-keys", "-t", fix, "Enter")
+        self.wait_status("fix", 1)
+        self.open_browser()
+        self.expect(self.browser, f"working ({len(WORKING)})")
+        self.expect(self.browser, "stashed (2)")
+        self.expect_stash(False)
+        self.verify_overview()
+        self.expect(self.browser, "Allow?")
+        self.hold(0.8)
+        approval = self.panes["approval"]
+        self.enter_session(approval)
+        self.expect(approval, "Allow?")
+        self.hold(0.7)
+        self.tmux("send-keys", "-t", approval, "Enter")
+        self.expect(approval, "Applied pricing migration.")
+        self.wait_status("approval", 1)
+        self.hold(0.6)
+        self.open_browser()
+        self.expect(self.browser, f"working ({len(WORKING) + 1})")
+        self.expect(self.browser, "Applied pricing migration.")
+        self.hold(0.8)
+        for keys, text, seconds in (
+            (("j",), FIX, 1.0),
+            (("j",), JOBS["storefront"][1], 0.8),
+            (("j",), JOBS["docs"][1], 0.8),
+        ):
+            self.keys(*keys)
+            self.expect(self.browser, text)
+            self.hold(seconds)
+        self.keys("G")
+        self.expect(self.browser, "Draft ready for later.")
+        self.expect_stash(True)
+        self.hold(0.8)
+        self.keys("k")
+        self.expect(self.browser, "Review ready for later.")
+        self.hold(0.7)
+        self.keys("k")
+        self.expect(self.browser, JOBS["shipping"][1])
+        self.expect_stash(False)
+        self.hold(0.6)
+        self.server.gates["fix"].set()
+        self.expect(fix, "All 3 tests pass")
+        self.expect(self.browser, f"working ({len(WORKING)})")
+        completed = f"✓ {self.label(fix)}"
+        self.expect(self.browser, completed)
+        self.hold(1.0)
+        self.select(fix)
+        self.expect(self.browser, "All 3 tests pass")
+        self.hold(1.4)
+        self.enter_session(fix)
+        self.hold(0.7)
+        self.open_browser()
+        self.expect(self.browser, completed)
+        self.select(fix)
+        self.expect(self.browser, "All 3 tests pass")
+        self.hold(1.5)
+
+    def close(self):
+        self.recording.clear()
+        if self.recorder:
+            self.recorder.join(timeout=35)
+        if self.server:
+            self.server.close()
+        with contextlib.suppress(RuntimeError):
+            self.tmux("kill-server")
+        if self.client:
+            self.client.terminate()
+            self.client.wait(timeout=5)
+            self.client.stdin.close()
+        # All UI clients are gone before stopping the private watcher, so none can restart it.
+        with contextlib.suppress(OSError):
+            with socket.socket(socket.AF_UNIX) as stream:
+                stream.settimeout(3)
+                stream.connect(str(self.root / "mux-state/daemon.sock"))
+                stream.sendall(b'{"type":"Shutdown"}\n')
+                stream.recv(4096)
+            with (self.root / "mux-state/watch.lock").open() as lock:
+
+                def stopped():
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        return True
+                    except BlockingIOError:
+                        return False
+
+                wait_for(stopped, "private watcher shutdown", timeout=10)
+
+
+SGR = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def replay_lines(ansi):
+    # tmux carries attributes across newlines; the docs player renders each row independently.
+    pen = {}
+    lines = []
+    for line in ansi.split("\n"):
+        prefix = f"\x1b[{';'.join(pen.values())}m" if pen and SGR.sub("", line) else ""
+        for match in SGR.finditer(line):
+            params = match[1].split(";") if match[1] else ["0"]
+            i = 0
+            while i < len(params):
+                code = int(params[i])
+                if code == 0:
+                    pen.clear()
+                elif code in (38, 48, 58):
+                    count = 3 if params[i + 1] == "5" else 5
+                    pen[code] = ";".join(params[i : i + count])
+                    i += count - 1
+                elif code in (39, 49, 59):
+                    pen.pop(code - 1, None)
+                elif 30 <= code <= 37 or 90 <= code <= 97:
+                    pen[38] = params[i]
+                elif 40 <= code <= 47 or 100 <= code <= 107:
+                    pen[48] = params[i]
+                elif code == 22:
+                    pen.pop(1, None)
+                    pen.pop(2, None)
+                elif 23 <= code <= 29:
+                    pen.pop(code - 20, None)
+                else:
+                    pen[code] = params[i]
+                i += 1
+        lines.append(prefix + line)
+    return (lines + [""] * ROWS)[:ROWS]
+
+
+def make_replay(frames):
+    moments = []
+    previous = None
+    for i, (at, ansi) in enumerate(frames):
+        text = SGR.sub("", ansi)
+        if f"demo/{MODEL}" in text or "Loading sessions" in text:
+            raise RuntimeError("Recording contains model labels or a cold-start screen")
+        ms = max(
+            10,
+            round(((frames[i + 1][0] - at) if i + 1 < len(frames) else 0.12) * 100)
+            * 10,
+        )
+        lines = replay_lines(ansi)
+        if lines == previous:
+            moments[-1]["ms"] += ms
+        else:
+            moments.append(
+                {
+                    "ms": ms,
+                    "l": [
+                        None if previous and line == previous[n] else line
+                        for n, line in enumerate(lines)
+                    ],
+                }
+            )
+        previous = lines
+    if not moments:
+        raise RuntimeError("Recording contains no frames")
+    return {"cols": COLS, "rows": ROWS, "frames": moments}
+
+
+def encode(replay, directory, output):
+    frames = replay["frames"]
+    entries = []
+    for n, frame in enumerate(frames):
+        entries.extend([f"file '{n:04d}.png'", f"duration {frame['ms'] / 1000:.3f}"])
+    entries.append(f"file '{len(frames) - 1:04d}.png'")
+    (directory / "frames.txt").write_text("\n".join(entries) + "\n")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Same palette and dithering as smelt/docs/shots/src/gif.ts, in our own temporary directory.
+    filters = "fps=12,split[a][b];[a]palettegen=stats_mode=full:max_colors=256[p];[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle"
+    # Limit the timeline so ffmpeg cannot infer another hold after the repeated final PNG.
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-i",
+            "frames.txt",
+            "-filter_complex",
+            filters,
+            "-loop",
+            "0",
+            "-t",
+            f"{sum(frame['ms'] for frame in frames) / 1000:.3f}",
+            str(output),
+        ],
+        cwd=directory,
+        check=True,
+        timeout=120,
+    )
+    print(f"Wrote {output} ({sum(frame['ms'] for frame in frames) / 1000:.1f}s)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--smelt",
+        default=os.environ.get("SMELT_BIN", "smelt"),
+        help="Real smelt executable",
+    )
+    parser.add_argument(
+        "--agent-mux",
+        type=Path,
+        help="Use an existing build instead of building release",
+    )
+    parser.add_argument("--output", type=Path, default=ROOT / "assets/demo.gif")
+    parser.add_argument(
+        "--smelt-repo",
+        type=Path,
+        default=os.environ.get("SMELT_REPO"),
+        help="smelt checkout with docs/shots dependencies installed (or SMELT_REPO)",
+    )
+    parser.add_argument(
+        "--replay", type=Path, help="Render a saved replay instead of recording again"
+    )
+    parser.add_argument(
+        "--stills",
+        type=Path,
+        help="Write first/middle/last PNGs here without replacing the GIF",
+    )
+    args = parser.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
+    if args.smelt_repo is None:
+        parser.error(
+            "Set --smelt-repo /path/to/smelt (or SMELT_REPO) to use its docs renderer"
+        )
+    for tool in [
+        "bun",
+        *([] if args.stills else ["ffmpeg"]),
+        *([] if args.replay else ["tmux", "git", "python3"]),
+    ]:
+        if not shutil.which(tool):
+            parser.error(f"Missing prerequisite: {tool}")
+    renderer = [
+        "bun",
+        str(ROOT / "scripts/demo-render.ts"),
+        str(args.smelt_repo.resolve()),
+    ]
+    subprocess.run([*renderer, "--check"], check=True)
+    replay_file = args.replay or ROOT / "target/demo/replay.json"
+    if args.replay is None:
+        if not re.search(
+            r"^send-keys .*\[-[^\]]*K", run("tmux", "list-commands"), re.MULTILINE
+        ):
+            parser.error(
+                "Recording requires tmux client key injection (send-keys -K; tmux 3.6+)"
+            )
+        smelt = shutil.which(args.smelt)
+        if not smelt:
+            parser.error("smelt not found; install it or set --smelt /path/to/smelt")
+        run(smelt, "session", "complete", "--help")
+        mux = args.agent_mux
+        if mux is None:
+            subprocess.run(
+                ["cargo", "build", "--release", "--locked"], cwd=ROOT, check=True
+            )
+            metadata = json.loads(
+                run(
+                    "cargo",
+                    "metadata",
+                    "--locked",
+                    "--format-version=1",
+                    "--no-deps",
+                    cwd=ROOT,
+                )
+            )
+            mux = Path(metadata["target_directory"]) / "release/agent-mux"
+        with tempfile.TemporaryDirectory(prefix="agent-mux-demo-") as temporary:
+            demo = Demo(Path(temporary), smelt, mux.resolve())
+            try:
+                demo.prepare()
+                demo.scene()
+            finally:
+                demo.close()
+            replay = make_replay(demo.frames)
+        replay_file.parent.mkdir(parents=True, exist_ok=True)
+        replay_file.write_text(json.dumps(replay, separators=(",", ":")))
+        print(f"Saved {replay_file}")
+    else:
+        replay = json.loads(replay_file.read_text())
+    if args.stills:
+        args.stills.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                *renderer,
+                str(replay_file.resolve()),
+                str(args.stills.resolve()),
+                "--stills",
+            ],
+            check=True,
+        )
+        print(f"Wrote stills to {args.stills}")
+    else:
+        with tempfile.TemporaryDirectory(prefix="agent-mux-render-") as temporary:
+            directory = Path(temporary)
+            subprocess.run(
+                [*renderer, str(replay_file.resolve()), str(directory)], check=True
+            )
+            encode(replay, directory, args.output.resolve())
+
+
+if __name__ == "__main__":
+    main()

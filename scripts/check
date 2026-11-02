@@ -19,7 +19,7 @@ uv --no-config sync --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
-uv --no-config run --locked ruff check tests
-uv --no-config run --locked ruff format --check tests
+uv --no-config run --locked ruff check tests scripts/demo
+uv --no-config run --locked ruff format --check tests scripts/demo
 # The session fixture builds the release executable once, using Cargo's target directory.
 uv --no-config run --locked pytest -m "$selection" --durations=10

@@ -129,3 +129,5 @@ scripts/check
 ```
 
 See [Testing](tests/README.md) for setup, full-suite checks, and focused runs.
+
+See [Demo recording](scripts/README.md) to update the GIF.
