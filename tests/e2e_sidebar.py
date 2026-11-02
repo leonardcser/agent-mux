@@ -170,28 +170,56 @@ int main(int argc, char **argv) {
                     f"\x1b[<0;3;{row + 1}M\x1b[<0;3;{row + 1}m",
                 )
 
+            def selected_session(frame=None):
+                if frame is None:
+                    frame = tmux("capture-pane", "-e", "-p", "-t", sidebar)
+                for line in frame.splitlines():
+                    left = line.split("│", 1)[0]
+                    if "\x1b[100m" in left or "\x1b[48;5;8m" in left:
+                        return next(
+                            (
+                                index
+                                for index, name in enumerate(labels)
+                                if name in left
+                            ),
+                            None,
+                        )
+                return None
+
+            def first_session_selected():
+                frame = tmux("capture-pane", "-e", "-p", "-t", sidebar)
+                visible = visible_sessions(frame)
+                return bool(visible) and selected_session(frame) == labels.index(
+                    visible[0]
+                )
+
             def focus(label):
                 if label not in labels:
                     click_title(label)
                     return
                 target = labels.index(label)
-                send("g")
-                send("g")
-                wait_for_screen(first_session_preview, "navigate to first session")
-                for _ in labels:
-                    frame = screen()
-                    if preview(target, frame):
-                        return
-                    previous = next(i for i in range(len(labels)) if preview(i, frame))
-                    send("j")
-                    wait_for_screen(
-                        lambda frame, previous=previous: any(
-                            i != previous and preview(i, frame)
-                            for i in range(len(labels))
-                        ),
-                        "navigate to next session",
-                    )
-                raise AssertionError(f"Cannot select {label}")
+                # Preview content arrives asynchronously; navigation must acknowledge
+                # the highlighted row rather than a possibly previous preview frame.
+                if selected_session() != target:
+                    tmux("send-keys", "-t", sidebar, "g", "g")
+                    wait_for(first_session_selected, "navigate to first session")
+                    for _ in labels:
+                        previous = selected_session()
+                        if previous == target:
+                            break
+                        send("j")
+                        wait_for(
+                            lambda previous=previous: (
+                                selected_session()
+                                in [i for i in range(len(labels)) if i != previous]
+                            ),
+                            "navigate to next session",
+                        )
+                    else:
+                        raise AssertionError(f"Cannot select {label}")
+                wait_for_screen(
+                    lambda frame: preview(target, frame), f"preview {label}"
+                )
 
             def wait_for_screen(check, label):
                 wait_for(lambda: check(screen()), label)
