@@ -107,9 +107,14 @@ def test_symlink_upgrade_follows_selected_installation(mux):
     pane = mux.launch(link)
     first = mux.ready()
     # An older TUI must follow the selected installation, not downgrade it.
-    old_client = mux.launch()
-    mux.wait_screen(
-        old_client, lambda frame: "No active sessions" in frame, "older TUI ready"
+    mux.launch()
+    # Cached rendering can precede background installation registration.
+    wait_for(
+        lambda: (
+            (mux.state / "daemon-executable.json").read_text().strip()
+            == f'"{mux.binary}"'
+        ),
+        "older TUI registers its installation",
     )
     mux.tmux("kill-pane", "-t", pane)
     pane = mux.launch(link)
