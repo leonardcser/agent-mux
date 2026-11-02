@@ -156,13 +156,42 @@ int main(int argc, char **argv) {
 
             labels = ["busy-fixture", "idle-fixture", "stash-fixture"]
 
-            def hover(label):
+            def click_title(label):
                 row = next(
                     i
                     for i, line in enumerate(screen().splitlines())
                     if label in line.split("│", 1)[0]
                 )
-                tmux("send-keys", "-t", sidebar, "-l", f"\x1b[<35;3;{row + 1}M")
+                tmux(
+                    "send-keys",
+                    "-t",
+                    sidebar,
+                    "-l",
+                    f"\x1b[<0;3;{row + 1}M\x1b[<0;3;{row + 1}m",
+                )
+
+            def focus(label):
+                if label not in labels:
+                    click_title(label)
+                    return
+                target = labels.index(label)
+                send("g")
+                send("g")
+                wait_for_screen(first_session_preview, "navigate to first session")
+                for _ in labels:
+                    frame = screen()
+                    if preview(target, frame):
+                        return
+                    previous = next(i for i in range(len(labels)) if preview(i, frame))
+                    send("j")
+                    wait_for_screen(
+                        lambda frame, previous=previous: any(
+                            i != previous and preview(i, frame)
+                            for i in range(len(labels))
+                        ),
+                        "navigate to next session",
+                    )
+                raise AssertionError(f"Cannot select {label}")
 
             def wait_for_screen(check, label):
                 wait_for(lambda: check(screen()), label)
@@ -203,29 +232,44 @@ int main(int argc, char **argv) {
                 "automatic collapsed Working",
             )
             wait_for_screen(first_session_preview, "startup focuses first session")
-            hover("stash-fixture")
+            selected = next(i for i in range(len(labels)) if preview(i, screen()))
+            row = next(
+                i
+                for i, line in enumerate(screen().splitlines())
+                if "working (1)" in line
+            )
+            tmux("send-keys", "-t", sidebar, "-l", f"\x1b[<35;3;{row + 1}M")
+            time.sleep(0.2)
+            assert preview(selected, screen()) and "busy-fixture" not in screen()
+            focus("stash-fixture")
             wait_for_screen(
-                lambda frame: preview(2, frame), "hover selects session preview"
+                lambda frame: preview(2, frame), "keyboard selects session preview"
             )
             send("s")
             wait_for_screen(
                 lambda frame: "stashed (1)" in frame and "stash-fixture" not in frame,
                 "collapsed Stashed",
             )
-            hover("stashed (1)")
+            focus("stashed (1)")
             wait_for_screen(
                 lambda frame: "stash-fixture" in frame and preview(2, frame),
-                "hover expands Stashed",
+                "title click expands Stashed and selects first session",
             )
-            hover("stashed (1)")
-            hover("working (1)")
+            click_title("stashed (1)")
+            wait_for_screen(
+                lambda frame: (
+                    "stash-fixture" not in frame and first_session_preview(frame)
+                ),
+                "title click collapses Stashed to available main session",
+            )
+            focus("working (1)")
             wait_for_screen(
                 lambda frame: (
                     "busy-fixture" in frame
                     and "stash-fixture" not in frame
                     and preview(0, frame)
                 ),
-                "hover selects Working and collapses Stashed",
+                "title click expands Working and selects first session",
             )
             send("q")
             sidebar = open_sidebar()
@@ -233,21 +277,21 @@ int main(int argc, char **argv) {
                 lambda frame: "busy-fixture" in frame and preview(0, frame),
                 "restore selection inside expanded Working",
             )
-            hover("idle-fixture")
+            focus("idle-fixture")
             wait_for_screen(
-                lambda frame: preview(1, frame), "hover updates main session preview"
+                lambda frame: preview(1, frame), "keyboard updates main session preview"
             )
             send("s")
             wait_for_screen(
                 lambda frame: "busy-fixture" in frame and preview(0, frame),
                 "stashing last main session selects first Working session",
             )
-            hover("stashed (2)")
+            focus("stashed (2)")
             wait_for_screen(
                 lambda frame: "idle-fixture" in frame,
                 "expand Stashed to restore main session",
             )
-            hover("idle-fixture")
+            focus("idle-fixture")
             wait_for_screen(
                 lambda frame: preview(1, frame), "select stashed main session"
             )
@@ -262,7 +306,7 @@ int main(int argc, char **argv) {
             wait_for(lambda: status(2) == 1, "stashed agent becomes busy")
             frame = screen()
             assert "working (1)" in frame and "stash-fixture" not in frame
-            hover("stashed (1)")
+            focus("stashed (1)")
             wait_for_screen(
                 lambda frame: "stash-fixture" in frame and preview(2, frame),
                 "busy stashed session stays in Stashed",
@@ -273,7 +317,7 @@ int main(int argc, char **argv) {
                 lambda frame: "stash-fixture" in frame and preview(2, frame),
                 "restore selection inside expanded Stashed",
             )
-            hover("idle-fixture")
+            focus("idle-fixture")
             wait_for_screen(
                 lambda frame: "stash-fixture" not in frame, "collapse busy Stashed"
             )
@@ -327,7 +371,7 @@ int main(int argc, char **argv) {
                 ("first", "creation", 1, 0),
                 ("first", "recent", 0, 1),
             ]:
-                hover(labels[saved])
+                focus(labels[saved])
                 wait_for_screen(
                     lambda frame, saved=saved: preview(saved, frame),
                     "save startup selection",
@@ -373,7 +417,7 @@ int main(int argc, char **argv) {
 
             for index, label in enumerate(labels[:2]):
                 pane_id = agents[index][0]
-                hover(label)
+                focus(label)
                 wait_for_screen(
                     lambda frame, index=index: preview(index, frame),
                     "select session to stash",
@@ -396,10 +440,21 @@ int main(int argc, char **argv) {
             wait_for_screen(
                 first_session_preview, "startup selects first stashed session"
             )
+            for key in ["Left", "h"]:
+                send(key)
+                wait_for_screen(
+                    first_session_preview, "only Stashed keeps selection on collapse"
+                )
+                assert len(visible_sessions(screen())) == 3
+            click_title("stashed (3)")
+            wait_for_screen(
+                first_session_preview, "only Stashed title keeps first session selected"
+            )
+            assert len(visible_sessions(screen())) == 3
             values[0]["state"] = "busy"
             write_statuses(values)
             wait_for(lambda: status(0) == 1, "stashed session becomes busy")
-            hover("busy-fixture")
+            focus("busy-fixture")
             wait_for_screen(
                 lambda frame: preview(0, frame), "select busy stashed session"
             )
@@ -408,11 +463,11 @@ int main(int argc, char **argv) {
                 lambda frame: "working (1)" in frame,
                 "unstash busy session into Working",
             )
-            hover("stashed (2)")
+            focus("stashed (2)")
             wait_for_screen(
                 lambda frame: "idle-fixture" in frame, "expand remaining Stashed"
             )
-            hover("idle-fixture")
+            focus("idle-fixture")
             wait_for_screen(
                 lambda frame: preview(1, frame), "select idle stashed session"
             )
@@ -434,6 +489,8 @@ int main(int argc, char **argv) {
                 ("expand", "collapse"),
                 ("collapse", "expand"),
                 ("expand", "expand"),
+                ("inline", "collapse"),
+                ("inline", "expand"),
             ]:
                 write_config(working, stashed)
                 send("q")
@@ -441,28 +498,88 @@ int main(int argc, char **argv) {
                 wait_for_screen(
                     lambda frame, working=working, stashed=stashed: (
                         preview(1, frame)
-                        and ("busy-fixture" in frame) == (working == "expand")
+                        and ("busy-fixture" in frame) == (working != "collapse")
                         and ("stash-fixture" in frame) == (stashed == "expand")
                     ),
                     "section configuration applies on reopen",
                 )
-                hover("working (1)")
+                if working == "inline":
+                    assert "working (" not in screen()
+                    focus("busy-fixture")
+                else:
+                    click_title("working (1)")
                 wait_for_screen(
                     lambda frame: preview(0, frame), "enter configured Working"
                 )
-                hover("stashed (1)")
+                focus("stashed (1)")
                 wait_for_screen(
                     lambda frame: preview(2, frame), "enter configured Stashed"
                 )
-                hover("idle-fixture")
+                focus("idle-fixture")
                 wait_for_screen(
                     lambda frame, working=working, stashed=stashed: (
                         preview(1, frame)
-                        and ("busy-fixture" in frame) == (working == "expand")
+                        and ("busy-fixture" in frame) == (working != "collapse")
                         and ("stash-fixture" in frame) == (stashed == "expand")
                     ),
                     "configured expansion persists when focus leaves",
                 )
+
+            write_config("collapse", "collapse")
+            send("q")
+            values[1]["state"] = "busy"
+            write_statuses(values)
+            wait_for(lambda: status(1) == 1, "all non-stashed sessions become busy")
+            sidebar = open_sidebar()
+            wait_for_screen(
+                lambda frame: "working (2)" in frame and "stashed (1)" in frame,
+                "only grouped sessions remain",
+            )
+            click_title("working (2)")
+            wait_for_screen(
+                lambda frame: preview(2, frame) and "busy-fixture" not in frame,
+                "collapse Working expands other closed section",
+            )
+            send("Left")
+            wait_for_screen(
+                lambda frame: (
+                    "stash-fixture" not in frame and first_session_preview(frame)
+                ),
+                "keyboard collapse returns to Working",
+            )
+            click_title("stashed (1)")
+            wait_for_screen(
+                lambda frame: preview(2, frame), "select last stashed session"
+            )
+            send("u")
+            wait_for_screen(
+                lambda frame: (
+                    "working (3)" in frame and len(visible_sessions(frame)) == 3
+                ),
+                "only Working sessions remain",
+            )
+            for key in ["Left", "h"]:
+                send(key)
+                time.sleep(0.2)
+                assert len(visible_sessions(screen())) == 3 and preview(2, screen())
+            click_title("working (3)")
+            wait_for_screen(
+                first_session_preview, "only Working title selects first session"
+            )
+            assert len(visible_sessions(screen())) == 3
+
+            focus("stash-fixture")
+            send("s")
+            values[1]["state"] = "idle"
+            write_statuses(values)
+            wait_for(lambda: status(1) in (0, 3), "restore idle fixture")
+            write_config("expand", "expand")
+            send("q")
+            sidebar = open_sidebar()
+            wait_for_screen(
+                lambda frame: len(visible_sessions(frame)) == 3,
+                "restore expanded sections for click-to-open check",
+            )
 
             config_path.write_text("[sidebar]\nworking = 'automatic'\n")
             invalid = subprocess.run(
@@ -502,7 +619,7 @@ int main(int argc, char **argv) {
                 "click opens session",
             )
             print(
-                "PASS: automatic Working, hover previews, stash priority, first-session startup, click to open"
+                "PASS: automatic Working, keyboard previews, stash priority, first-session startup, click to open"
             )
         finally:
             for process in (client, watcher):

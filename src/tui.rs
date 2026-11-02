@@ -26,7 +26,9 @@ use crate::agent::persist::{
 #[cfg(not(test))]
 use crate::agent::persist::{ui_pane_state_is_empty, update_ui_state};
 use crate::agent::{Pane, PaneId, PaneStatus, capture_pane, kill_pane, switch_to_pane};
-use crate::config::{Config, SectionBehavior, SidebarConfig, SortMode, StartupSelection};
+use crate::config::{
+    Config, SectionBehavior, SidebarConfig, SortMode, StartupSelection, WorkingSection,
+};
 
 const SIDEBAR: PaintId = PaintId(1);
 const PREVIEW: PaintId = PaintId(3);
@@ -52,16 +54,6 @@ impl Section {
             Self::Working => "working",
             Self::Stashed => "stashed",
         }
-    }
-}
-
-fn pane_section(pane: &Pane) -> Option<Section> {
-    if pane.stashed {
-        Some(Section::Stashed)
-    } else if pane.status == PaneStatus::Busy {
-        Some(Section::Working)
-    } else {
-        None
     }
 }
 
@@ -579,7 +571,7 @@ impl App {
             .map(|p| (p.pane_id.to_string(), p))
             .collect();
         if let Some(pane) = selected.as_ref().and_then(|id| self.panes.get(id)) {
-            self.expanded_section = pane_section(pane);
+            self.expanded_section = self.pane_section(pane);
         }
         if selected.is_none() {
             self.focus_startup_session();
@@ -632,7 +624,7 @@ impl App {
             if let Some(section) = section {
                 let count = panes
                     .iter()
-                    .filter(|p| pane_section(p) == Some(section))
+                    .filter(|p| self.pane_section(p) == Some(section))
                     .count();
                 if count == 0 {
                     continue;
@@ -647,7 +639,11 @@ impl App {
             }
             let mut groups: Vec<Group<'_>> = Vec::new();
             let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
-            for p in panes.iter().copied().filter(|p| pane_section(p) == section) {
+            for p in panes
+                .iter()
+                .copied()
+                .filter(|p| self.pane_section(p) == section)
+            {
                 let key = if !p.project_root.is_empty() {
                     GroupKey::Project(p.project_root.clone())
                 } else {
@@ -755,7 +751,10 @@ impl App {
             StartupSelection::Last => self.ui_state.selected_pane_id.clone(),
             StartupSelection::First => String::new(),
         };
-        if let Some(section) = self.panes.get(&selected).and_then(pane_section)
+        if let Some(section) = self
+            .panes
+            .get(&selected)
+            .and_then(|pane| self.pane_section(pane))
             && !self.section_is_expanded(section)
         {
             self.expanded_section = Some(section);
@@ -794,7 +793,7 @@ impl App {
         let Some(pane) = self.pending_kills.remove(pane_id) else {
             return;
         };
-        self.expanded_section = pane_section(&pane);
+        self.expanded_section = self.pane_section(&pane);
         self.panes.insert(pane_id.to_string(), pane);
         self.rebuild_items();
         self.cursor = self
@@ -812,12 +811,50 @@ impl App {
         panes.retain(|pane| !self.pending_kills.contains_key(pane.pane_id.as_str()));
     }
 
+    fn pane_section(&self, pane: &Pane) -> Option<Section> {
+        if pane.stashed {
+            Some(Section::Stashed)
+        } else if pane.status == PaneStatus::Busy
+            && self.sidebar_config.working != WorkingSection::Inline
+        {
+            Some(Section::Working)
+        } else {
+            None
+        }
+    }
+
+    fn section_is_always_expanded(&self, section: Section) -> bool {
+        match section {
+            Section::Working => self.sidebar_config.working == WorkingSection::Expand,
+            Section::Stashed => self.sidebar_config.stashed == SectionBehavior::Expand,
+        }
+    }
+
     fn section_is_expanded(&self, section: Section) -> bool {
-        let behavior = match section {
-            Section::Working => self.sidebar_config.working,
-            Section::Stashed => self.sidebar_config.stashed,
-        };
-        behavior == SectionBehavior::Expand || self.expanded_section == Some(section)
+        self.section_is_always_expanded(section) || self.expanded_section == Some(section)
+    }
+
+    fn collapse_section(&mut self, section: Section) -> bool {
+        if self.section_is_always_expanded(section) || !self.section_is_expanded(section) {
+            return false;
+        }
+        let destination = self
+            .items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                TreeItem::Pane(id) if self.pane_section(&self.panes[id]) != Some(section) => {
+                    Some(index)
+                }
+                TreeItem::SectionHeader(other, _) if *other != section => Some(index),
+                _ => None,
+            });
+        if let Some(destination) = destination {
+            self.select_cursor(destination, false);
+            true
+        } else {
+            false
+        }
     }
 
     fn select_cursor(&mut self, cursor: usize, backwards: bool) {
@@ -836,7 +873,7 @@ impl App {
             let section = *section;
             self.expanded_section = Some(section);
             self.rebuild_items();
-            let in_section = |item: &TreeItem| matches!(item, TreeItem::Pane(id) if pane_section(&self.panes[id]) == Some(section));
+            let in_section = |item: &TreeItem| matches!(item, TreeItem::Pane(id) if self.pane_section(&self.panes[id]) == Some(section));
             self.cursor = if backwards {
                 self.items.iter().rposition(in_section)
             } else {
@@ -848,7 +885,7 @@ impl App {
     }
 
     fn collapse_unfocused_section(&mut self) {
-        let section = self.current_pane().and_then(pane_section);
+        let section = self.current_pane().and_then(|pane| self.pane_section(pane));
         if let Some(expanded) = self.expanded_section
             && section != Some(expanded)
         {
@@ -866,13 +903,13 @@ impl App {
 
     fn toggle_current_stash(&mut self) -> Option<bool> {
         let previous_cursor = self.cursor;
-        let (pane_id, stashed, section) = {
+        let (pane_id, stashed) = {
             let pane = self.current_pane_mut()?;
             pane.stashed = !pane.stashed;
-            (pane.pane_id.to_string(), pane.stashed, pane_section(pane))
+            (pane.pane_id.to_string(), pane.stashed)
         };
         if !stashed {
-            self.expanded_section = section;
+            self.expanded_section = self.current_pane().and_then(|pane| self.pane_section(pane));
         }
         self.rebuild_items();
         self.cursor = if stashed {
@@ -1061,6 +1098,17 @@ impl App {
                 }
                 Action::Redraw
             }
+            KeyCode::Char('h') | KeyCode::Left => {
+                let section = self.current_pane().and_then(|pane| self.pane_section(pane));
+                if let Some(section) = section
+                    && self.collapse_section(section)
+                {
+                    self.preview_gen += 1;
+                    Action::Preview
+                } else {
+                    Action::None
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 for _ in 0..count {
                     let next = next_pane(&self.items, self.cursor);
@@ -1140,10 +1188,8 @@ impl App {
             }
             return Action::Redraw;
         }
-        if matches!(
-            mouse.kind,
-            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left)
-        ) && self.split_interaction.active_id().is_none()
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.split_interaction.active_id().is_none()
             && let Some(hit) = self.hits.hit(mouse.row, mouse.column).cloned()
         {
             let (idx, section) = match hit {
@@ -1156,19 +1202,14 @@ impl App {
                 ),
             };
             let Some(idx) = idx else { return Action::None };
-            if mouse.kind == MouseEventKind::Moved
-                && (idx == self.cursor
-                    || section.is_some_and(|section| {
-                        self.current_pane().and_then(pane_section) == Some(section)
-                    }))
-            {
-                return Action::None;
-            }
-            self.select_cursor(idx, false);
-            if mouse.kind == MouseEventKind::Moved || section.is_some() {
+            if let Some(section) = section {
+                if !self.section_is_expanded(section) || !self.collapse_section(section) {
+                    self.select_cursor(idx, false);
+                }
                 self.preview_gen += 1;
                 return Action::Preview;
             }
+            self.select_cursor(idx, false);
             return self.open_current_pane();
         }
         Action::None
@@ -1629,6 +1670,7 @@ fn render_help(slice: &mut GridSlice<'_>) {
     slice.put_str(2, 1, "Keybindings", title);
     let rows = [
         ("j/k", "move down/up"),
+        ("h/left", "collapse section"),
         ("C-n/C-p", "move down/up"),
         ("[n]j/k", "move down/up n times"),
         ("enter", "switch to pane"),
@@ -2164,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_selects_session_and_requests_preview_only_when_selection_changes() {
+    fn pointer_motion_preserves_selection_and_preview() {
         let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1)]);
         let mut surface = Surface::new(120, 24);
         app.resize(120, 24);
@@ -2176,11 +2218,11 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         let generation = app.preview_gen;
-        assert!(matches!(app.handle_mouse(mouse), Action::Preview));
-        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
-        assert_eq!(app.preview_gen, generation + 1);
         assert!(matches!(app.handle_mouse(mouse), Action::None));
-        assert_eq!(app.preview_gen, generation + 1);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        assert_eq!(app.preview_gen, generation);
+        assert!(matches!(app.handle_mouse(mouse), Action::None));
+        assert_eq!(app.preview_gen, generation);
         assert!(matches!(
             app.handle_mouse(MouseEvent {
                 column: 80,
@@ -2188,7 +2230,7 @@ mod tests {
             }),
             Action::None
         ));
-        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
     }
 
     #[test]
@@ -2219,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_during_sidebar_resize_preserves_session_selection() {
+    fn pointer_motion_during_resize_preserves_session_selection() {
         let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1)]);
         let mut surface = Surface::new(120, 24);
         app.resize(120, 24);
@@ -2245,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_switches_between_collapsible_sections() {
+    fn title_clicks_toggle_sections_and_select_first_session() {
         let mut busy = pane("%2", 1);
         busy.status = PaneStatus::Busy;
         let mut stashed = pane("%3", 2);
@@ -2260,16 +2302,27 @@ mod tests {
             .position(|item| matches!(item, TreeItem::SectionHeader(Section::Stashed, _)))
             .unwrap();
         let mouse = MouseEvent {
-            kind: MouseEventKind::Moved,
+            kind: MouseEventKind::Down(MouseButton::Left),
             column: 4,
             row: header as u16,
             modifiers: KeyModifiers::NONE,
         };
+        assert!(matches!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                ..mouse
+            }),
+            Action::None
+        ));
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
         assert!(matches!(app.handle_mouse(mouse), Action::Preview));
         assert_eq!(app.expanded_section, Some(Section::Stashed));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%3");
         render(&mut surface, &mut app, &mut Vec::new()).unwrap();
-        assert!(matches!(app.handle_mouse(mouse), Action::None));
+        assert!(matches!(app.handle_mouse(mouse), Action::Preview));
+        assert_eq!(app.expanded_section, None);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+        render(&mut surface, &mut app, &mut Vec::new()).unwrap();
         let busy_row = app
             .items
             .iter()
@@ -2285,6 +2338,119 @@ mod tests {
         assert_eq!(app.expanded_section, Some(Section::Working));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
         assert_eq!(pane_ids(&app), ["%1", "%2"]);
+    }
+
+    fn click_title(app: &mut App, section: Section) {
+        let mut surface = Surface::new(120, 24);
+        app.resize(120, 24);
+        render(&mut surface, app, &mut Vec::new()).unwrap();
+        let row = app
+            .items
+            .iter()
+            .position(|item| matches!(item, TreeItem::SectionHeader(found, _) if *found == section))
+            .unwrap();
+        assert!(matches!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Action::Preview
+        ));
+    }
+
+    #[test]
+    fn collapse_requires_destination_for_mouse_and_keyboard() {
+        let (tx, _rx) = mpsc::channel();
+        for section in [Section::Working, Section::Stashed] {
+            let mut first = pane("%1", 0);
+            first.status = PaneStatus::Busy;
+            first.stashed = section == Section::Stashed;
+            let mut second = first.clone();
+            second.pane_id = pane("%2", 1).pane_id;
+            second.order = 1;
+            let mut app = app_with_panes(vec![first, second]);
+            for key in [
+                KeyCode::Char('j'),
+                KeyCode::Left,
+                KeyCode::Char('h'),
+                KeyCode::Char('k'),
+            ] {
+                app.handle_key(KeyEvent::from(key), &tx);
+                assert!(app.current_pane().is_some());
+                assert!(app.section_is_expanded(section));
+            }
+            for _ in 0..3 {
+                click_title(&mut app, section);
+                assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+                assert!(app.section_is_expanded(section));
+            }
+        }
+    }
+
+    #[test]
+    fn collapse_moves_into_other_closed_section() {
+        let (tx, _rx) = mpsc::channel();
+        let mut busy = pane("%1", 0);
+        busy.status = PaneStatus::Busy;
+        let mut stashed = pane("%2", 1);
+        stashed.stashed = true;
+        let mut app = app_with_panes(vec![busy, stashed]);
+        for _ in 0..3 {
+            click_title(&mut app, Section::Working);
+            assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+            assert_eq!(app.expanded_section, Some(Section::Stashed));
+            assert!(matches!(
+                app.handle_key(KeyEvent::from(KeyCode::Left), &tx),
+                Action::Preview
+            ));
+            assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
+            assert_eq!(app.expanded_section, Some(Section::Working));
+        }
+    }
+
+    #[test]
+    fn always_expanded_sections_refuse_collapse_with_other_sessions() {
+        let (tx, _rx) = mpsc::channel();
+        let mut busy = pane("%2", 1);
+        busy.status = PaneStatus::Busy;
+        let mut stashed = pane("%3", 2);
+        stashed.stashed = true;
+        let mut app = app_with_panes(vec![pane("%1", 0), busy, stashed]);
+        app.sidebar_config.working = WorkingSection::Expand;
+        app.sidebar_config.stashed = SectionBehavior::Expand;
+        app.focus_startup_session();
+        for (section, id) in [(Section::Working, "%2"), (Section::Stashed, "%3")] {
+            click_title(&mut app, section);
+            click_title(&mut app, section);
+            assert_eq!(app.current_pane().unwrap().pane_id.as_str(), id);
+            assert!(matches!(
+                app.handle_key(KeyEvent::from(KeyCode::Char('h')), &tx),
+                Action::None
+            ));
+            assert_eq!(app.current_pane().unwrap().pane_id.as_str(), id);
+        }
+    }
+
+    #[test]
+    fn inline_working_keeps_busy_sessions_in_main_but_respects_stash() {
+        let mut busy = pane("%2", 1);
+        busy.status = PaneStatus::Busy;
+        let mut stashed = pane("%3", 2);
+        stashed.status = PaneStatus::Busy;
+        stashed.stashed = true;
+        let mut app = app_with_panes(vec![pane("%1", 0), busy, stashed]);
+        app.sidebar_config.working = WorkingSection::Inline;
+        app.focus_startup_session();
+        assert_eq!(pane_ids(&app), ["%1", "%2"]);
+        assert_eq!(app.pane_section(&app.panes["%2"]), None);
+        assert_eq!(app.pane_section(&app.panes["%3"]), Some(Section::Stashed));
+        assert!(
+            !app.items
+                .iter()
+                .any(|item| matches!(item, TreeItem::SectionHeader(Section::Working, _)))
+        );
     }
 
     #[test]
@@ -2408,7 +2574,7 @@ mod tests {
         busy.status = PaneStatus::Busy;
         let app = app_with_panes(vec![pane("%1", 0), busy]);
         assert_eq!(pane_ids(&app), ["%1"]);
-        assert_eq!(pane_section(&app.panes["%2"]), Some(Section::Working));
+        assert_eq!(app.pane_section(&app.panes["%2"]), Some(Section::Working));
         assert!(
             app.items
                 .iter()
@@ -2460,13 +2626,17 @@ mod tests {
         stashed.status = PaneStatus::Busy;
         stashed.stashed = true;
         let app = app_with_panes(vec![pane("%1", 0), stashed]);
-        assert_eq!(pane_section(&app.panes["%2"]), Some(Section::Stashed));
+        assert_eq!(app.pane_section(&app.panes["%2"]), Some(Section::Stashed));
         assert_eq!(pane_ids(&app), ["%1"]);
     }
 
     #[test]
     fn section_configuration_controls_visibility_without_selecting_headers() {
-        for working in [SectionBehavior::Collapse, SectionBehavior::Expand] {
+        for working in [
+            WorkingSection::Collapse,
+            WorkingSection::Expand,
+            WorkingSection::Inline,
+        ] {
             for stashed_behavior in [SectionBehavior::Collapse, SectionBehavior::Expand] {
                 let mut busy = pane("%2", 1);
                 busy.status = PaneStatus::Busy;
@@ -2481,7 +2651,7 @@ mod tests {
                 app.focus_startup_session();
                 assert_eq!(
                     app.find_pane_by_id("%2").is_some(),
-                    working == SectionBehavior::Expand
+                    working != WorkingSection::Collapse
                 );
                 assert_eq!(
                     app.find_pane_by_id("%3").is_some(),
@@ -2494,7 +2664,7 @@ mod tests {
                 }
                 assert_eq!(
                     app.find_pane_by_id("%2").is_some(),
-                    working == SectionBehavior::Expand
+                    working != WorkingSection::Collapse
                 );
                 assert_eq!(
                     app.find_pane_by_id("%3").is_some(),
@@ -2506,7 +2676,7 @@ mod tests {
                 }
                 assert_eq!(
                     app.find_pane_by_id("%2").is_some(),
-                    working == SectionBehavior::Expand
+                    working != WorkingSection::Collapse
                 );
                 assert_eq!(
                     app.find_pane_by_id("%3").is_some(),
@@ -2576,12 +2746,12 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         app.handle_key(KeyEvent::from(KeyCode::Char('j')), &tx);
         assert_eq!(
-            pane_section(app.current_pane().unwrap()),
+            app.pane_section(app.current_pane().unwrap()),
             Some(Section::Working)
         );
         working.status = PaneStatus::Unread;
         app.replace_panes(vec![pane("%1", 0), working]);
-        assert_eq!(pane_section(&app.panes["%2"]), None);
+        assert_eq!(app.pane_section(&app.panes["%2"]), None);
         assert_eq!(app.panes["%2"].status, PaneStatus::Unread);
         assert_eq!(app.expanded_section, None);
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");

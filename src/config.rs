@@ -14,7 +14,7 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SidebarConfig {
-    pub working: SectionBehavior,
+    pub working: WorkingSection,
     pub stashed: SectionBehavior,
     pub sort: Option<SortMode>,
     pub select: StartupSelection,
@@ -36,6 +36,15 @@ pub enum StartupSelection {
     Unread,
     Last,
     First,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkingSection {
+    #[default]
+    Collapse,
+    Expand,
+    Inline,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -85,13 +94,13 @@ mod tests {
     fn omitted_settings_keep_sections_collapsible() {
         for source in ["", "[sidebar]", "[sidebar]\nworking = 'collapse'"] {
             let config: Config = toml::from_str(source).unwrap();
-            assert_eq!(config.sidebar.working, SectionBehavior::Collapse);
+            assert_eq!(config.sidebar.working, WorkingSection::Collapse);
             assert_eq!(config.sidebar.stashed, SectionBehavior::Collapse);
             assert_eq!(config.sidebar.sort, None);
             assert_eq!(config.sidebar.select, StartupSelection::Unread);
         }
         let config: Config = toml::from_str("[sidebar]\nworking = 'expand'").unwrap();
-        assert_eq!(config.sidebar.working, SectionBehavior::Expand);
+        assert_eq!(config.sidebar.working, WorkingSection::Expand);
         assert_eq!(config.sidebar.stashed, SectionBehavior::Collapse);
     }
 
@@ -101,7 +110,11 @@ mod tests {
             ("collapse", SectionBehavior::Collapse),
             ("expand", SectionBehavior::Expand),
         ];
-        for (working, expected_working) in behaviors {
+        for (working, expected_working) in [
+            ("collapse", WorkingSection::Collapse),
+            ("expand", WorkingSection::Expand),
+            ("inline", WorkingSection::Inline),
+        ] {
             for (stashed, expected_stashed) in behaviors {
                 let source = format!("[sidebar]\nworking = '{working}'\nstashed = '{stashed}'");
                 let config: Config = toml::from_str(&source).unwrap();
@@ -134,6 +147,7 @@ mod tests {
             "[sidebar]\nworkng = 'collapse'",
             "[sidebar]\nworking = true",
             "[sidebar]\nworking = 'automatic'",
+            "[sidebar]\nstashed = 'inline'",
             "[sidebar]\nsort = 'manual'",
             "[sidebar]\nsort = true",
             "[sidebar]\nselect = 'attention'",
@@ -177,14 +191,14 @@ mod tests {
         ));
         let path = root.join("config.toml");
         let config = Config::load_from(&path).unwrap();
-        assert_eq!(config.sidebar.working, SectionBehavior::Collapse);
+        assert_eq!(config.sidebar.working, WorkingSection::Collapse);
         assert_eq!(config.sidebar.stashed, SectionBehavior::Collapse);
 
         fs::create_dir_all(&root).unwrap();
         fs::write(&path, "[sidebar]\nworking = 'expand'").unwrap();
         assert_eq!(
             Config::load_from(&path).unwrap().sidebar.working,
-            SectionBehavior::Expand
+            WorkingSection::Expand
         );
         fs::write(&path, "invalid = true").unwrap();
         assert!(

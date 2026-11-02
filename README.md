@@ -27,7 +27,7 @@ Run inside tmux:
 agent-mux
 ```
 
-Hover to preview a session. Click or press Enter to open it. Background
+Use Up/Down to preview a session. Click or press Enter to open it. Background
 monitoring starts and recovers automatically. Watcher errors appear alongside
 the session list; agent sessions and saved UI state are preserved.
 
@@ -43,7 +43,8 @@ Reload with `tmux source-file ~/.tmux.conf`, then use `prefix + j`.
 
 | Key                       | Action                             |
 | ------------------------- | ---------------------------------- |
-| `j` / `k` or arrows       | Move down/up                       |
+| `j` / `k` or Up/Down       | Move down/up                       |
+| `h` / Left                | Collapse current section           |
 | `gg` / `G`                | First/last session                 |
 | `Enter`                   | Open session                       |
 | `s` / `u`                 | Stash/unstash                      |
@@ -61,9 +62,12 @@ Sessions are grouped by project, with the latest state changes first.
 - **Working**: busy agents, returned to the main list when finished.
 - **Stashed**: sessions set aside with `s`, including busy ones.
 
-Sections expand when entered and collapse when left. Startup selects an unread,
-non-stashed session, then falls back to your last selection or the first session.
-Finished, unfocused sessions become unread; opening them marks them read.
+Sections expand when entered and collapse when left. Click a section title to
+expand and select its first session, or collapse it. A section stays open if
+there is no other session to select, or it is configured to stay expanded.
+Startup selects an unread, non-stashed session, then falls back to your last
+selection or the first session. Finished, unfocused sessions become unread;
+opening them marks them read.
 
 ## Configuration
 
@@ -74,11 +78,13 @@ Optional file: `~/.config/agent-mux/config.toml` (or
 [sidebar]
 # sort = "recent"    # "recent" | "creation"; unset: saved choice or "recent"
 select = "unread"    # "unread" | "last" | "first"
-working = "collapse" # "collapse" | "expand"
+working = "collapse" # "collapse" | "expand" | "inline"
 stashed = "collapse" # "collapse" | "expand"
 ```
 
-Reopen agent-mux to apply changes.
+Set `working = "inline"` to keep busy sessions in the normal list, without a
+Working section. Stashed sessions remain separate. Reopen agent-mux to apply
+changes.
 
 ## Development
 
