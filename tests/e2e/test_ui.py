@@ -1,7 +1,25 @@
 import shlex
+import time
 
 import pytest
 from harness import run, wait_for
+
+
+def test_busy_parent_stays_working_while_nested_smelt_runs(mux):
+    agent, pid = mux.add_agent("nested-parent")
+    statuses = [{"pid": pid, "state": "busy"}]
+    mux.write_statuses(statuses)
+    pane = mux.launch()
+    mux.wait_screen(pane, lambda frame: "working (1)" in frame, "parent starts working")
+
+    for command, marker in [("s", "child-running"), ("x", "child-stopped")]:
+        mux.send(agent, command, "Enter")
+        mux.wait_screen(agent, lambda frame, marker=marker: marker in frame, marker)
+        # Cross several polls with unchanged output to catch heuristic fallback.
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            assert "working (1)" in mux.screen(pane)
+            time.sleep(0.1)
 
 
 def test_sidebar_navigation_stash_restore_and_click(mux):

@@ -165,14 +165,14 @@ const PROVIDERS: &[ProviderPattern] = &[
 ];
 
 pub fn resolve(cmd: &str, shell_pid: i32, pt: &ProcessTable) -> Option<ProviderMatch> {
-    let current = resolve_executable(cmd);
-    if let Some(matched) = resolve_descendant(shell_pid, pt) {
-        return Some(matched);
-    }
-    current.map(|matched| ProviderMatch {
-        name: matched.to_string(),
-        pid: shell_pid,
-    })
+    resolve_process(shell_pid, pt)
+        .or_else(|| resolve_descendant(shell_pid, pt))
+        .or_else(|| {
+            resolve_executable(cmd).map(|name| ProviderMatch {
+                name: name.to_string(),
+                pid: shell_pid,
+            })
+        })
 }
 
 fn resolve_descendant(root_pid: i32, pt: &ProcessTable) -> Option<ProviderMatch> {
@@ -311,6 +311,43 @@ mod tests {
 
         assert_eq!(matched.name, "smelt");
         assert_eq!(matched.pid, 30);
+    }
+
+    #[test]
+    fn keeps_direct_provider_pid_when_nested_provider_runs() {
+        let mut table = ProcessTable::default();
+        add_process(&mut table, 10, 1, "smelt", &["smelt"]);
+        add_process(&mut table, 20, 10, "smelt", &["smelt", "status"]);
+
+        let matched = resolve("smelt", 10, &table).unwrap();
+
+        assert_eq!(matched.name, "smelt");
+        assert_eq!(matched.pid, 10);
+    }
+
+    #[test]
+    fn keeps_direct_script_provider_pid_when_nested_provider_runs() {
+        let mut table = ProcessTable::default();
+        add_process(&mut table, 10, 1, "node", &["node", "/usr/bin/claude"]);
+        add_process(&mut table, 20, 10, "smelt", &["smelt"]);
+
+        let matched = resolve("node", 10, &table).unwrap();
+
+        assert_eq!(matched.name, "claude");
+        assert_eq!(matched.pid, 10);
+    }
+
+    #[test]
+    fn resolves_foreground_provider_pid_when_pane_pid_is_shell() {
+        let mut table = ProcessTable::default();
+        add_process(&mut table, 10, 1, "bash", &["bash"]);
+        add_process(&mut table, 20, 10, "smelt", &["smelt"]);
+        add_process(&mut table, 30, 20, "smelt", &["smelt", "status"]);
+
+        let matched = resolve("smelt", 10, &table).unwrap();
+
+        assert_eq!(matched.name, "smelt");
+        assert_eq!(matched.pid, 20);
     }
 
     #[test]
