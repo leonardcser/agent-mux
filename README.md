@@ -10,13 +10,19 @@ Kimi CLI.
 
 ## Install
 
-Requires Rust 1.88+ and tmux. From this checkout:
+Requires Rust 1.88+ and tmux on Linux or macOS. On Windows, use WSL.
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/leonardcser/agent-mux --locked
 ```
 
-Use the same command to upgrade. Open TUIs pick up validated updates
+Or, from a local checkout:
+
+```sh
+cargo install --path . --locked
+```
+
+Rerun the same command to upgrade. Open TUIs pick up validated updates
 automatically; otherwise, updates take effect on the next launch.
 
 ## Use
