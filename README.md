@@ -62,8 +62,9 @@ Reload with `tmux source-file ~/.tmux.conf`, then use `prefix + j`.
 
 ### Sidebar
 
-Sessions are grouped by project. Busy sessions appear under **Working**;
-use `s` to move sessions to **Stashed**. Click a section title to expand or
+Sessions are grouped by project. Busy sessions appear under **Working**.
+Sessions that wait for input show an orange outline circle and leave
+**Working**; in `manual` mode, park them back with Ctrl+Enter or `w`. Use `s` to move sessions to **Stashed**. Click a section title to expand or
 collapse it. Sessions that finish in the background become unread until opened.
 
 ## Configuration
@@ -86,7 +87,7 @@ stashed_section = "collapse" # collapse | expand
 
 `working` modes:
 
-- `manual`: use Ctrl+Enter or `w` to park busy sessions in Working.
+- `manual`: use Ctrl+Enter or `w` to park busy or waiting sessions in Working.
 - `section`: move busy sessions to Working automatically.
 - `inline`: keep busy sessions in place.
 - `inline-last`: show busy sessions last in each project.

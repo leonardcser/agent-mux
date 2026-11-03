@@ -241,10 +241,9 @@ fn prune_ui_state(panes: &[Pane]) -> Result<()> {
             let Some(pane) = pane_state.get(id.as_str()) else {
                 continue;
             };
-            ui.parked_busy_since = ui.parked_busy_since.filter(|since| {
-                pane.status == crate::agent::PaneStatus::Busy
-                    && pane.status_changed_at == Some(*since)
-            });
+            ui.parked_since = ui
+                .parked_since
+                .filter(|since| pane.status.is_working() && pane.park_epoch == Some(*since));
             update_pane_read_state(ui, &pane.content_hash, pane.window_active);
         }
         state

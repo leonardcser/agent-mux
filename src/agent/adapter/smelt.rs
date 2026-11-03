@@ -3,7 +3,7 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use crate::agent::Pane;
+use crate::agent::{Activity, Pane};
 
 use super::{ObservedActivity, ProviderAdapter};
 
@@ -17,7 +17,7 @@ impl ProviderAdapter for SmeltAdapter {
                 (
                     pid,
                     ObservedActivity {
-                        busy: status.state.is_busy(),
+                        activity: status.state.activity(),
                         completed: matches!(status.state, SmeltState::Completed),
                     },
                 )
@@ -45,8 +45,12 @@ enum SmeltState {
 }
 
 impl SmeltState {
-    fn is_busy(self) -> bool {
-        matches!(self, Self::Busy | Self::Waiting)
+    fn activity(self) -> Activity {
+        match self {
+            Self::Busy => Activity::Busy,
+            Self::Waiting => Activity::Waiting,
+            Self::Completed | Self::Inactive => Activity::Inactive,
+        }
     }
 }
 
@@ -76,20 +80,24 @@ fn smelt_statuses() -> HashMap<u32, SmeltStatus> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn busy_and_waiting_states_are_active() {
-        assert!(SmeltState::Busy.is_busy());
-        assert!(SmeltState::Waiting.is_busy());
-        assert!(!SmeltState::Completed.is_busy());
-        assert!(!SmeltState::Inactive.is_busy());
+    fn activity(state: &str) -> Activity {
+        let json = format!(r#"{{"pid":1,"state":"{state}"}}"#);
+        serde_json::from_str::<SmeltStatus>(&json)
+            .unwrap()
+            .state
+            .activity()
     }
 
     #[test]
-    fn inactive_provider_states_are_not_busy() {
+    fn busy_and_waiting_are_distinct_activities() {
+        assert_eq!(activity("busy"), Activity::Busy);
+        assert_eq!(activity("waiting"), Activity::Waiting);
+    }
+
+    #[test]
+    fn other_provider_states_are_inactive() {
         for state in ["idle", "needs_attention", "completed", "future_state"] {
-            let json = format!(r#"{{"pid":1,"state":"{state}"}}"#);
-            let status: SmeltStatus = serde_json::from_str(&json).unwrap();
-            assert!(!status.state.is_busy());
+            assert_eq!(activity(state), Activity::Inactive);
         }
     }
 }

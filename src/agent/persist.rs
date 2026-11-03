@@ -84,6 +84,8 @@ pub struct CachedPane {
         skip_serializing_if = "Option::is_none"
     )]
     pub status_changed_at: Option<DateTime<Utc>>,
+    #[serde(rename = "parkEpoch", default, skip_serializing_if = "Option::is_none")]
+    pub park_epoch: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -132,13 +134,13 @@ pub struct UiState {
 pub struct UiPaneState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stashed: bool,
-    // Bind parking to one busy period, so it cannot carry into the next task.
+    // Bind parking to one working period, so it cannot carry into the next task.
     #[serde(
-        rename = "parkedBusySince",
+        rename = "parkedSince",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub parked_busy_since: Option<DateTime<Utc>>,
+    pub parked_since: Option<DateTime<Utc>>,
     #[serde(rename = "forcedUnread", default, skip_serializing_if = "is_false")]
     pub forced_unread: bool,
     #[serde(
@@ -197,9 +199,9 @@ pub fn apply_ui_state(panes: &mut [Pane], ui_state: &UiState) {
 
 pub fn apply_pane_ui_state(pane: &mut Pane, ui: &UiPaneState) {
     pane.stashed = ui.stashed;
-    pane.parked_busy_since = ui
-        .parked_busy_since
-        .filter(|since| pane.status == PaneStatus::Busy && pane.status_changed_at == Some(*since));
+    pane.parked_since = ui
+        .parked_since
+        .filter(|since| pane.status.is_working() && pane.park_epoch == Some(*since));
     pane.status = display_status(
         pane.status,
         &pane.content_hash,
@@ -214,8 +216,8 @@ pub fn display_status(
     forced_unread: bool,
     read_content_hash: Option<&str>,
 ) -> PaneStatus {
-    if status == PaneStatus::Busy {
-        PaneStatus::Busy
+    if status.is_working() {
+        status
     } else if forced_unread {
         PaneStatus::Unread
     } else if status == PaneStatus::Unread && read_content_hash == Some(content_hash) {
@@ -226,10 +228,7 @@ pub fn display_status(
 }
 
 pub fn ui_pane_state_is_empty(ui: &UiPaneState) -> bool {
-    !ui.stashed
-        && ui.parked_busy_since.is_none()
-        && !ui.forced_unread
-        && ui.read_content_hash.is_none()
+    !ui.stashed && ui.parked_since.is_none() && !ui.forced_unread && ui.read_content_hash.is_none()
 }
 
 pub fn update_snapshot(
@@ -399,6 +398,7 @@ pub fn cache_panes(panes: &[Pane]) -> Vec<CachedPane> {
             completed: p.completed,
             last_active: p.last_active,
             status_changed_at: p.status_changed_at,
+            park_epoch: p.park_epoch,
             ..CachedPane::default()
         })
         .collect()
@@ -436,6 +436,7 @@ fn panes_from_cached(panes: &[CachedPane]) -> Vec<Pane> {
                 completed: cp.completed,
                 last_active: cp.last_active,
                 status_changed_at: cp.status_changed_at.or(cp.last_active),
+                park_epoch: cp.park_epoch.or(cp.status_changed_at).or(cp.last_active),
                 ..Pane::new(pane_id)
             })
         })

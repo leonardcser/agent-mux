@@ -900,10 +900,11 @@ impl App {
     fn pane_section(&self, pane: &Pane) -> Option<Section> {
         if pane.stashed {
             Some(Section::Stashed)
-        } else if pane.status == PaneStatus::Busy
-            && (self.sidebar_config.working == WorkingSection::Section
-                || (self.sidebar_config.working == WorkingSection::Manual
-                    && pane.parked_busy_since.is_some()))
+        } else if (pane.status == PaneStatus::Busy
+            && self.sidebar_config.working == WorkingSection::Section)
+            || (pane.status.is_working()
+                && self.sidebar_config.working == WorkingSection::Manual
+                && pane.parked_since.is_some())
         {
             Some(Section::Working)
         } else {
@@ -997,14 +998,14 @@ impl App {
         let Some(pane) = self.current_pane_mut() else {
             return Action::None;
         };
-        if pane.stashed || pane.status != PaneStatus::Busy {
+        if pane.stashed || !pane.status.is_working() {
             return Action::None;
         }
-        let parked = pane.parked_busy_since.is_none();
-        if parked && pane.status_changed_at.is_none() {
+        let parked = pane.parked_since.is_none();
+        if parked && pane.park_epoch.is_none() {
             return Action::None;
         }
-        pane.parked_busy_since = if parked { pane.status_changed_at } else { None };
+        pane.parked_since = if parked { pane.park_epoch } else { None };
         let id = pane.pane_id.to_string();
         self.rebuild_items();
         self.cursor = if parked {
@@ -1024,7 +1025,7 @@ impl App {
         let (pane_id, stashed) = {
             let pane = self.current_pane_mut()?;
             pane.stashed = !pane.stashed;
-            pane.parked_busy_since = None;
+            pane.parked_since = None;
             (pane.pane_id.to_string(), pane.stashed)
         };
         if !stashed {
@@ -1137,7 +1138,7 @@ impl App {
                     let unread = match p.status {
                         PaneStatus::Idle => true,
                         PaneStatus::Unread => false,
-                        PaneStatus::Busy => return Action::None,
+                        PaneStatus::Busy | PaneStatus::Waiting => return Action::None,
                     };
                     p.status = if unread {
                         PaneStatus::Unread
@@ -1371,7 +1372,7 @@ impl App {
         for p in self.panes.values() {
             let entry = state.panes.entry(p.pane_id.to_string()).or_default();
             entry.stashed = p.stashed;
-            entry.parked_busy_since = p.parked_busy_since;
+            entry.parked_since = p.parked_since;
             if let Some(unread) = self.pending_unread_changes.get(p.pane_id.as_str()) {
                 entry.forced_unread = *unread;
                 entry.read_content_hash = (!*unread).then(|| p.content_hash.clone());
@@ -1690,7 +1691,7 @@ fn render_pane_row(
         Color::AnsiValue(242)
     } else {
         match p.status {
-            PaneStatus::Busy => Color::Rgb {
+            PaneStatus::Busy | PaneStatus::Waiting => Color::Rgb {
                 r: 217,
                 g: 119,
                 b: 6,
@@ -1706,7 +1707,7 @@ fn render_pane_row(
     };
     let icon = if p.completed {
         '✓'
-    } else if matches!(p.status, PaneStatus::Idle) {
+    } else if matches!(p.status, PaneStatus::Idle | PaneStatus::Waiting) {
         '○'
     } else {
         '●'
@@ -2520,6 +2521,7 @@ mod tests {
             path: path.to_string(),
             order,
             status_changed_at: chrono::DateTime::from_timestamp(status_changed_secs, 0),
+            park_epoch: chrono::DateTime::from_timestamp(status_changed_secs, 0),
             ..Pane::new(PaneId::parse(id).unwrap())
         }
     }
@@ -2846,7 +2848,7 @@ mod tests {
             let mut app = app_with_panes(vec![p]);
             app.sidebar_config.working = mode;
             assert!(matches!(app.toggle_current_parking(), Action::None));
-            assert!(app.panes["%1"].parked_busy_since.is_none());
+            assert!(app.panes["%1"].parked_since.is_none());
         }
     }
 
@@ -2864,6 +2866,47 @@ mod tests {
     }
 
     #[test]
+    fn waiting_session_stays_out_of_working_until_parked_manually() {
+        let mut p = pane_at("%1", 0, "/repo", 100);
+        p.status = PaneStatus::Waiting;
+        for mode in [WorkingSection::Section, WorkingSection::Inline] {
+            let mut app = app_with_panes(vec![p.clone()]);
+            app.sidebar_config.working = mode;
+            assert_eq!(app.pane_section(&app.panes["%1"]), None);
+            assert!(matches!(app.toggle_current_parking(), Action::None));
+        }
+        let mut app = app_with_panes(vec![p]);
+        app.sidebar_config.working = WorkingSection::Manual;
+        assert!(matches!(app.toggle_current_parking(), Action::Redraw));
+        assert_eq!(app.pane_section(&app.panes["%1"]), Some(Section::Working));
+    }
+
+    #[test]
+    fn waiting_rows_use_orange_outline_circle() {
+        let mut waiting = pane("%1", 0);
+        waiting.status = PaneStatus::Waiting;
+        let app = app_with_panes(vec![waiting]);
+        let mut grid = smelt_term::grid::Grid::new(40, 1);
+        render_pane_row(
+            &mut grid.slice_mut(Rect::new(0, 0, 40, 1)),
+            0,
+            40,
+            &app.panes["%1"],
+            false,
+            &app,
+        );
+        assert_eq!(grid.cell(3, 0).symbol.as_str(), "○");
+        assert_eq!(
+            grid.cell(3, 0).style.fg,
+            Some(Color::Rgb {
+                r: 217,
+                g: 119,
+                b: 6
+            })
+        );
+    }
+
+    #[test]
     fn saved_parking_expires_even_if_completion_snapshot_was_missed() {
         let mut p = pane_at("%1", 0, "/repo", 100);
         p.status = PaneStatus::Busy;
@@ -2872,10 +2915,10 @@ mod tests {
         app.toggle_current_parking();
         let state = app.ui_state.clone();
         crate::agent::persist::apply_pane_ui_state(&mut p, &state.panes["%1"]);
-        assert!(p.parked_busy_since.is_some());
-        p.status_changed_at = Some(p.status_changed_at.unwrap() + chrono::Duration::seconds(1));
+        assert!(p.parked_since.is_some());
+        p.park_epoch = Some(p.park_epoch.unwrap() + chrono::Duration::seconds(1));
         crate::agent::persist::apply_pane_ui_state(&mut p, &state.panes["%1"]);
-        assert!(p.parked_busy_since.is_none());
+        assert!(p.parked_since.is_none());
     }
 
     #[test]

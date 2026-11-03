@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::agent::persist::{CachedPane, Snapshot};
-use crate::agent::{Pane, PaneStatus};
+use crate::agent::{Activity, Pane, PaneStatus};
 
 const BUSY_UNCHANGED_POLLS: usize = 3;
 // After a pane is resized, tmux reflows the existing content and the running
@@ -13,15 +13,17 @@ const RESIZE_SETTLE_POLLS: usize = 5;
 
 fn activity_status(
     previous: PaneStatus,
-    busy: bool,
+    activity: Activity,
     focused: bool,
     newly_completed: bool,
 ) -> PaneStatus {
-    if busy {
+    if activity == Activity::Busy {
         PaneStatus::Busy
+    } else if activity == Activity::Waiting {
+        PaneStatus::Waiting
     } else if focused {
         PaneStatus::Idle
-    } else if newly_completed || matches!(previous, PaneStatus::Busy | PaneStatus::Unread) {
+    } else if newly_completed || previous.is_working() || previous == PaneStatus::Unread {
         PaneStatus::Unread
     } else {
         PaneStatus::Idle
@@ -39,6 +41,7 @@ pub struct Reconciler {
     resize_settling: HashMap<String, usize>,
     last_active: HashMap<String, DateTime<Utc>>,
     status_changed_at: HashMap<String, DateTime<Utc>>,
+    park_epoch: HashMap<String, DateTime<Utc>>,
 }
 
 impl Reconciler {
@@ -63,7 +66,10 @@ impl Reconciler {
                 self.last_active.insert(id.clone(), t);
             }
             if let Some(t) = cp.status_changed_at.or(cp.last_active) {
-                self.status_changed_at.insert(id, t);
+                self.status_changed_at.insert(id.clone(), t);
+            }
+            if let Some(t) = cp.park_epoch.or(cp.status_changed_at).or(cp.last_active) {
+                self.park_epoch.insert(id, t);
             }
         }
     }
@@ -107,16 +113,15 @@ impl Reconciler {
             };
             self.resize_settling.insert(id.clone(), settling);
 
-            if let Some(observed_busy) = p.observed_busy {
-                if observed_busy {
+            if let Some(observed) = p.observed {
+                if observed == Activity::Busy {
                     self.last_active.insert(id.clone(), now);
                     self.unchanged_count.insert(id.clone(), 0);
                 }
                 p.last_active = self.last_active.get(&id).copied();
                 let newly_completed =
                     p.completed && !self.prev_completed.get(&id).copied().unwrap_or(false);
-                p.status =
-                    activity_status(prev_status, observed_busy, p.window_active, newly_completed);
+                p.status = activity_status(prev_status, observed, p.window_active, newly_completed);
                 self.track_pane(p, now);
                 continue;
             }
@@ -138,7 +143,12 @@ impl Reconciler {
             {
                 PaneStatus::Busy
             } else {
-                activity_status(prev_status, active_now, p.window_active, false)
+                let activity = if active_now {
+                    Activity::Busy
+                } else {
+                    Activity::Inactive
+                };
+                activity_status(prev_status, activity, p.window_active, false)
             };
 
             self.track_pane(p, now);
@@ -153,17 +163,25 @@ impl Reconciler {
         self.resize_settling.retain(|k, _| alive.contains_key(k));
         self.last_active.retain(|k, _| alive.contains_key(k));
         self.status_changed_at.retain(|k, _| alive.contains_key(k));
+        self.park_epoch.retain(|k, _| alive.contains_key(k));
     }
 
     fn track_pane(&mut self, p: &mut Pane, now: DateTime<Utc>) {
         let id = p.pane_id.to_string();
+        let previous = self.prev_statuses.get(&id).copied();
+        let status_changed =
+            previous != Some(p.status) || self.prev_completed.get(&id) != Some(&p.completed);
+        let resumed = previous == Some(PaneStatus::Waiting) && p.status == PaneStatus::Busy;
         let changed_at = self.status_changed_at.entry(id.clone()).or_insert(now);
-        if self.prev_statuses.get(&id) != Some(&p.status)
-            || self.prev_completed.get(&id) != Some(&p.completed)
-        {
+        if status_changed {
             *changed_at = now;
         }
         p.status_changed_at = Some(*changed_at);
+        let epoch = self.park_epoch.entry(id.clone()).or_insert(now);
+        if status_changed && !resumed {
+            *epoch = now;
+        }
+        p.park_epoch = Some(*epoch);
         if !p.content_hash.is_empty() {
             self.prev_content.insert(id.clone(), p.content_hash.clone());
         }
@@ -187,6 +205,7 @@ impl Reconciler {
             }
             cp.completed = self.prev_completed.get(&id).copied().unwrap_or(false);
             cp.status_changed_at = self.status_changed_at.get(&id).copied();
+            cp.park_epoch = self.park_epoch.get(&id).copied();
             if let Some(t) = self.last_active.get(&id) {
                 cp.last_active = Some(*t);
             }
@@ -235,7 +254,11 @@ mod tests {
 
     fn pane_with_observed(content_hash: &str, window_active: bool, busy: bool) -> Pane {
         Pane {
-            observed_busy: Some(busy),
+            observed: Some(if busy {
+                Activity::Busy
+            } else {
+                Activity::Inactive
+            }),
             ..pane(content_hash, window_active)
         }
     }
@@ -265,7 +288,7 @@ mod tests {
         });
         restarted.reconcile(&mut panes);
         assert_eq!(panes[0].status_changed_at, Some(started));
-        panes[0].observed_busy = Some(false);
+        panes[0].observed = Some(Activity::Inactive);
         restarted.reconcile(&mut panes);
         assert!(panes[0].status_changed_at.unwrap() > started);
         assert_eq!(panes[0].status, PaneStatus::Unread);
@@ -294,7 +317,7 @@ mod tests {
         reconciler.reconcile(&mut panes);
         assert_eq!(panes[0].status, PaneStatus::Idle);
         panes[0].completed = false;
-        panes[0].observed_busy = Some(true);
+        panes[0].observed = Some(Activity::Busy);
         reconciler.reconcile(&mut panes);
         assert_eq!(panes[0].status, PaneStatus::Busy);
         assert!(!panes[0].completed);
@@ -467,5 +490,39 @@ mod tests {
         reconciler.reconcile(&mut panes);
 
         assert_eq!(panes[0].status, PaneStatus::Busy);
+    }
+
+    #[test]
+    fn waiting_leaves_working_period_but_resuming_keeps_it() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Busy, "same", false));
+        let mut panes = vec![pane_with_observed("same", false, true)];
+        reconciler.reconcile(&mut panes);
+        let busy_epoch = panes[0].park_epoch;
+
+        let mut panes = vec![Pane {
+            observed: Some(Activity::Waiting),
+            ..pane_with_observed("same", false, false)
+        }];
+        reconciler.reconcile(&mut panes);
+        assert_eq!(panes[0].status, PaneStatus::Waiting);
+        let waiting_epoch = panes[0].park_epoch;
+        assert_ne!(waiting_epoch, busy_epoch);
+
+        let mut panes = vec![pane_with_observed("same", false, true)];
+        reconciler.reconcile(&mut panes);
+        assert_eq!(panes[0].status, PaneStatus::Busy);
+        assert_eq!(panes[0].park_epoch, waiting_epoch);
+    }
+
+    #[test]
+    fn waiting_becoming_inactive_marks_unfocused_pane_unread() {
+        let mut reconciler = Reconciler::new();
+        reconciler.seed_from_snapshot(&snapshot(PaneStatus::Waiting, "same", false));
+        let mut panes = vec![pane_with_observed("same", false, false)];
+
+        reconciler.reconcile(&mut panes);
+
+        assert_eq!(panes[0].status, PaneStatus::Unread);
     }
 }

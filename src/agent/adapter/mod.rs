@@ -3,14 +3,14 @@ mod smelt;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::agent::Pane;
+use crate::agent::{Activity, Pane};
 
 use self::default::DEFAULT_ADAPTER;
 use self::smelt::SMELT_ADAPTER;
 
 #[derive(Clone, Copy)]
 struct ObservedActivity {
-    busy: bool,
+    activity: Activity,
     completed: bool,
 }
 
@@ -38,7 +38,7 @@ pub fn apply_provider_activity(panes: &mut [Pane]) {
                 continue;
             }
             if let Some(observed) = activity.get(&(pane.provider_pid as u32)) {
-                pane.observed_busy = Some(observed.busy);
+                pane.observed = Some(observed.activity);
                 pane.completed = observed.completed;
             }
         }

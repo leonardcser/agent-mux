@@ -41,13 +41,19 @@ pub enum PaneStatus {
     #[default]
     Idle = 0,
     Busy = 1,
+    Waiting = 2,
     Unread = 3,
 }
 
 impl PaneStatus {
+    pub fn is_working(self) -> bool {
+        matches!(self, Self::Busy | Self::Waiting)
+    }
+
     pub fn from_i32(value: i32) -> Self {
         match value {
             1 => Self::Busy,
+            2 => Self::Waiting,
             3 => Self::Unread,
             _ => Self::Idle,
         }
@@ -56,6 +62,14 @@ impl PaneStatus {
     pub fn as_i32(self) -> i32 {
         self as i32
     }
+}
+
+/// What a provider reports about a session, as opposed to the displayed status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    Busy,
+    Waiting,
+    Inactive,
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +92,7 @@ pub struct Pane {
     pub pid: i32,
     pub provider_pid: i32,
     pub status: PaneStatus,
-    pub observed_busy: Option<bool>,
+    pub observed: Option<Activity>,
     pub completed: bool,
     pub content_hash: String,
     pub window_active: bool,
@@ -86,8 +100,11 @@ pub struct Pane {
     pub height: u16,
     pub last_active: Option<DateTime<Utc>>,
     pub status_changed_at: Option<DateTime<Utc>>,
+    /// Changes whenever the session leaves its current working period. A
+    /// waiting session resuming work stays in the same period.
+    pub park_epoch: Option<DateTime<Utc>>,
     pub stashed: bool,
-    pub parked_busy_since: Option<DateTime<Utc>>,
+    pub parked_since: Option<DateTime<Utc>>,
     pub order: usize,
     pub provider: String,
 }
@@ -112,7 +129,7 @@ impl Pane {
             pid: 0,
             provider_pid: 0,
             status: PaneStatus::default(),
-            observed_busy: None,
+            observed: None,
             completed: false,
             content_hash: String::new(),
             window_active: false,
@@ -120,8 +137,9 @@ impl Pane {
             height: 0,
             last_active: None,
             status_changed_at: None,
+            park_epoch: None,
             stashed: false,
-            parked_busy_since: None,
+            parked_since: None,
             order: 0,
             provider: String::new(),
         }
