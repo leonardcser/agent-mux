@@ -24,6 +24,10 @@ impl ProviderAdapter for SmeltAdapter {
             })
             .collect()
     }
+
+    fn reports_activity(&self) -> bool {
+        true
+    }
 }
 
 pub(super) static SMELT_ADAPTER: SmeltAdapter = SmeltAdapter;
