@@ -72,6 +72,7 @@ class Sandbox:
         self.state.mkdir()
         self.config = root / "config/agent-mux/config.toml"
         self.config.parent.mkdir(parents=True)
+        self.config.write_text('[sidebar]\nworking = "section"\n')
         self.statuses = root / "statuses.json"
         self.statuses.write_text("[]")
         self.socket = root / "tmux.sock"

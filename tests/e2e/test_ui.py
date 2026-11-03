@@ -23,7 +23,9 @@ def test_busy_parent_stays_working_while_nested_smelt_runs(mux):
 
 
 def test_sidebar_navigation_stash_restore_and_click(mux):
-    mux.config.write_text('[sidebar]\nselect = "last"\nsort = "creation"\n')
+    mux.config.write_text(
+        '[sidebar]\nworking = "section"\nselect = "last"\nsort = "creation"\n'
+    )
     idle, idle_pid = mux.add_agent("idle")
     _, busy_pid = mux.add_agent("busy")
     mux.write_statuses(
