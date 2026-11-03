@@ -79,15 +79,15 @@ new_window_command = "" # shell | smelt | opencode | codex | claude
 [sidebar]
 sort = "recent"              # recent | creation; unset: saved choice
 select = "unread"            # unread | last | first
-working = "section"          # section | manual | inline | inline-last
+working = "manual"           # manual | section | inline | inline-last
 working_section = "collapse" # collapse | expand
 stashed_section = "collapse" # collapse | expand
 ```
 
 `working` modes:
 
-- `section`: move busy sessions to Working automatically.
 - `manual`: use Ctrl+Enter or `w` to park busy sessions in Working.
+- `section`: move busy sessions to Working automatically.
 - `inline`: keep busy sessions in place.
 - `inline-last`: show busy sessions last in each project.
 

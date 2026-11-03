@@ -2031,7 +2031,10 @@ mod tests {
             pending_g: false,
             sort_mode: SortMode::default(),
             expanded_section: None,
-            sidebar_config: SidebarConfig::default(),
+            sidebar_config: SidebarConfig {
+                working: WorkingSection::Section,
+                ..SidebarConfig::default()
+            },
             new_window_command: None,
             count: 0,
             err: None,

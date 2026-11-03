@@ -44,8 +44,8 @@ pub enum StartupSelection {
 #[serde(rename_all = "lowercase")]
 pub enum WorkingSection {
     #[default]
-    Section,
     Manual,
+    Section,
     Inline,
     #[serde(rename = "inline-last")]
     InlineLast,
@@ -96,9 +96,9 @@ mod tests {
 
     #[test]
     fn omitted_settings_keep_sections_collapsible() {
-        for source in ["", "[sidebar]", "[sidebar]\nworking = 'section'"] {
+        for source in ["", "[sidebar]", "[sidebar]\nworking = 'manual'"] {
             let config: Config = toml::from_str(source).unwrap();
-            assert_eq!(config.sidebar.working, WorkingSection::Section);
+            assert_eq!(config.sidebar.working, WorkingSection::Manual);
             assert_eq!(config.sidebar.working_section, SectionBehavior::Collapse);
             assert_eq!(config.sidebar.stashed_section, SectionBehavior::Collapse);
             assert_eq!(config.sidebar.sort, None);
@@ -118,8 +118,8 @@ mod tests {
     #[test]
     fn section_settings_are_independent() {
         for (working, expected_working) in [
-            ("section", WorkingSection::Section),
             ("manual", WorkingSection::Manual),
+            ("section", WorkingSection::Section),
             ("inline", WorkingSection::Inline),
             ("inline-last", WorkingSection::InlineLast),
         ] {
@@ -199,7 +199,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.toml");
         let config = Config::load_from(&path).unwrap();
-        assert_eq!(config.sidebar.working, WorkingSection::Section);
+        assert_eq!(config.sidebar.working, WorkingSection::Manual);
         assert_eq!(config.sidebar.stashed_section, SectionBehavior::Collapse);
 
         fs::write(&path, "[sidebar]\nworking = 'inline-last'").unwrap();
