@@ -14,9 +14,8 @@ use smelt_term::ansi::parse_ansi_lines;
 use smelt_term::geometry::Rect;
 use smelt_term::grid::{Color, GridSlice, Style};
 use smelt_term::{
-    Axis, DividerStyles, HitRegistry, LayoutStyle, LayoutTree, Line, NoopSizer, PaintId,
-    ResolvedLayout, Split, SplitInteraction, SplitOptions, SplitPane, SplitResizeMode, SplitSize,
-    Surface, TerminalSession,
+    Axis, DividerStyles, HitRegistry, LayoutTree, Line, NoopSizer, PaintId, ResolvedLayout, Split,
+    SplitOptions, SplitPane, SplitResizeMode, SplitResponse, SplitSize, Surface, TerminalSession,
 };
 
 use crate::agent::ipc;
@@ -133,7 +132,7 @@ fn run_config_error<W: Write>(
     surface.set_layout(LayoutTree::leaf(PREVIEW));
     let mut scroll = 0usize;
     loop {
-        surface.render(writer, |_, slice, _| {
+        surface.render(writer, |_, slice| {
             render_config_error(slice, error, &mut scroll);
         })?;
         match event::read()? {
@@ -283,17 +282,17 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                 Msg::Input(event) => {
                     let action = match event? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
-                            dirty |= app.split_interaction.active_id().is_some();
+                            dirty |= app.cancel_resize(surface);
                             app.handle_key(key, &tx)
                         }
-                        Event::Mouse(mouse) => app.handle_mouse(mouse),
+                        Event::Mouse(mouse) => app.handle_mouse(surface, mouse),
                         Event::Resize(w, h) => {
                             surface.set_terminal_size(w, h);
                             app.resize(w, h);
                             Action::Redraw
                         }
                         Event::FocusLost => {
-                            app.cancel_resize();
+                            app.cancel_resize(surface);
                             Action::Redraw
                         }
                         _ => Action::None,
@@ -523,7 +522,6 @@ struct App {
     width: u16,
     height: u16,
     sidebar: Split,
-    split_interaction: SplitInteraction,
     show_help: bool,
     pending_d: bool,
     pending_g: bool,
@@ -573,7 +571,6 @@ impl App {
             width: 0,
             height: 0,
             sidebar: sidebar_split(ui_state.sidebar_width),
-            split_interaction: SplitInteraction::default(),
             show_help: false,
             pending_d: false,
             pending_g: false,
@@ -1043,7 +1040,6 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, tx: &mpsc::Sender<Msg>) -> Action {
-        self.cancel_resize();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         // Emacs navigation: alias C-n/C-p to down/up so they flow through the
@@ -1299,35 +1295,14 @@ impl App {
         Action::Quit
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
-        let layout = self.resolved_layout();
-        let active = self
-            .split_interaction
-            .active_id()
-            .and_then(|id| layout.split(id));
-        let response = match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => layout
-                .divider_at(mouse.row, mouse.column)
-                .and_then(|split| self.split_interaction.begin(split, mouse.row, mouse.column)),
-            MouseEventKind::Drag(MouseButton::Left) => {
-                self.split_interaction
-                    .update(active, mouse.row, mouse.column)
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.split_interaction
-                    .release(active, mouse.row, mouse.column)
-            }
-            _ => None,
-        };
-        if let Some(response) = response {
-            if response.ended() && response.changed {
-                self.save_state();
-            }
+    fn handle_mouse(&mut self, surface: &mut Surface, mouse: MouseEvent) -> Action {
+        if let Some(response) = surface.handle_mouse(mouse) {
+            self.apply_split_response(&response);
             return Action::Redraw;
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-            && self.split_interaction.active_id().is_none()
-            && let Some(hit) = self.hits.hit(mouse.row, mouse.column).cloned()
+            && surface.active_split().is_none()
+            && let Some(hit) = self.hits.hit(mouse.column, mouse.row).cloned()
         {
             let (idx, section) = match hit {
                 Hit::Pane(id) => (self.find_pane_by_id(&id), None),
@@ -1352,12 +1327,21 @@ impl App {
         Action::None
     }
 
-    fn cancel_resize(&mut self) {
-        if let Some(response) = self.split_interaction.cancel()
-            && response.changed
-        {
+    fn apply_split_response(&mut self, response: &SplitResponse) {
+        if response.ended() && response.changed {
             self.save_state();
         }
+    }
+
+    /// Ends a divider drag in progress. Returns whether one was active.
+    fn cancel_resize(&mut self, surface: &mut Surface) -> bool {
+        let Some(response) = surface.cancel_split_drag() else {
+            return false;
+        };
+        if response.changed {
+            self.save_state();
+        }
+        true
     }
 
     fn update_saved_state(&self, state: &mut UiState) {
@@ -1407,17 +1391,14 @@ impl App {
 fn render<W: Write>(surface: &mut Surface, app: &mut App, out: &mut W) -> io::Result<()> {
     app.hits.clear();
     surface.set_layout(app.layout());
-    surface.set_layout_style(LayoutStyle {
-        active_split: app.split_interaction.active_id(),
-        ..LayoutStyle::default()
-    });
-    surface.render(out, |id, slice, _theme| {
+    surface.render(out, |id, slice| {
         if id == SIDEBAR {
             render_sidebar(slice, app);
         } else if id == PREVIEW {
             render_preview(slice, app);
         }
-    })
+    })?;
+    Ok(())
 }
 
 fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
@@ -1468,7 +1449,7 @@ fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
         };
         if let Some(hit) = hit {
             app.hits
-                .record_local(origin, Rect::new(row as u16, 0, width, 1), hit);
+                .record_local(origin, Rect::new(0, row as u16, width, 1), hit);
         }
     }
 }
@@ -2026,7 +2007,6 @@ mod tests {
             width: 0,
             height: 0,
             sidebar: sidebar_split(0),
-            split_interaction: SplitInteraction::default(),
             show_help: false,
             pending_d: false,
             pending_g: false,
@@ -2265,7 +2245,7 @@ mod tests {
             app.loading_since = loading_since;
             let mut grid = smelt_term::grid::Grid::new(100, 12);
             render_sidebar(&mut grid.slice_mut(Rect::new(0, 0, 40, 12)), &mut app);
-            render_empty_preview(&mut grid.slice_mut(Rect::new(0, 40, 60, 12)), &app);
+            render_empty_preview(&mut grid.slice_mut(Rect::new(40, 0, 60, 12)), &app);
             let text = (0..12)
                 .map(|row| {
                     (0..100)
@@ -2364,30 +2344,49 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert!(matches!(
-            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36)),
+            app.handle_mouse(
+                &mut surface,
+                mouse(MouseEventKind::Down(MouseButton::Left), 36)
+            ),
             Action::Redraw
         ));
-        assert_eq!(app.split_interaction.active_id(), Some(app.sidebar.id()));
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50));
+        assert_eq!(surface.active_split(), Some(app.sidebar.id()));
+        app.handle_mouse(
+            &mut surface,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 50),
+        );
         assert_eq!(
             app.ui_state.sidebar_width, 36,
             "save only at gesture completion"
         );
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 54));
+        app.handle_mouse(
+            &mut surface,
+            mouse(MouseEventKind::Up(MouseButton::Left), 54),
+        );
         assert_eq!(
             app.ui_state.sidebar_width, 54,
             "final pointer position is applied"
         );
-        assert_eq!(app.split_interaction.active_id(), None);
+        assert_eq!(surface.active_split(), None);
         assert_eq!(app.cursor, cursor);
         render(&mut surface, &mut app, &mut Vec::new()).unwrap();
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 54));
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), u16::MAX));
+        app.handle_mouse(
+            &mut surface,
+            mouse(MouseEventKind::Down(MouseButton::Left), 54),
+        );
+        app.handle_mouse(
+            &mut surface,
+            mouse(MouseEventKind::Drag(MouseButton::Left), u16::MAX),
+        );
+        assert!(app.cancel_resize(&mut surface));
         app.handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE), &tx);
-        assert_eq!(app.split_interaction.active_id(), None);
+        assert_eq!(surface.active_split(), None);
         assert_eq!(app.sidebar_width(), 97);
         assert!(matches!(
-            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30)),
+            app.handle_mouse(
+                &mut surface,
+                mouse(MouseEventKind::Drag(MouseButton::Left), 30)
+            ),
             Action::None
         ));
         surface.set_terminal_size(39, 24);
@@ -2595,16 +2594,25 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         let generation = app.preview_gen;
-        assert!(matches!(app.handle_mouse(mouse), Action::None));
+        assert!(matches!(
+            app.handle_mouse(&mut surface, mouse),
+            Action::None
+        ));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
         assert_eq!(app.preview_gen, generation);
-        assert!(matches!(app.handle_mouse(mouse), Action::None));
+        assert!(matches!(
+            app.handle_mouse(&mut surface, mouse),
+            Action::None
+        ));
         assert_eq!(app.preview_gen, generation);
         assert!(matches!(
-            app.handle_mouse(MouseEvent {
-                column: 80,
-                ..mouse
-            }),
+            app.handle_mouse(
+                &mut surface,
+                MouseEvent {
+                    column: 80,
+                    ..mouse
+                }
+            ),
             Action::None
         ));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
@@ -2669,15 +2677,21 @@ mod tests {
             row: 1,
             modifiers: KeyModifiers::NONE,
         };
-        assert!(matches!(app.handle_mouse(mouse), Action::Redraw));
-        assert!(app.split_interaction.active_id().is_some());
         assert!(matches!(
-            app.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Moved,
-                column: 4,
-                row: app.find_pane_by_id("%2").unwrap() as u16,
-                ..mouse
-            }),
+            app.handle_mouse(&mut surface, mouse),
+            Action::Redraw
+        ));
+        assert!(surface.active_split().is_some());
+        assert!(matches!(
+            app.handle_mouse(
+                &mut surface,
+                MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 4,
+                    row: app.find_pane_by_id("%2").unwrap() as u16,
+                    ..mouse
+                }
+            ),
             Action::None
         ));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
@@ -2705,18 +2719,27 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert!(matches!(
-            app.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Moved,
-                ..mouse
-            }),
+            app.handle_mouse(
+                &mut surface,
+                MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    ..mouse
+                }
+            ),
             Action::None
         ));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
-        assert!(matches!(app.handle_mouse(mouse), Action::Redraw));
+        assert!(matches!(
+            app.handle_mouse(&mut surface, mouse),
+            Action::Redraw
+        ));
         assert_eq!(app.expanded_section, Some(Section::Stashed));
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%3");
         render(&mut surface, &mut app, &mut Vec::new()).unwrap();
-        assert!(matches!(app.handle_mouse(mouse), Action::Redraw));
+        assert!(matches!(
+            app.handle_mouse(&mut surface, mouse),
+            Action::Redraw
+        ));
         assert_eq!(app.expanded_section, None);
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%1");
         render(&mut surface, &mut app, &mut Vec::new()).unwrap();
@@ -2726,10 +2749,13 @@ mod tests {
             .position(|item| matches!(item, TreeItem::SectionHeader(Section::Working, _)))
             .unwrap() as u16;
         assert!(matches!(
-            app.handle_mouse(MouseEvent {
-                row: busy_row,
-                ..mouse
-            }),
+            app.handle_mouse(
+                &mut surface,
+                MouseEvent {
+                    row: busy_row,
+                    ..mouse
+                }
+            ),
             Action::Redraw
         ));
         assert_eq!(app.expanded_section, Some(Section::Working));
@@ -2747,12 +2773,15 @@ mod tests {
             .position(|item| matches!(item, TreeItem::SectionHeader(found, _) if *found == section))
             .unwrap();
         assert!(matches!(
-            app.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 4,
-                row: row as u16,
-                modifiers: KeyModifiers::NONE,
-            }),
+            app.handle_mouse(
+                &mut surface,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 4,
+                    row: row as u16,
+                    modifiers: KeyModifiers::NONE,
+                }
+            ),
             Action::Redraw
         ));
     }

@@ -4,7 +4,7 @@ mod preview;
 mod tui;
 
 #[global_allocator]
-static ALLOC: smelt_perf::alloc::Counting = smelt_perf::alloc::Counting;
+static ALLOC: smelt_perf::alloc::Counting = smelt_perf::alloc::Counting::new(std::alloc::System);
 
 use anyhow::{Result, bail};
 
