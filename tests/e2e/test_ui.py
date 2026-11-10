@@ -256,3 +256,95 @@ def test_add_window_uses_project_root_from_worktree(mux, repo, configured):
         ),
         "browser closes after opening window",
     )
+
+
+def add_worktree(mux, repo):
+    worktree = mux.root / "worktree with spaces"
+    run(
+        "git",
+        "-C",
+        str(repo),
+        "worktree",
+        "add",
+        "-b",
+        "feature",
+        str(worktree),
+        env=mux.env,
+    )
+    return worktree
+
+
+def launch_with_picker(mux, repo, key):
+    worktree = add_worktree(mux, repo)
+    mux.tmux("new-session", "-d", "-s", "agents", "exec sleep 600")
+    mux.add_agent("selected", cwd=repo, session="agents")
+    mux.attach()
+    pane = mux.launch()
+    mux.wait_screen(
+        pane, lambda frame: "preview-selected" in frame, "preview selected project"
+    )
+    mux.send(pane, key)
+    mux.wait_screen(
+        pane,
+        lambda frame: "Choose a worktree" in frame and "feature" in frame,
+        "worktree picker lists both checkouts",
+    )
+    return pane, worktree
+
+
+def test_worktree_picker_escape_keeps_the_sidebar_open(mux, repo):
+    pane, _ = launch_with_picker(mux, repo, "A")
+    mux.send(pane, "Escape")
+    mux.wait_screen(
+        pane, lambda frame: "Choose a worktree" not in frame, "picker closes"
+    )
+    assert pane in mux.tmux("list-panes", "-a", "-F", "#{pane_id}").splitlines()
+
+
+def test_worktree_picker_opens_an_agent_window_in_the_chosen_worktree(mux, repo):
+    pane, worktree = launch_with_picker(mux, repo, "A")
+    before = mux.tmux("list-windows", "-t", "agents", "-F", "#{window_id}").splitlines()
+    mux.send(pane, "-l", "feat")
+    mux.wait_screen(pane, lambda frame: "> feat" in frame, "query typed")
+    mux.send(pane, "Enter")
+    wait_for(
+        lambda: (
+            len(
+                mux.tmux(
+                    "list-windows", "-t", "agents", "-F", "#{window_id}"
+                ).splitlines()
+            )
+            == len(before) + 1
+        ),
+        "agent window added",
+    )
+    wait_for(
+        lambda: (
+            str(worktree)
+            in mux.tmux(
+                "list-panes", "-s", "-t", "agents", "-F", "#{pane_current_path}"
+            ).splitlines()
+        ),
+        "new window starts in the worktree",
+    )
+
+
+def test_worktree_picker_opens_one_terminal_per_worktree(mux, repo):
+    pane, worktree = launch_with_picker(mux, repo, "T")
+    mux.send(pane, "-l", "feat")
+    mux.wait_screen(pane, lambda frame: "> feat" in frame, "query typed")
+    mux.send(pane, "Enter")
+    wait_for(
+        lambda: (
+            str(worktree)
+            in mux.tmux(
+                "list-panes", "-s", "-t", "agents", "-F", "#{pane_current_path}"
+            ).splitlines()
+        ),
+        "terminal window opens in the worktree",
+    )
+    tags = mux.tmux(
+        "list-windows", "-t", "agents", "-F", "#{@agent-mux-terminal}"
+    ).splitlines()
+    assert f"terminal:{worktree}" in tags
+    assert "terminal" not in tags
