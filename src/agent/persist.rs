@@ -88,6 +88,22 @@ pub struct CachedPane {
     pub park_epoch: Option<DateTime<Utc>>,
 }
 
+/// Git state of a known project, kept while the project has no sessions.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CachedProject {
+    pub root: String,
+    #[serde(default)]
+    pub short: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dirty: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub ahead: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub behind: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     #[serde(default)]
@@ -98,6 +114,8 @@ pub struct Snapshot {
     pub revision: u64,
     #[serde(default)]
     pub panes: Vec<CachedPane>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<CachedProject>,
     #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -116,6 +134,9 @@ pub struct UiState {
     pub version: i32,
     #[serde(default)]
     pub panes: std::collections::HashMap<String, UiPaneState>,
+    /// Project roots that stay listed after their last session ends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
     #[serde(
         rename = "selectedPaneID",
         default,
@@ -158,6 +179,9 @@ fn is_zero_usize(v: &usize) -> bool {
     *v == 0
 }
 fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
@@ -247,10 +271,11 @@ pub(super) fn update_snapshot_at(
     let Some(mut snapshot) = update(previous.as_ref()) else {
         return Ok(None);
     };
-    if previous
-        .as_ref()
-        .is_some_and(|previous| previous.revision > 0 && previous.panes == snapshot.panes)
-    {
+    if previous.as_ref().is_some_and(|previous| {
+        previous.revision > 0
+            && previous.panes == snapshot.panes
+            && previous.projects == snapshot.projects
+    }) {
         return Ok(previous.map(|snapshot| (snapshot, false)));
     }
 
@@ -262,7 +287,9 @@ pub(super) fn update_snapshot_at(
         .as_ref()
         .map(|previous| {
             let generation = previous.generation.max(1);
-            if panes_equal_for_generation(&previous.panes, &snapshot.panes) {
+            if panes_equal_for_generation(&previous.panes, &snapshot.panes)
+                && previous.projects == snapshot.projects
+            {
                 generation
             } else {
                 generation + 1

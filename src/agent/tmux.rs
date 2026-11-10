@@ -26,6 +26,8 @@ struct RawPane {
     session: String,
     window: String,
     window_name: String,
+    /// The window name follows tmux's active pane instead of being chosen.
+    auto_name: bool,
     pane: String,
     path: String,
     cmd: String,
@@ -92,7 +94,7 @@ fn list_tmux_panes() -> Result<(String, std::collections::HashSet<PaneId>)> {
         .arg("list-panes")
         .arg("-a")
         .arg("-F")
-        .arg("#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{?session_attached,1,0}#{pane_active}\t#{pane_id}\t#{pane_width}x#{pane_height}")
+        .arg("#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_name}\t#{window_active}#{?session_attached,1,0}#{pane_active}\t#{pane_id}\t#{pane_width}x#{pane_height}\t#{automatic-rename}")
         .args([";", "list-clients", "-F", "@client\t#{&&:#{client_control_mode},#{m:*read-only*,#{client_flags}}}\t#{pane_id}"])
         .output()
         .context("tmux list-panes")?;
@@ -117,7 +119,7 @@ fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
             if line.is_empty() {
                 return None;
             }
-            let fields: Vec<&str> = line.splitn(8, '\t').collect();
+            let fields: Vec<&str> = line.splitn(9, '\t').collect();
             if fields.len() < 8 {
                 return None;
             }
@@ -130,6 +132,7 @@ fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
                 pid: fields[3].parse().unwrap_or(0),
                 provider_pid: 0,
                 window_name: fields[4].to_string(),
+                auto_name: fields.get(8) == Some(&"1"),
                 window_focused: fields[5] == "111",
                 pane_id: PaneId::parse(fields[6])?,
                 width,
@@ -149,9 +152,21 @@ fn resolve_agent_panes(raw: Vec<RawPane>, pt: &ProcessTable) -> Vec<RawPane> {
             let matched = resolve(&r.cmd, r.pid, pt)?;
             r.cmd = matched.name;
             r.provider_pid = matched.pid;
+            r.window_name = agent_window_name(r.auto_name, &r.window_name, &r.cmd);
             Some(r)
         })
         .collect()
+}
+
+/// The label for an agent's window. tmux names an unnamed window after its
+/// active pane, which is not the agent once the window is split, so unnamed
+/// windows take the agent's name. A name the user chose is kept.
+fn agent_window_name(auto_named: bool, tmux_name: &str, agent: &str) -> String {
+    if auto_named {
+        agent.to_string()
+    } else {
+        tmux_name.to_string()
+    }
 }
 
 fn load_process_table() -> ProcessTable {
@@ -245,37 +260,297 @@ pub fn switch_to_pane(pane_id: &PaneId) -> Result<()> {
     run_tmux(["switch-client", "-t", pane_id.as_str()])
 }
 
-pub fn new_window(pane: &Pane, command: Option<&str>) -> Result<()> {
-    let target = format!("={}:$", pane.session);
-    let path = if pane.project_root.is_empty() {
-        &pane.path
-    } else {
-        &pane.project_root
+/// Opens a window after the last window of `session` and switches to it.
+pub fn new_window(session: &str, dir: &str, command: Option<&str>) -> Result<()> {
+    let target = format!("={session}:$");
+    let mut args = vec!["new-window", "-a", "-t", &target, "-c", dir];
+    args.extend(["-P", "-F", "#{pane_id}"]);
+    spawn_and_switch("new-window", args, command)
+}
+
+/// Opens a window in `dir` and switches to it. It goes in `session`, else in
+/// the project's session, which is created when none exists.
+pub fn open_agent_window(
+    session: Option<&str>,
+    root: &str,
+    dir: &str,
+    command: Option<&str>,
+) -> Result<()> {
+    let session = match session {
+        Some(session) => Some(session.to_string()),
+        None => project_session(root)?,
     };
-    let mut cmd = Command::new("tmux");
-    cmd.args([
-        "new-window",
-        "-a",
+    match session {
+        Some(session) => new_window(&session, dir, command),
+        None => {
+            let name = session_name(root);
+            let args = vec![
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-c",
+                dir,
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ];
+            spawn_and_switch("new-session", args, command)
+        }
+    }
+}
+
+/// The session for a project: one that starts in `root`, else one named like
+/// the sessionizer names the directory.
+pub fn project_session(root: &str) -> Result<Option<String>> {
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}\t#{session_path}"])
+        .output()
+        .context("tmux list-sessions")?;
+    let sessions = if output.status.success() {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    } else {
+        String::new()
+    };
+    Ok(find_project_session(&sessions, root, &session_name(root)))
+}
+
+/// Creates a detached session whose first window, started in `dir`, is the
+/// terminal window `terminal`, and returns the session name.
+pub fn create_terminal_session(root: &str, dir: &str, terminal: &str) -> Result<String> {
+    let name = session_name(root);
+    let window = tmux_stdout(&[
+        "new-session",
+        "-d",
+        "-s",
+        &name,
+        "-c",
+        dir,
         "-P",
         "-F",
-        "#{pane_id}",
+        "#{window_id}",
+    ])?;
+    run_tmux([
+        "set-option",
+        "-w",
+        "-t",
+        window.trim(),
+        TERMINAL_TAG,
+        terminal,
+    ])?;
+    Ok(name)
+}
+
+/// Name of the shell tmux starts in new panes.
+pub fn default_shell_name() -> String {
+    let shell = tmux_stdout(&["show-options", "-gv", "default-shell"]).unwrap_or_default();
+    std::path::Path::new(shell.trim()).file_name().map_or_else(
+        || "sh".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "nu"];
+
+/// One pane of a session, as listed for terminal lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionPane {
+    window: String,
+    tag: String,
+    pane: String,
+    command: String,
+    window_panes: usize,
+    path: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalPick {
+    /// A window already tagged with the terminal's name.
+    Tagged(String),
+    /// An idle single-shell window, to be tagged and reused.
+    Adopt {
+        window: String,
+        pane: String,
+    },
+    Missing,
+}
+
+/// The window tagged `name`, else an untagged idle shell sitting in `dir`.
+fn pick_terminal(panes: &[SessionPane], name: &str, dir: &str) -> TerminalPick {
+    if let Some(pane) = panes.iter().find(|pane| pane.tag == name) {
+        return TerminalPick::Tagged(pane.pane.clone());
+    }
+    panes
+        .iter()
+        .find(|pane| {
+            pane.tag.is_empty()
+                && pane.window_panes == 1
+                && pane.path == dir
+                && SHELLS.contains(&pane.command.as_str())
+        })
+        .map_or(TerminalPick::Missing, |pane| TerminalPick::Adopt {
+            window: pane.window.clone(),
+            pane: pane.pane.clone(),
+        })
+}
+
+fn parse_session_panes(out: &str) -> Vec<SessionPane> {
+    out.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split('\t').collect();
+            let [window, tag, pane, command, window_panes, path] = f.as_slice() else {
+                return None;
+            };
+            Some(SessionPane {
+                window: (*window).to_string(),
+                tag: (*tag).to_string(),
+                pane: (*pane).to_string(),
+                command: (*command).to_string(),
+                window_panes: window_panes.parse().ok()?,
+                path: (*path).to_string(),
+            })
+        })
+        .collect()
+}
+
+const TERMINAL_TAG: &str = "@agent-mux-terminal";
+
+/// The pane of the session's terminal window named `name`. An untagged idle
+/// shell window in `dir` is adopted first; otherwise a window is added to the
+/// session. The window is tagged so later lookups find it even while a
+/// command renames it.
+pub fn terminal_pane(session: &str, name: &str, dir: &str) -> Result<(PaneId, String)> {
+    let target = format!("={session}:");
+    let out = tmux_stdout(&[
+        "list-panes",
+        "-s",
         "-t",
         &target,
-        "-c",
-        path,
-    ]);
-    if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
-        cmd.arg(command);
+        "-F",
+        &format!(
+            "#{{window_id}}\t#{{{TERMINAL_TAG}}}\t#{{pane_id}}\t#{{pane_current_command}}\t#{{window_panes}}\t#{{pane_current_path}}"
+        ),
+    ])?;
+    let panes = parse_session_panes(&out);
+    let (pane, command) = match pick_terminal(&panes, name, dir) {
+        TerminalPick::Tagged(pane) => {
+            let command = panes
+                .iter()
+                .find(|p| p.pane == pane)
+                .map(|p| p.command.clone())
+                .unwrap_or_default();
+            (pane, command)
+        }
+        TerminalPick::Adopt { window, pane } => {
+            run_tmux(["set-option", "-w", "-t", &window, TERMINAL_TAG, name])?;
+            let command = panes
+                .iter()
+                .find(|p| p.pane == pane)
+                .map(|p| p.command.clone())
+                .unwrap_or_default();
+            (pane, command)
+        }
+        TerminalPick::Missing => {
+            // Before the first window, so the terminal keeps one fixed position
+            // and agent windows, added at the end, never interleave with it.
+            let created = tmux_stdout(&[
+                "new-window",
+                "-b",
+                "-t",
+                &format!("={session}:^"),
+                "-c",
+                dir,
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}\t#{pane_id}",
+            ])?;
+            let (window, pane) = created
+                .trim()
+                .split_once('\t')
+                .ok_or_else(|| anyhow!("tmux new-window returned no window"))?;
+            run_tmux(["set-option", "-w", "-t", window, TERMINAL_TAG, name])?;
+            (pane.to_string(), default_shell_name())
+        }
+    };
+    let pane = PaneId::parse(&pane).context("tmux returned invalid pane ID")?;
+    Ok((pane, command))
+}
+
+/// Types `text` into an idle shell pane, or recalls the previous command when
+/// `text` is `last`. Refuses while a program other than a shell is running.
+pub fn send_to_terminal(pane: &PaneId, command: &str, text: &str) -> Result<()> {
+    if !SHELLS.contains(&command) {
+        return Err(anyhow!("terminal is busy running {command}"));
     }
-    let output = cmd.output().context("tmux new-window")?;
+    let id = pane.as_str();
+    // Ctrl-C drops any half-typed line so recalled or typed text starts clean.
+    run_tmux(["send-keys", "-t", id, "C-c"])?;
+    if text == "last" {
+        run_tmux(["send-keys", "-t", id, "Up", "Enter"])
+    } else {
+        run_tmux(["send-keys", "-t", id, "-l", "--", text])?;
+        run_tmux(["send-keys", "-t", id, "Enter"])
+    }
+}
+
+fn tmux_stdout(args: &[&str]) -> Result<String> {
+    let output = Command::new("tmux")
+        .args(args)
+        .output()
+        .context("run tmux")?;
     if !output.status.success() {
         return Err(anyhow!(
-            "tmux new-window: {}",
+            "tmux {}: {}",
+            args[0],
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn find_project_session(sessions: &str, root: &str, name: &str) -> Option<String> {
+    let sessions: Vec<(&str, &str)> = sessions
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect();
+    sessions
+        .iter()
+        .find(|(_, path)| *path == root)
+        .or_else(|| sessions.iter().find(|(session, _)| *session == name))
+        .map(|(session, _)| (*session).to_string())
+}
+
+/// The session name the tmux sessionizer uses: the directory name with `.`
+/// replaced, since tmux reserves `.` and `:` in targets.
+fn session_name(root: &str) -> String {
+    let base = std::path::Path::new(root).file_name().map_or_else(
+        || root.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    base.replace(['.', ':'], "_")
+}
+
+fn spawn_and_switch<'a>(
+    what: &str,
+    mut args: Vec<&'a str>,
+    command: Option<&'a str>,
+) -> Result<()> {
+    if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
+        args.push(command);
+    }
+    let output = Command::new("tmux")
+        .args(&args)
+        .output()
+        .with_context(|| format!("tmux {what}"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "tmux {what}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     let pane_id = PaneId::parse(String::from_utf8_lossy(&output.stdout).trim())
-        .context("tmux new-window returned invalid pane ID")?;
+        .with_context(|| format!("tmux {what} returned invalid pane ID"))?;
     switch_to_pane(&pane_id)
 }
 
@@ -317,7 +592,110 @@ pub fn parse_target(s: &str) -> (String, String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::short_hash;
+    use super::{
+        SessionPane, TerminalPick, agent_window_name, find_project_session, parse_session_panes,
+        pick_terminal, session_name, short_hash,
+    };
+
+    #[test]
+    fn project_session_prefers_matching_path_then_sessionizer_name() {
+        let sessions = "dotfiles\t/home/me\n_dotfiles\t/home/me/.dotfiles\nrepo\t/elsewhere\n";
+        assert_eq!(
+            find_project_session(sessions, "/home/me/.dotfiles", "_dotfiles").as_deref(),
+            Some("_dotfiles")
+        );
+        assert_eq!(
+            find_project_session(sessions, "/home/me/dev/repo", "repo").as_deref(),
+            Some("repo")
+        );
+        assert_eq!(
+            find_project_session(sessions, "/home/me/dev/new", "new"),
+            None
+        );
+    }
+
+    const DIR: &str = "/repo";
+
+    fn session_pane(window: &str, tag: &str, command: &str, window_panes: usize) -> SessionPane {
+        SessionPane {
+            window: window.to_string(),
+            tag: tag.to_string(),
+            pane: format!("%{}", &window[1..]),
+            command: command.to_string(),
+            window_panes,
+            path: DIR.to_string(),
+        }
+    }
+
+    #[test]
+    fn terminal_lookup_prefers_tag_then_adopts_an_idle_shell() {
+        let tagged = [
+            session_pane("@1", "", "nvim", 1),
+            session_pane("@2", "term", "cargo", 1),
+            session_pane("@3", "", "zsh", 1),
+        ];
+        assert_eq!(
+            pick_terminal(&tagged, "term", DIR),
+            TerminalPick::Tagged("%2".to_string())
+        );
+        let untagged = [
+            session_pane("@1", "", "nvim", 1),
+            session_pane("@2", "", "smelt", 1),
+            session_pane("@3", "", "zsh", 1),
+        ];
+        assert_eq!(
+            pick_terminal(&untagged, "term", DIR),
+            TerminalPick::Adopt {
+                window: "@3".to_string(),
+                pane: "%3".to_string()
+            }
+        );
+        let other = [session_pane("@3", "build", "zsh", 1)];
+        assert_eq!(pick_terminal(&other, "term", DIR), TerminalPick::Missing);
+    }
+
+    #[test]
+    fn terminal_lookup_skips_split_and_busy_windows() {
+        let panes = [
+            session_pane("@1", "", "zsh", 2),
+            session_pane("@2", "", "cargo", 1),
+        ];
+        assert_eq!(pick_terminal(&panes, "term", DIR), TerminalPick::Missing);
+    }
+
+    #[test]
+    fn terminal_lookup_adopts_only_a_shell_in_the_wanted_directory() {
+        let panes = [session_pane("@1", "", "zsh", 1)];
+        assert_eq!(
+            pick_terminal(&panes, "term", "/repo-feature"),
+            TerminalPick::Missing
+        );
+    }
+
+    #[test]
+    fn session_pane_listing_parses_tab_separated_fields() {
+        let panes = parse_session_panes("@1\tterm\t%4\tzsh\t1\t/repo\nbroken line\n");
+        assert_eq!(
+            panes,
+            [session_pane("@1", "term", "zsh", 1)].map(|mut p| {
+                p.pane = "%4".to_string();
+                p
+            })
+        );
+    }
+
+    #[test]
+    fn unnamed_windows_are_labelled_by_their_agent_not_the_active_pane() {
+        assert_eq!(agent_window_name(true, "zsh", "smelt"), "smelt");
+        assert_eq!(agent_window_name(false, "backend", "smelt"), "backend");
+    }
+
+    #[test]
+    fn session_names_match_the_sessionizer() {
+        assert_eq!(session_name("/home/me/.dotfiles"), "_dotfiles");
+        assert_eq!(session_name("/home/me/dev/agent-mux"), "agent-mux");
+        assert_eq!(session_name("/srv/app.v2:x"), "app_v2_x");
+    }
 
     #[test]
     fn ansi_only_change_produces_activity_hash_change() {

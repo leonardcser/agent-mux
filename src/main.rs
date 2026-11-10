@@ -1,5 +1,8 @@
+mod actions;
 mod agent;
 mod config;
+mod keys;
+mod picker;
 mod preview;
 mod tui;
 

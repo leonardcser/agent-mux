@@ -18,17 +18,20 @@ use smelt_term::{
     SplitOptions, SplitPane, SplitResizeMode, SplitResponse, SplitSize, Surface, TerminalSession,
 };
 
+use crate::actions::{self, Action as UserAction};
 use crate::agent::ipc;
 #[cfg(not(test))]
 use crate::agent::persist::update_ui_state;
 use crate::agent::persist::{
-    Snapshot, UiState, apply_ui_state, load_snapshot, load_ui_state, panes_from_snapshot,
-    ui_pane_state_is_empty,
+    CachedProject, Snapshot, UiState, apply_ui_state, load_snapshot, load_ui_state,
+    panes_from_snapshot, ui_pane_state_is_empty,
 };
 use crate::agent::{Pane, PaneId, PaneStatus, kill_pane, switch_to_pane};
 use crate::config::{
     Config, SectionBehavior, SidebarConfig, SortMode, StartupSelection, WorkingSection,
 };
+use crate::keys;
+use crate::picker::{Outcome, Picker};
 use crate::preview::{FRAME_INTERVAL, Preview, Target as PreviewTarget};
 
 const SIDEBAR: PaintId = PaintId(1);
@@ -40,6 +43,7 @@ const LOADING_DELAY: Duration = Duration::from_millis(200);
 #[derive(Clone, Debug)]
 enum Hit {
     Pane(String),
+    Project(String),
     Section(Section),
 }
 
@@ -65,6 +69,8 @@ enum TreeItem {
     Workspace(String),
     ProjectGroup(String),
     Pane(String),
+    /// A known project without sessions, keyed by its root.
+    Project(String),
 }
 
 #[derive(Debug)]
@@ -78,6 +84,10 @@ enum Msg {
     PaneKilled {
         pane_id: String,
         err: Option<String>,
+    },
+    ActionDone {
+        err: Option<String>,
+        leaves: bool,
     },
     SubscriptionEnded,
     DaemonChecked(Option<String>),
@@ -119,7 +129,7 @@ pub fn run(tmux_session: String) -> Result<()> {
     };
 
     let mut app = App::new(tmux_session, config.sidebar);
-    app.new_window_command = config.new_window_command;
+    app.actions = actions::bind(&config)?;
     app.resize(w, h);
     run_loop(&mut surface, term.writer(), &mut app).map_err(Into::into)
 }
@@ -267,6 +277,18 @@ fn run_loop<W: Write>(surface: &mut Surface, writer: &mut W, app: &mut App) -> i
                         spawn_load_panes(&tx);
                         panes_pending = true;
                     }
+                    dirty = true;
+                }
+                Msg::ActionDone { err, leaves } => {
+                    if err.is_none() && leaves {
+                        app.save_state();
+                        return Ok(());
+                    }
+                    if err.is_some() {
+                        app.err = err;
+                    }
+                    spawn_load_panes(&tx);
+                    panes_pending = true;
                     dirty = true;
                 }
                 Msg::DaemonChecked(err) => {
@@ -528,7 +550,10 @@ struct App {
     sort_mode: SortMode,
     expanded_section: Option<Section>,
     sidebar_config: SidebarConfig,
-    new_window_command: Option<String>,
+    actions: Vec<UserAction>,
+    picker: Option<Picker>,
+    projects: Vec<CachedProject>,
+    pending_forgotten: Vec<String>,
     count: usize,
     err: Option<String>,
     daemon_err: Option<String>,
@@ -577,7 +602,10 @@ impl App {
             sort_mode: SortMode::default(),
             expanded_section: None,
             sidebar_config,
-            new_window_command: None,
+            actions: Vec::new(),
+            picker: None,
+            projects: Vec::new(),
+            pending_forgotten: Vec::new(),
             count: 0,
             err: None,
             daemon_err: None,
@@ -638,6 +666,7 @@ impl App {
         if snapshot.generation == self.snapshot_generation && !ui_changed {
             return false;
         }
+        self.projects = snapshot.projects.clone();
         let mut panes = panes_from_snapshot(&snapshot);
         apply_ui_state(&mut panes, &self.ui_state);
         self.hide_pending_kills(&mut panes);
@@ -648,6 +677,7 @@ impl App {
 
     fn replace_panes(&mut self, panes: Vec<Pane>) {
         let selected = self.current_pane().map(|p| p.pane_id.to_string());
+        let selected_project = self.current_project().map(|p| p.root.clone());
         self.panes = panes
             .into_iter()
             .map(|p| (p.pane_id.to_string(), p))
@@ -655,15 +685,16 @@ impl App {
         if let Some(pane) = selected.as_ref().and_then(|id| self.panes.get(id)) {
             self.expanded_section = self.pane_section(pane);
         }
-        if selected.is_none() {
+        if selected.is_none() && selected_project.is_none() {
             self.focus_startup_session();
         } else {
             self.rebuild_items();
             self.cursor = selected
                 .and_then(|id| self.find_pane_by_id(&id))
+                .or_else(|| selected_project.and_then(|root| self.find_project(&root)))
                 .unwrap_or_else(|| nearest_pane(&self.items, self.cursor));
             self.collapse_unfocused_section();
-            if self.current_pane().is_none() {
+            if self.current_pane().is_none() && self.current_project().is_none() {
                 self.focus_first_session();
             }
         }
@@ -701,7 +732,10 @@ impl App {
             panes: Vec<&'a Pane>,
         }
 
-        let mut items = Vec::new();
+        let mut items: Vec<TreeItem> = self
+            .idle_projects()
+            .map(|project| TreeItem::Project(project.root.clone()))
+            .collect();
         for section in [None, Some(Section::Working), Some(Section::Stashed)] {
             if let Some(section) = section {
                 let count = panes
@@ -808,6 +842,123 @@ impl App {
             _ => return None,
         };
         self.panes.get_mut(&id)
+    }
+
+    fn current_project(&self) -> Option<&CachedProject> {
+        match self.items.get(self.cursor)? {
+            TreeItem::Project(root) => self.projects.iter().find(|p| &p.root == root),
+            _ => None,
+        }
+    }
+
+    fn find_project(&self, root: &str) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|it| matches!(it, TreeItem::Project(r) if r == root))
+    }
+
+    /// Known projects that no session runs in, in the daemon's order.
+    fn idle_projects(&self) -> impl Iterator<Item = &CachedProject> {
+        self.projects.iter().filter(|project| {
+            self.ui_state.projects.contains(&project.root)
+                && !self.pending_forgotten.contains(&project.root)
+                && !self
+                    .panes
+                    .values()
+                    .any(|pane| pane.project_root == project.root)
+        })
+    }
+
+    /// Where actions run for the selected row: its own directory, or the
+    /// project's main checkout when `at_root`.
+    fn action_target(&self, at_root: bool) -> Option<actions::Target> {
+        if let Some(pane) = self.current_pane() {
+            let root = if pane.project_root.is_empty() {
+                pane.path.clone()
+            } else {
+                pane.project_root.clone()
+            };
+            let (path, branch) = if at_root {
+                (root.clone(), pane.project_branch.clone())
+            } else {
+                (pane.path.clone(), pane.git_branch.clone())
+            };
+            return Some(actions::Target {
+                session: Some(pane.session.clone()),
+                path,
+                root,
+                branch,
+            });
+        }
+        let project = self.current_project()?;
+        Some(actions::Target {
+            session: None,
+            path: project.root.clone(),
+            root: project.root.clone(),
+            branch: project.branch.clone(),
+        })
+    }
+
+    /// Runs `action` on the selected row, after asking for a worktree when the
+    /// action wants one and the project has several.
+    fn run_action(&mut self, action: UserAction, tx: &mpsc::Sender<Msg>) -> Action {
+        let Some(target) = self.action_target(action.is_project_level()) else {
+            return Action::None;
+        };
+        if action.pick.is_some() {
+            let worktrees = crate::agent::git::worktrees(&target.root);
+            if worktrees.len() > 1 {
+                self.picker = Some(Picker::new(action, target, worktrees));
+                return Action::Redraw;
+            }
+        }
+        self.spawn_action(action, target, tx);
+        Action::None
+    }
+
+    fn handle_picker_key(&mut self, key: KeyEvent, tx: &mpsc::Sender<Msg>) -> Action {
+        let Some(picker) = self.picker.as_mut() else {
+            return Action::None;
+        };
+        match picker.handle_key(key) {
+            Outcome::Pending => {}
+            Outcome::Cancel => self.picker = None,
+            Outcome::Choose(worktree) => {
+                if let Some(picker) = self.picker.take() {
+                    let (action, target) = picker.into_parts(&worktree);
+                    self.spawn_action(action, target, tx);
+                }
+            }
+        }
+        Action::Redraw
+    }
+
+    fn spawn_action(&self, action: UserAction, target: actions::Target, tx: &mpsc::Sender<Msg>) {
+        let tx = tx.clone();
+        let leaves = action.leaves();
+        thread::spawn(move || {
+            let err = actions::run(&action, &target)
+                .err()
+                .map(|err| format!("{err:#}"));
+            // Actions often change git state; refresh before the next draw. A
+            // list that is about to close skips it and quits at once.
+            if err.is_some() || !leaves {
+                let _ = crate::agent::watch::refresh_once();
+            }
+            let _ = tx.send(Msg::ActionDone { err, leaves });
+        });
+    }
+
+    fn forget_current_project(&mut self) -> bool {
+        let Some(root) = self.current_project().map(|p| p.root.clone()) else {
+            return false;
+        };
+        self.pending_forgotten.push(root);
+        self.rebuild_items();
+        self.select_cursor(nearest_pane(&self.items, self.cursor), false);
+        self.preview_gen += 1;
+        self.save_state();
+        true
     }
 
     fn find_pane_by_id(&self, pane_id: &str) -> Option<usize> {
@@ -1040,6 +1191,9 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, tx: &mpsc::Sender<Msg>) -> Action {
+        if self.picker.is_some() {
+            return self.handle_picker_key(key, tx);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         // Emacs navigation: alias C-n/C-p to down/up so they flow through the
@@ -1087,6 +1241,9 @@ impl App {
             if self.pending_d {
                 self.pending_d = false;
                 self.pending_g = false;
+                if self.forget_current_project() {
+                    return Action::Redraw;
+                }
                 if let Some(pane_id) = self.remove_current_pane() {
                     let tx = tx.clone();
                     thread::spawn(move || {
@@ -1149,22 +1306,7 @@ impl App {
                 }
                 Action::Redraw
             }
-            KeyCode::Char('a') => {
-                let Some(pane) = self.current_pane() else {
-                    return Action::None;
-                };
-                match crate::agent::tmux::new_window(pane, self.new_window_command.as_deref()) {
-                    Ok(()) => {
-                        self.save_state();
-                        Action::Quit
-                    }
-                    Err(err) => {
-                        self.err = Some(format!("{err:#}"));
-                        Action::Redraw
-                    }
-                }
-            }
-            KeyCode::Char('A') => {
+            KeyCode::Char('R') => {
                 let mut changed = Vec::new();
                 for p in self.panes.values_mut() {
                     if p.status == PaneStatus::Unread {
@@ -1262,8 +1404,21 @@ impl App {
             }
             KeyCode::Enter if ctrl => self.toggle_current_parking(),
             KeyCode::Char('w') => self.toggle_current_parking(),
+            KeyCode::Enter if self.current_project().is_some() => self.open_new_agent(tx),
             KeyCode::Enter => self.open_current_pane(),
-            _ => Action::None,
+            _ => match actions::find(&self.actions, &key).cloned() {
+                Some(action) => self.run_action(action, tx),
+                None => Action::None,
+            },
+        }
+    }
+
+    /// Runs the action bound to `a`, which opens an agent in the selected project.
+    fn open_new_agent(&mut self, tx: &mpsc::Sender<Msg>) -> Action {
+        let key = KeyEvent::from(KeyCode::Char('a'));
+        match actions::find(&self.actions, &key).cloned() {
+            Some(action) => self.run_action(action, tx),
+            None => Action::None,
         }
     }
 
@@ -1300,12 +1455,23 @@ impl App {
             self.apply_split_response(&response);
             return Action::Redraw;
         }
+        if self.picker.is_some() {
+            return Action::None;
+        }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && surface.active_split().is_none()
             && let Some(hit) = self.hits.hit(mouse.column, mouse.row).cloned()
         {
             let (idx, section) = match hit {
                 Hit::Pane(id) => (self.find_pane_by_id(&id), None),
+                Hit::Project(root) => {
+                    if let Some(idx) = self.find_project(&root) {
+                        self.select_cursor(idx, false);
+                        self.preview_gen += 1;
+                        return Action::Redraw;
+                    }
+                    return Action::None;
+                }
                 Hit::Section(section) => (
                     self.items.iter().position(
                         |item| matches!(item, TreeItem::SectionHeader(s, _) if *s == section),
@@ -1368,6 +1534,9 @@ impl App {
             .map(|pane| pane.pane_id.to_string())
             .unwrap_or_default();
         state.sidebar_width = self.sidebar_width();
+        state
+            .projects
+            .retain(|root| !self.pending_forgotten.contains(root));
         state.sort_mode = self.sort_mode.as_str().to_string();
     }
 
@@ -1376,6 +1545,7 @@ impl App {
         if let Ok(state) = update_ui_state(|state| self.update_saved_state(state)) {
             self.ui_state = state;
             self.pending_unread_changes.clear();
+            self.pending_forgotten.clear();
         }
     }
 
@@ -1385,6 +1555,7 @@ impl App {
         self.update_saved_state(&mut state);
         self.ui_state = state;
         self.pending_unread_changes.clear();
+        self.pending_forgotten.clear();
     }
 }
 
@@ -1444,6 +1615,7 @@ fn render_sidebar(slice: &mut GridSlice<'_>, app: &mut App) {
         );
         let hit = match &app.items[idx] {
             TreeItem::Pane(id) => Some(Hit::Pane(id.clone())),
+            TreeItem::Project(root) => Some(Hit::Project(root.clone())),
             TreeItem::SectionHeader(section, _) => Some(Hit::Section(*section)),
             _ => None,
         };
@@ -1538,7 +1710,64 @@ fn render_tree_item(
                 render_pane_row(slice, row, width, p, selected, app);
             }
         }
+        TreeItem::Project(root) => {
+            if let Some(project) = app.projects.iter().find(|p| &p.root == root) {
+                render_project_row(slice, row, width, project, selected);
+            }
+        }
     }
+}
+
+fn render_project_row(
+    slice: &mut GridSlice<'_>,
+    row: u16,
+    width: u16,
+    project: &CachedProject,
+    selected: bool,
+) {
+    let mut style = Style::new().fg(Color::AnsiValue(250));
+    if selected {
+        style = style.bg(Color::DarkGrey).bold();
+    }
+    let branch_style = if selected {
+        Style::new().fg(Color::Green).bg(Color::DarkGrey)
+    } else {
+        Style::new().fg(Color::Green)
+    };
+    let mut branch = project.branch.clone();
+    if project.dirty {
+        branch.push('*');
+    }
+    let badge = distance_badge(project);
+    let right = [branch, badge].join(if project.ahead + project.behind > 0 {
+        " "
+    } else {
+        ""
+    });
+    let name_avail = (width as usize).saturating_sub(display_width(&right) + 3);
+    let name = truncate_width(&project.short, name_avail.max(1));
+    slice.fill_row(row, style);
+    let mut col = slice.put_str(0, row, " ", style);
+    col = slice.put_str(col, row, &name, style);
+    let pad = width
+        .saturating_sub(col)
+        .saturating_sub(display_width(&right) as u16)
+        .saturating_sub(1);
+    if display_width(&right) < width as usize {
+        col = slice.put_padded(col, row, pad, "", style);
+        slice.put_str(col, row, &right, branch_style);
+    }
+}
+
+fn distance_badge(project: &CachedProject) -> String {
+    let mut badge = String::new();
+    if project.ahead > 0 {
+        badge.push_str(&format!("↑{}", project.ahead));
+    }
+    if project.behind > 0 {
+        badge.push_str(&format!("↓{}", project.behind));
+    }
+    badge
 }
 
 struct HeaderRow<'a> {
@@ -1741,8 +1970,16 @@ fn pane_label(p: &Pane) -> String {
 }
 
 fn render_preview(slice: &mut GridSlice<'_>, app: &App) {
+    if let Some(picker) = &app.picker {
+        picker.render(slice);
+        return;
+    }
     if app.show_help {
-        render_help(slice);
+        render_help(slice, app);
+        return;
+    }
+    if let Some(project) = app.current_project() {
+        render_project_preview(slice, app, project);
         return;
     }
     if app.current_pane().is_none() {
@@ -1757,6 +1994,35 @@ fn render_preview(slice: &mut GridSlice<'_>, app: &App) {
     let start = app.preview_lines.len().saturating_sub(h);
     for (row, line) in app.preview_lines.iter().skip(start).take(h).enumerate() {
         slice.put_line(0, row as u16, line);
+    }
+}
+
+fn render_project_preview(slice: &mut GridSlice<'_>, app: &App, project: &CachedProject) {
+    let title = Style::new().fg(Color::White).bold();
+    let dim = Style::new().fg(Color::DarkGrey);
+    let key = Style::new().fg(Color::Yellow).bold();
+    slice.put_str(2, 1, &project.short, title);
+    slice.put_str(2, 2, &project.root, dim);
+    let mut state = vec![format!("branch {}", project.branch)];
+    if project.dirty {
+        state.push("uncommitted changes".to_string());
+    }
+    if project.ahead > 0 {
+        state.push(format!("{} to push", project.ahead));
+    }
+    if project.behind > 0 {
+        state.push(format!("{} to pull", project.behind));
+    }
+    slice.put_str(2, 4, &state.join("  "), Style::new().fg(Color::Green));
+    let mut row = 6;
+    let mut line = |label: &str, text: &str, key_style| {
+        slice.put_str(2, row, &format!("{label:<8}"), key_style);
+        slice.put_str(12, row, text, dim);
+        row += 1;
+    };
+    line("dd", "forget project", key);
+    for action in &app.actions {
+        line(&action.key_label(), &action.description, key);
     }
 }
 
@@ -1788,37 +2054,22 @@ fn render_empty_preview(slice: &mut GridSlice<'_>, app: &App) {
     slice.put_str(2, 3, detail, Style::new().fg(Color::DarkGrey));
 }
 
-fn render_help(slice: &mut GridSlice<'_>) {
+fn render_help(slice: &mut GridSlice<'_>, app: &App) {
     let title = Style::new().fg(Color::White).bold();
     let key = Style::new().fg(Color::Yellow).bold();
     let dim = Style::new().fg(Color::DarkGrey);
     slice.put_str(2, 1, "Keybindings", title);
-    let rows = [
-        ("j/k", "move down/up"),
-        ("h/left", "collapse section"),
-        ("C-n/C-p", "move down/up"),
-        ("[n]j/k", "move down/up n times"),
-        ("enter", "switch to pane"),
-        ("space", "toggle read/unread"),
-        ("a", "add window in project"),
-        ("A", "mark all read"),
-        ("s/u", "stash/unstash"),
-        ("C-ret/w", "park/unpark (manual mode)"),
-        ("dd", "kill pane"),
-        ("gg", "go to first"),
-        ("M-<", "go to first"),
-        ("G", "go to last"),
-        ("M->", "go to last"),
-        ("o", "toggle sort order"),
-        ("H/L", "resize sidebar"),
-        ("drag", "resize sidebar"),
-        ("?", "toggle help"),
-        ("q/esc", "quit"),
-    ];
-    for (i, (k, desc)) in rows.iter().enumerate() {
-        let y = i as u16 + 3;
-        slice.put_str(2, y, &format!("{k:<8}"), key);
-        slice.put_str(12, y, desc, dim);
+    let builtins = keys::BUILTINS.iter().map(|b| (b.label.to_string(), b.help));
+    let actions = app
+        .actions
+        .iter()
+        .map(|a| (a.key_label(), a.description.as_str()));
+    for (i, (label, help)) in builtins.chain(actions).enumerate() {
+        // Action rows follow the built-in ones after a blank row.
+        let gap = u16::from(i >= keys::BUILTINS.len());
+        let y = i as u16 + 3 + gap;
+        slice.put_str(2, y, &format!("{label:<8}"), key);
+        slice.put_str(12, y, help, dim);
     }
 }
 
@@ -1905,7 +2156,10 @@ fn visible_start(len: usize, cursor: usize, height: usize) -> usize {
 }
 
 fn selectable(item: &TreeItem) -> bool {
-    matches!(item, TreeItem::Pane(_) | TreeItem::SectionHeader(_, _))
+    matches!(
+        item,
+        TreeItem::Pane(_) | TreeItem::Project(_) | TreeItem::SectionHeader(_, _)
+    )
 }
 
 fn first_pane(items: &[TreeItem]) -> Option<usize> {
@@ -1949,14 +2203,15 @@ fn nearest_pane(items: &[TreeItem], from: usize) -> usize {
         return 0;
     }
     let from = from.min(items.len() - 1);
-    if matches!(items[from], TreeItem::Pane(_)) {
+    let session = |item: &TreeItem| matches!(item, TreeItem::Pane(_) | TreeItem::Project(_));
+    if session(&items[from]) {
         return from;
     }
     for offset in 1..items.len() {
-        if from >= offset && matches!(items[from - offset], TreeItem::Pane(_)) {
+        if from >= offset && session(&items[from - offset]) {
             return from - offset;
         }
-        if from + offset < items.len() && matches!(items[from + offset], TreeItem::Pane(_)) {
+        if from + offset < items.len() && session(&items[from + offset]) {
             return from + offset;
         }
     }
@@ -2016,7 +2271,10 @@ mod tests {
                 working: WorkingSection::Section,
                 ..SidebarConfig::default()
             },
-            new_window_command: None,
+            picker: None,
+            actions: Vec::new(),
+            projects: Vec::new(),
+            pending_forgotten: Vec::new(),
             count: 0,
             err: None,
             daemon_err: None,
@@ -2578,6 +2836,111 @@ mod tests {
                 .filter(|item| matches!(item, TreeItem::ProjectGroup(_)))
                 .count(),
             2
+        );
+    }
+
+    fn project(root: &str) -> CachedProject {
+        CachedProject {
+            root: root.to_string(),
+            short: root.rsplit('/').next().unwrap().to_string(),
+            branch: "main".to_string(),
+            ahead: 1,
+            ..CachedProject::default()
+        }
+    }
+
+    fn app_with_projects(panes: Vec<Pane>, roots: &[&str]) -> App {
+        let mut app = app_with_panes(panes);
+        app.projects = roots.iter().map(|root| project(root)).collect();
+        app.ui_state.projects = roots.iter().map(|root| (*root).to_string()).collect();
+        app.rebuild_items();
+        app.focus_first_session();
+        app
+    }
+
+    fn project_roots(app: &App) -> Vec<String> {
+        app.items
+            .iter()
+            .filter_map(|item| match item {
+                TreeItem::Project(root) => Some(root.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn projects_without_sessions_stay_listed_and_selectable() {
+        let mut busy = pane("%1", 1);
+        busy.project_root = "/repo/a".to_string();
+        let mut app = app_with_projects(vec![busy], &["/repo/a", "/repo/b", "/repo/c"]);
+        assert_eq!(project_roots(&app), ["/repo/b", "/repo/c"]);
+
+        assert_eq!(app.current_project().unwrap().root, "/repo/b");
+        assert!(app.current_pane().is_none());
+        app.select_cursor(next_pane(&app.items, app.cursor), true);
+        assert_eq!(app.current_project().unwrap().root, "/repo/c");
+        app.select_cursor(next_pane(&app.items, app.cursor), true);
+        assert!(app.current_pane().is_some());
+    }
+
+    #[test]
+    fn project_selection_survives_snapshot_updates() {
+        let mut app = app_with_projects(Vec::new(), &["/repo/a", "/repo/b"]);
+        app.select_cursor(next_pane(&app.items, app.cursor), false);
+        assert_eq!(app.current_project().unwrap().root, "/repo/b");
+        app.projects[1].dirty = true;
+        app.replace_panes(Vec::new());
+        assert_eq!(app.current_project().unwrap().root, "/repo/b");
+    }
+
+    #[test]
+    fn forgetting_a_project_removes_it_and_persists() {
+        let mut app = app_with_projects(Vec::new(), &["/repo/a", "/repo/b"]);
+        assert!(app.forget_current_project());
+        assert_eq!(project_roots(&app), ["/repo/b"]);
+        assert_eq!(app.ui_state.projects, ["/repo/b"]);
+        assert_eq!(app.current_project().unwrap().root, "/repo/b");
+        assert!(!app.pending_forgotten.contains(&"/repo/a".to_string()));
+        assert!(app.forget_current_project());
+        assert!(project_roots(&app).is_empty());
+        assert!(!app.forget_current_project());
+    }
+
+    #[test]
+    fn action_targets_follow_the_selected_row() {
+        let mut selected = pane("%1", 1);
+        selected.path = "/repo/a-feature".to_string();
+        selected.project_root = "/repo/a".to_string();
+        selected.git_branch = "feature".to_string();
+        selected.project_branch = "main".to_string();
+        let mut app = app_with_projects(vec![selected], &["/repo/b"]);
+        let target = app.action_target(false).unwrap();
+        assert_eq!(
+            (
+                target.path.as_str(),
+                target.root.as_str(),
+                target.branch.as_str()
+            ),
+            ("/repo/b", "/repo/b", "main")
+        );
+        app.select_cursor(last_pane(&app.items).unwrap(), true);
+        let target = app.action_target(false).unwrap();
+        assert_eq!(
+            (
+                target.path.as_str(),
+                target.root.as_str(),
+                target.branch.as_str()
+            ),
+            ("/repo/a-feature", "/repo/a", "feature")
+        );
+        let target = app.action_target(true).unwrap();
+        assert_eq!(
+            (
+                target.path.as_str(),
+                target.root.as_str(),
+                target.branch.as_str()
+            ),
+            ("/repo/a", "/repo/a", "main")
         );
     }
 
@@ -3333,7 +3696,7 @@ mod tests {
         app.panes.get_mut("%1").unwrap().status = PaneStatus::Unread;
         app.panes.get_mut("%2").unwrap().status = PaneStatus::Busy;
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), &tx);
 
         assert_eq!(app.panes["%1"].status, PaneStatus::Idle);
         assert_eq!(app.panes["%2"].status, PaneStatus::Busy);
@@ -3393,5 +3756,52 @@ mod tests {
         // M-< jumps to the first session like gg.
         app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::ALT), &tx);
         assert_eq!(cur(&app).as_deref(), Some("%1"));
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn worktree_keys_open_a_picker_that_escape_closes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = temporary.path().join("repo");
+        let linked = temporary.path().join("repo-feature");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let root = repo.to_str().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_projects(Vec::new(), &[root]);
+        app.actions = actions::bind(&Config::default()).unwrap();
+        app.select_cursor(app.find_project(root).unwrap(), false);
+
+        for key in ['A', 'T'] {
+            let opened =
+                app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::SHIFT), &tx);
+            assert!(matches!(opened, Action::Redraw), "{key}");
+            assert!(app.picker.is_some(), "{key}");
+            // Quit keys close the picker without leaving the sidebar.
+            let closed = app.handle_key(KeyEvent::from(KeyCode::Esc), &tx);
+            assert!(matches!(closed, Action::Redraw), "{key}");
+            assert!(app.picker.is_none(), "{key}");
+        }
     }
 }

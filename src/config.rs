@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,58 @@ use serde::Deserialize;
 pub struct Config {
     pub sidebar: SidebarConfig,
     pub new_window_command: Option<String>,
+    pub actions: BTreeMap<String, ActionConfig>,
+}
+
+/// A command bound to a key, run in the selected session's or project's directory.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionConfig {
+    /// Shell command. Not used by `terminal` actions. For `agent` actions it
+    /// is the agent to start; empty opens a shell.
+    #[serde(default)]
+    pub cmd: String,
+    #[serde(default)]
+    pub mode: ActionMode,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Ask which worktree of the project to run in.
+    #[serde(default)]
+    pub pick: Option<Pick>,
+    /// `terminal` only: tag that marks the reusable window. Defaults to `terminal`.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// `terminal` only: `last` reruns the previous shell command, anything
+    /// else is typed into the terminal followed by Enter.
+    #[serde(default)]
+    pub send: Option<String>,
+    /// `terminal` only: switch to the terminal window. Defaults to true.
+    #[serde(default)]
+    pub focus: Option<bool>,
+}
+
+/// What an action asks for before it runs.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Pick {
+    Worktree,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionMode {
+    /// Modal tmux popup that closes when the command exits.
+    #[default]
+    Popup,
+    /// New tmux window after the current one.
+    Window,
+    /// New window in the project's session that starts an agent.
+    Agent,
+    /// Background process with no terminal.
+    Run,
+    /// The project's reusable shell window: switch to it, and optionally send
+    /// it a command. It is created when missing and never replaced.
+    Terminal,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -76,7 +129,11 @@ impl Config {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(err) => return Err(err).with_context(|| format!("read config {}", path.display())),
         };
-        toml::from_str(&source).with_context(|| format!("parse config {}", path.display()))
+        let config: Self =
+            toml::from_str(&source).with_context(|| format!("parse config {}", path.display()))?;
+        crate::actions::bind(&config)
+            .with_context(|| format!("parse config {}", path.display()))?;
+        Ok(config)
     }
 }
 

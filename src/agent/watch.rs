@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 
-use crate::agent::git::{dirty_statuses, enrich_panes_fast};
+use crate::agent::git::{dirty_statuses, enrich_panes_fast, is_git_root, project_status};
 use crate::agent::ipc::{Request, Response, socket_path};
 use crate::agent::persist::{
-    Snapshot, UiPaneState, UiState, cache_panes, load_snapshot, load_ui_state, panes_from_snapshot,
-    snapshot_path, state_dir, ui_pane_state_is_empty, update_snapshot, update_snapshot_at,
-    update_ui_state_if_changed, write_heartbeat,
+    CachedProject, Snapshot, UiPaneState, UiState, cache_panes, load_snapshot, load_ui_state,
+    panes_from_snapshot, snapshot_path, state_dir, ui_pane_state_is_empty, update_snapshot,
+    update_snapshot_at, update_ui_state_if_changed, write_heartbeat,
 };
 use crate::agent::{Pane, Reconciler, list_panes_fast};
 
@@ -127,6 +127,7 @@ fn refresh_once_with(
 
     reconciler.reconcile(&mut panes);
     let (snapshot, changed) = write_panes_snapshot(reconciler, &panes, snapshot_path())?;
+    record_projects(&snapshot)?;
     publish_snapshot(latest_snapshot, subscribers, snapshot, changed);
     write_heartbeat()?;
 
@@ -159,16 +160,48 @@ fn refresh_metadata_snapshot() -> Result<Option<Snapshot>> {
     enrich_panes_fast(&mut panes);
     let dirty = dirty_statuses(&panes);
     let metadata = cache_panes(&panes);
-    merge_metadata_snapshot(&metadata, &dirty)
+    let projects = known_project_status();
+    merge_metadata_snapshot(&metadata, &dirty, projects)
+}
+
+/// Remembers the project of every live session so it stays listed afterwards.
+fn record_projects(snapshot: &Snapshot) -> Result<()> {
+    let roots: Vec<&str> = snapshot
+        .panes
+        .iter()
+        .map(|pane| pane.project_root.as_str())
+        .filter(|root| !root.is_empty() && is_git_root(root))
+        .collect();
+    update_ui_state_if_changed(|state| {
+        for root in &roots {
+            if !state.projects.iter().any(|known| known == root) {
+                state.projects.push((*root).to_string());
+            }
+        }
+    })?;
+    Ok(())
+}
+
+fn known_project_status() -> Vec<CachedProject> {
+    let mut projects: Vec<CachedProject> = load_ui_state()
+        .projects
+        .iter()
+        .filter(|root| is_git_root(root))
+        .map(|root| project_status(root))
+        .collect();
+    projects.sort_by(|a, b| a.short.cmp(&b.short).then(a.root.cmp(&b.root)));
+    projects
 }
 
 fn merge_metadata_snapshot(
     metadata: &[crate::agent::persist::CachedPane],
     dirty: &std::collections::HashMap<String, Option<bool>>,
+    projects: Vec<CachedProject>,
 ) -> Result<Option<Snapshot>> {
     let updated = update_snapshot(|previous| {
         let mut snapshot = previous?.clone();
         apply_metadata(&mut snapshot, metadata, dirty);
+        snapshot.projects = projects;
         Some(snapshot)
     })?;
     Ok(updated.and_then(|(snapshot, changed)| changed.then_some(snapshot)))
@@ -283,6 +316,9 @@ fn write_panes_snapshot(
         Some(Snapshot {
             version: 1,
             panes: cached,
+            projects: previous
+                .map(|previous| previous.projects.clone())
+                .unwrap_or_default(),
             ..Snapshot::default()
         })
     })?

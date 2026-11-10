@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::agent::Pane;
+use crate::agent::persist::CachedProject;
 
 pub fn enrich_panes(panes: &mut [Pane]) {
     let _g = smelt_perf::perf::begin("git.enrich_panes");
@@ -64,6 +65,90 @@ pub fn enrich_panes_fast(panes: &mut [Pane]) {
             }
         }
     }
+}
+
+/// Whether `dir` is a git working tree root a project can be listed under.
+pub fn is_git_root(dir: &str) -> bool {
+    resolve_git_dir(dir).is_some()
+}
+
+/// Branch, dirtiness and upstream distance of a project checkout.
+pub fn project_status(root: &str) -> CachedProject {
+    let _g = smelt_perf::perf::begin("git.project_status");
+    let (ahead, behind) = upstream_distance(root).unwrap_or_default();
+    CachedProject {
+        root: root.to_string(),
+        short: shorten(root),
+        branch: git_branch(root),
+        dirty: git_dirty(root).unwrap_or(false),
+        ahead,
+        behind,
+    }
+}
+
+/// A checkout of a project: the main one or a linked worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: String,
+    /// Branch name, or `detached`.
+    pub branch: String,
+}
+
+/// The checkouts of the project at `root`, main checkout first.
+pub fn worktrees(root: &str) -> Vec<Worktree> {
+    let output = Command::new("git")
+        .args(["--no-optional-locks", "worktree", "list", "--porcelain"])
+        .current_dir(root)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_worktrees(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
+    porcelain
+        .split("\n\n")
+        .filter_map(|block| {
+            let mut path = None;
+            let mut branch = "detached";
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("worktree ") {
+                    path = Some(value);
+                } else if let Some(value) = line.strip_prefix("branch ") {
+                    branch = value.strip_prefix("refs/heads/").unwrap_or(value);
+                } else if line == "bare" || line.starts_with("prunable") {
+                    return None;
+                }
+            }
+            Some(Worktree {
+                path: path?.to_string(),
+                branch: branch.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn upstream_distance(dir: &str) -> Option<(u32, u32)> {
+    let output = Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "rev-list",
+            "--left-right",
+            "--count",
+            "HEAD...@{upstream}",
+        ])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut counts = text.split_whitespace().map(|n| n.parse::<u32>().ok());
+    Some((counts.next()??, counts.next()??))
 }
 
 #[derive(Debug)]
@@ -243,6 +328,59 @@ mod tests {
     }
 
     #[test]
+    fn project_status_reports_distance_from_upstream() -> std::io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let remote = root.path().join("remote.git");
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&remote)?;
+        git(&remote, &["init", "--bare", "--initial-branch=main"]);
+        git(
+            root.path(),
+            &["clone", remote.to_str().unwrap(), repo.to_str().unwrap()],
+        );
+        let commit = |message: &str| {
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ],
+            )
+        };
+        commit("first");
+        git(&repo, &["push", "-u", "origin", "HEAD:main"]);
+        let path = repo.to_str().unwrap();
+        let status = project_status(path);
+        assert_eq!((status.ahead, status.behind, status.dirty), (0, 0, false));
+        commit("second");
+        commit("third");
+        fs::write(repo.join("untracked"), "new")?;
+        let status = project_status(path);
+        assert_eq!((status.ahead, status.behind, status.dirty), (2, 0, true));
+        assert_eq!(status.short, "repo");
+        Ok(())
+    }
+
+    #[test]
+    fn project_status_without_upstream_has_no_distance() -> std::io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo)?;
+        git(&repo, &["init"]);
+        let status = project_status(repo.to_str().unwrap());
+        assert_eq!((status.ahead, status.behind), (0, 0));
+        assert!(is_git_root(repo.to_str().unwrap()));
+        assert!(!is_git_root(root.path().to_str().unwrap()));
+        Ok(())
+    }
+
+    #[test]
     fn dirty_status_detects_untracked_files_before_first_commit() -> std::io::Result<()> {
         let root = tempfile::tempdir()?;
         let repo = root.path().join("repo");
@@ -304,5 +442,30 @@ mod tests {
         assert!(panes[0].project_dirty);
 
         Ok(())
+    }
+
+    #[test]
+    fn worktree_listing_skips_bare_and_prunable_entries() {
+        let porcelain = "worktree /repo\nHEAD aaa\nbranch refs/heads/main\n\n\
+            worktree /repo-feature\nHEAD bbb\nbranch refs/heads/feat/x\n\n\
+            worktree /repo-old\nHEAD ccc\ndetached\n\n\
+            worktree /repo-gone\nHEAD ddd\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location\n\n\
+            worktree /repo.git\nbare\n";
+        let expected: Vec<(&str, &str)> = vec![
+            ("/repo", "main"),
+            ("/repo-feature", "feat/x"),
+            ("/repo-old", "detached"),
+        ];
+        let listed: Vec<(String, String)> = parse_worktrees(porcelain)
+            .into_iter()
+            .map(|w| (w.path, w.branch))
+            .collect();
+        assert_eq!(
+            listed,
+            expected
+                .into_iter()
+                .map(|(p, b)| (p.to_string(), b.to_string()))
+                .collect::<Vec<_>>()
+        );
     }
 }
