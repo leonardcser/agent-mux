@@ -16,7 +16,7 @@ use crate::agent::persist::{
     panes_from_snapshot, snapshot_path, state_dir, ui_pane_state_is_empty, update_snapshot,
     update_snapshot_at, update_ui_state_if_changed, write_heartbeat,
 };
-use crate::agent::{Pane, Reconciler, list_panes_fast};
+use crate::agent::{Pane, PaneStatus, Reconciler, list_panes_fast};
 
 type SharedSnapshot = Arc<Mutex<Option<Snapshot>>>;
 type Subscribers = Arc<Mutex<Vec<mpsc::Sender<Response>>>>;
@@ -270,6 +270,12 @@ fn prune_ui_state(panes: &[Pane]) -> Result<()> {
         .flat_map(|p| [(p.pane_id.as_str(), p), (p.target.as_str(), p)])
         .collect();
     update_ui_state_if_changed(|state| {
+        // A waiting session is unread by default, so reading one needs an entry.
+        for pane in panes {
+            if pane.status == PaneStatus::Waiting && pane.window_active {
+                state.panes.entry(pane.pane_id.to_string()).or_default();
+            }
+        }
         for (id, ui) in &mut state.panes {
             let Some(pane) = pane_state.get(id.as_str()) else {
                 continue;
@@ -278,6 +284,7 @@ fn prune_ui_state(panes: &[Pane]) -> Result<()> {
                 .parked_since
                 .filter(|since| pane.status.is_working() && pane.park_epoch == Some(*since));
             update_pane_read_state(ui, &pane.content_hash, pane.window_active);
+            update_waiting_read_state(ui, pane);
         }
         state
             .panes
@@ -293,6 +300,16 @@ fn update_pane_read_state(ui: &mut UiPaneState, content_hash: &str, focused: boo
     } else if ui.read_content_hash.as_deref() != Some(content_hash) {
         ui.read_content_hash = None;
     }
+}
+
+/// Looking at a waiting session reads it for this waiting period only.
+fn update_waiting_read_state(ui: &mut UiPaneState, pane: &Pane) {
+    if pane.status == PaneStatus::Waiting && pane.window_active {
+        ui.read_epoch = pane.park_epoch;
+    }
+    ui.read_epoch = ui
+        .read_epoch
+        .filter(|epoch| pane.status == PaneStatus::Waiting && pane.park_epoch == Some(*epoch));
 }
 
 fn write_panes_snapshot(
@@ -540,6 +557,8 @@ pub fn lock_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::PaneId;
+    use chrono::Utc;
 
     #[test]
     fn unread_subscriber_does_not_block_publication_or_reorder_initial_state() {
@@ -720,6 +739,30 @@ mod tests {
 
         assert!(!ui.forced_unread);
         assert_eq!(ui.read_content_hash, None);
+    }
+
+    #[test]
+    fn looking_at_a_waiting_session_reads_only_that_period() {
+        let epoch = Utc::now();
+        let mut waiting = Pane::new(PaneId::parse("%1").unwrap());
+        waiting.status = PaneStatus::Waiting;
+        waiting.park_epoch = Some(epoch);
+        let mut ui = UiPaneState::default();
+
+        update_waiting_read_state(&mut ui, &waiting);
+        assert_eq!(ui.read_epoch, None);
+
+        waiting.window_active = true;
+        update_waiting_read_state(&mut ui, &waiting);
+        assert_eq!(ui.read_epoch, Some(epoch));
+
+        // Leaving the window keeps the period read; resuming work drops it.
+        waiting.window_active = false;
+        update_waiting_read_state(&mut ui, &waiting);
+        assert_eq!(ui.read_epoch, Some(epoch));
+        waiting.status = PaneStatus::Busy;
+        update_waiting_read_state(&mut ui, &waiting);
+        assert_eq!(ui.read_epoch, None);
     }
 
     #[test]

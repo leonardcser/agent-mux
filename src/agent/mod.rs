@@ -43,11 +43,23 @@ pub enum PaneStatus {
     Busy = 1,
     Waiting = 2,
     Unread = 3,
+    /// A waiting session the user has not looked at yet. Only the display
+    /// layer produces it; it is never stored.
+    WaitingUnread = 4,
 }
 
 impl PaneStatus {
     pub fn is_working(self) -> bool {
-        matches!(self, Self::Busy | Self::Waiting)
+        matches!(self, Self::Busy | Self::Waiting | Self::WaitingUnread)
+    }
+
+    pub fn is_waiting(self) -> bool {
+        matches!(self, Self::Waiting | Self::WaitingUnread)
+    }
+
+    /// Whether the session has news the user has not seen.
+    pub fn is_unread(self) -> bool {
+        matches!(self, Self::Unread | Self::WaitingUnread)
     }
 
     pub fn from_i32(value: i32) -> Self {

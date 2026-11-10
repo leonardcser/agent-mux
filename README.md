@@ -65,8 +65,9 @@ Reload with `tmux source-file ~/.tmux.conf`, then use `prefix + j`.
 ### Sidebar
 
 Sessions are grouped by project. Busy sessions appear under **Working**.
-Sessions that wait for input show an orange outline circle and leave
-**Working**; in `manual` mode, park them back with Ctrl+Enter or `w`. Use `s` to move sessions to **Stashed**. Click a section title to expand or
+Sessions that wait for input leave **Working** and show an outline circle:
+violet until you read them, then orange. In `manual` mode, park them back with
+Ctrl+Enter or `w`. Use `s` to move sessions to **Stashed**. Click a section title to expand or
 collapse it. Sessions that finish in the background become unread until opened.
 
 ### Projects

@@ -170,6 +170,10 @@ pub struct UiPaneState {
         skip_serializing_if = "Option::is_none"
     )]
     pub read_content_hash: Option<String>,
+    // The waiting period the user has read. A waiting session is unread until
+    // then, and the next waiting period is unread again.
+    #[serde(rename = "readEpoch", default, skip_serializing_if = "Option::is_none")]
+    pub read_epoch: Option<DateTime<Utc>>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -217,6 +221,12 @@ pub fn apply_ui_state(panes: &mut [Pane], ui_state: &UiState) {
             .or_else(|| ui_state.panes.get(&pane.target))
         {
             apply_pane_ui_state(pane, ui);
+        } else {
+            let unset = UiPaneState {
+                stashed: pane.stashed,
+                ..UiPaneState::default()
+            };
+            apply_pane_ui_state(pane, &unset);
         }
     }
 }
@@ -232,6 +242,11 @@ pub fn apply_pane_ui_state(pane: &mut Pane, ui: &UiPaneState) {
         ui.forced_unread,
         ui.read_content_hash.as_deref(),
     );
+    if pane.status == PaneStatus::Waiting
+        && !(ui.read_epoch.is_some() && ui.read_epoch == pane.park_epoch)
+    {
+        pane.status = PaneStatus::WaitingUnread;
+    }
 }
 
 pub fn display_status(
@@ -252,7 +267,11 @@ pub fn display_status(
 }
 
 pub fn ui_pane_state_is_empty(ui: &UiPaneState) -> bool {
-    !ui.stashed && ui.parked_since.is_none() && !ui.forced_unread && ui.read_content_hash.is_none()
+    !ui.stashed
+        && ui.parked_since.is_none()
+        && !ui.forced_unread
+        && ui.read_content_hash.is_none()
+        && ui.read_epoch.is_none()
 }
 
 pub fn update_snapshot(
@@ -506,6 +525,7 @@ mod tests {
         CachedPane, UiPaneState, UiState, apply_ui_state, display_status, panes_from_cached,
     };
     use crate::agent::{Pane, PaneId, PaneStatus};
+    use chrono::Utc;
 
     fn pane(status: PaneStatus, content_hash: &str) -> Pane {
         Pane {
@@ -613,6 +633,36 @@ mod tests {
         assert_eq!(
             display_status(PaneStatus::Unread, "new", false, Some("old")),
             PaneStatus::Unread
+        );
+    }
+
+    #[test]
+    fn waiting_is_unread_until_its_period_is_read() {
+        let epoch = Utc::now();
+        let mut waiting = pane(PaneStatus::Waiting, "same");
+        waiting.park_epoch = Some(epoch);
+        let status_with = |ui: Option<UiPaneState>| {
+            let mut panes = vec![waiting.clone()];
+            let mut state = UiState::default();
+            if let Some(ui) = ui {
+                state.panes.insert("%1".to_string(), ui);
+            }
+            apply_ui_state(&mut panes, &state);
+            panes[0].status
+        };
+        let read = |read_epoch| UiPaneState {
+            read_epoch,
+            ..UiPaneState::default()
+        };
+
+        assert_eq!(status_with(None), PaneStatus::WaitingUnread);
+        assert_eq!(status_with(Some(read(None))), PaneStatus::WaitingUnread);
+        assert_eq!(status_with(Some(read(Some(epoch)))), PaneStatus::Waiting);
+        // The next waiting period starts unread again.
+        let later = epoch + chrono::Duration::seconds(5);
+        assert_eq!(
+            status_with(Some(read(Some(later)))),
+            PaneStatus::WaitingUnread
         );
     }
 

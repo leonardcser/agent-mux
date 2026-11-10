@@ -348,3 +348,32 @@ def test_worktree_picker_opens_one_terminal_per_worktree(mux, repo):
     ).splitlines()
     assert f"terminal:{worktree}" in tags
     assert "terminal" not in tags
+
+
+def test_waiting_session_is_unread_until_read(mux):
+    _, idle_pid = mux.add_agent("idle")
+    _, waiting_pid = mux.add_agent("waiting")
+    mux.write_statuses(
+        [
+            {"pid": idle_pid, "state": "inactive"},
+            {"pid": waiting_pid, "state": "waiting"},
+        ]
+    )
+    pane = mux.launch()
+    mux.wait_screen(
+        pane,
+        lambda frame: "preview-waiting" in frame,
+        "startup selects the unread waiting session",
+    )
+
+    def ring_colors():
+        frame = mux.tmux("capture-pane", "-p", "-e", "-t", pane)
+        return [line for line in frame.splitlines() if "○" in line]
+
+    violet = "38;2;155;155;245"
+    assert any(violet in line for line in ring_colors())
+    mux.send(pane, "Space")
+    wait_for(
+        lambda: not any(violet in line for line in ring_colors()),
+        "reading turns the violet ring orange",
+    )

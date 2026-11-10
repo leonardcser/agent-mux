@@ -983,7 +983,7 @@ impl App {
                         return None;
                     };
                     let pane = &self.panes[id];
-                    (!pane.stashed && pane.status == PaneStatus::Unread).then(|| id.clone())
+                    (!pane.stashed && pane.status.is_unread()).then(|| id.clone())
                 })
                 .unwrap_or_else(|| self.ui_state.selected_pane_id.clone()),
             StartupSelection::Last => self.ui_state.selected_pane_id.clone(),
@@ -1288,16 +1288,14 @@ impl App {
             KeyCode::Char(' ') => {
                 let mut changed = None;
                 if let Some(p) = self.current_pane_mut() {
-                    let unread = match p.status {
-                        PaneStatus::Idle => true,
-                        PaneStatus::Unread => false,
-                        PaneStatus::Busy | PaneStatus::Waiting => return Action::None,
+                    let (unread, status) = match p.status {
+                        PaneStatus::Idle => (true, PaneStatus::Unread),
+                        PaneStatus::Unread => (false, PaneStatus::Idle),
+                        PaneStatus::Waiting => (true, PaneStatus::WaitingUnread),
+                        PaneStatus::WaitingUnread => (false, PaneStatus::Waiting),
+                        PaneStatus::Busy => return Action::None,
                     };
-                    p.status = if unread {
-                        PaneStatus::Unread
-                    } else {
-                        PaneStatus::Idle
-                    };
+                    p.status = status;
                     changed = Some((p.pane_id.to_string(), unread));
                 }
                 if let Some((id, unread)) = changed {
@@ -1309,10 +1307,13 @@ impl App {
             KeyCode::Char('R') => {
                 let mut changed = Vec::new();
                 for p in self.panes.values_mut() {
-                    if p.status == PaneStatus::Unread {
-                        p.status = PaneStatus::Idle;
-                        changed.push(p.pane_id.to_string());
-                    }
+                    let read = match p.status {
+                        PaneStatus::Unread => PaneStatus::Idle,
+                        PaneStatus::WaitingUnread => PaneStatus::Waiting,
+                        _ => continue,
+                    };
+                    p.status = read;
+                    changed.push(p.pane_id.to_string());
                 }
                 if changed.is_empty() {
                     return Action::None;
@@ -1434,7 +1435,7 @@ impl App {
         }
         if let Some(p) = self.current_pane() {
             let pane_id = p.pane_id.clone();
-            let unread = p.status == PaneStatus::Unread;
+            let unread = p.status.is_unread();
             if let Err(err) = switch_to_pane(&pane_id) {
                 self.err = Some(format!("{err:#}"));
                 return Action::Redraw;
@@ -1524,8 +1525,12 @@ impl App {
             entry.stashed = p.stashed;
             entry.parked_since = p.parked_since;
             if let Some(unread) = self.pending_unread_changes.get(p.pane_id.as_str()) {
-                entry.forced_unread = *unread;
-                entry.read_content_hash = (!*unread).then(|| p.content_hash.clone());
+                if p.status.is_waiting() {
+                    entry.read_epoch = if *unread { None } else { p.park_epoch };
+                } else {
+                    entry.forced_unread = *unread;
+                    entry.read_content_hash = (!*unread).then(|| p.content_hash.clone());
+                }
             }
         }
         state.panes.retain(|_, ui| !ui_pane_state_is_empty(ui));
@@ -1906,7 +1911,7 @@ fn render_pane_row(
                 g: 119,
                 b: 6,
             },
-            PaneStatus::Unread => Color::Rgb {
+            PaneStatus::Unread | PaneStatus::WaitingUnread => Color::Rgb {
                 r: 155,
                 g: 155,
                 b: 245,
@@ -1917,7 +1922,10 @@ fn render_pane_row(
     };
     let icon = if p.completed {
         '✓'
-    } else if matches!(p.status, PaneStatus::Idle | PaneStatus::Waiting) {
+    } else if matches!(
+        p.status,
+        PaneStatus::Idle | PaneStatus::Waiting | PaneStatus::WaitingUnread
+    ) {
         '○'
     } else {
         '●'
@@ -3482,6 +3490,33 @@ mod tests {
         unread.status = PaneStatus::Unread;
         app.replace_panes(vec![pane("%1", 0), unread]);
         assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+    }
+
+    #[test]
+    fn first_loaded_snapshot_prioritizes_unread_waiting_session() {
+        let mut app = app_with_panes(Vec::new());
+        let mut waiting = pane("%2", 1);
+        waiting.status = PaneStatus::WaitingUnread;
+        let mut read = pane("%3", 2);
+        read.status = PaneStatus::Waiting;
+        app.replace_panes(vec![pane("%1", 0), waiting, read]);
+        assert_eq!(app.current_pane().unwrap().pane_id.as_str(), "%2");
+    }
+
+    #[test]
+    fn space_and_mark_all_read_toggle_waiting_sessions() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_panes(vec![pane("%1", 0), pane("%2", 1)]);
+        app.panes.get_mut("%1").unwrap().status = PaneStatus::Waiting;
+        app.panes.get_mut("%2").unwrap().status = PaneStatus::WaitingUnread;
+
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')), &tx);
+        assert_eq!(app.panes["%1"].status, PaneStatus::WaitingUnread);
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')), &tx);
+        assert_eq!(app.panes["%1"].status, PaneStatus::Waiting);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), &tx);
+        assert_eq!(app.panes["%2"].status, PaneStatus::Waiting);
     }
 
     #[test]
