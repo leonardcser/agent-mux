@@ -1922,10 +1922,7 @@ fn render_pane_row(
     };
     let icon = if p.completed {
         '✓'
-    } else if matches!(
-        p.status,
-        PaneStatus::Idle | PaneStatus::Waiting | PaneStatus::WaitingUnread
-    ) {
+    } else if matches!(p.status, PaneStatus::Idle | PaneStatus::Waiting) {
         '○'
     } else {
         '●'
