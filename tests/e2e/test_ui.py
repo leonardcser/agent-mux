@@ -366,16 +366,18 @@ def test_waiting_session_is_unread_until_read(mux):
         "startup selects the unread waiting session",
     )
 
-    def ring_colors():
+    def icon_lines(icon):
         frame = mux.tmux("capture-pane", "-p", "-e", "-t", pane)
-        return [line for line in frame.splitlines() if "○" in line]
+        return [line for line in frame.splitlines() if icon in line]
 
     violet = "38;2;155;155;245"
-    assert any(violet in line for line in ring_colors())
+    orange = "38;2;217;119;6"
+    assert any(violet in line for line in icon_lines("●"))
     mux.send(pane, "Space")
     wait_for(
-        lambda: not any(violet in line for line in ring_colors()),
-        "reading turns the violet ring orange",
+        lambda: not any(violet in line for line in icon_lines("●"))
+        and any(orange in line for line in icon_lines("○")),
+        "reading turns the violet dot into an orange ring",
     )
 
 
