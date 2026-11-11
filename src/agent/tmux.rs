@@ -111,6 +111,19 @@ fn list_tmux_panes() -> Result<(String, std::collections::HashSet<PaneId>)> {
     Ok((output, focused))
 }
 
+const DELETED_SUFFIX: &str = " (deleted)";
+
+/// The directory a pane works in. The system reports `<dir> (deleted)` for a
+/// process whose directory was removed, and keeps doing so after the directory
+/// is created again, because the process still holds the old one. A path that
+/// exists again is the directory the user means.
+fn live_path(path: &str) -> String {
+    match path.strip_suffix(DELETED_SUFFIX) {
+        Some(live) if std::path::Path::new(live).is_dir() => live.to_string(),
+        _ => path.to_string(),
+    }
+}
+
 fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
     let panes: Vec<RawPane> = out
         .trim()
@@ -128,7 +141,7 @@ fn parse_tmux_panes(out: &str) -> Vec<RawPane> {
             Some(RawPane {
                 target: fields[0].to_string(),
                 cmd: fields[1].to_string(),
-                path: fields[2].to_string(),
+                path: live_path(fields[2]),
                 pid: fields[3].parse().unwrap_or(0),
                 provider_pid: 0,
                 window_name: fields[4].to_string(),
@@ -407,7 +420,7 @@ fn parse_session_panes(out: &str) -> Vec<SessionPane> {
                 pane: (*pane).to_string(),
                 command: (*command).to_string(),
                 window_panes: window_panes.parse().ok()?,
-                path: (*path).to_string(),
+                path: live_path(path),
             })
         })
         .collect()
@@ -593,8 +606,8 @@ pub fn parse_target(s: &str) -> (String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionPane, TerminalPick, agent_window_name, find_project_session, parse_session_panes,
-        pick_terminal, session_name, short_hash,
+        SessionPane, TerminalPick, agent_window_name, find_project_session, live_path,
+        parse_session_panes, pick_terminal, session_name, short_hash,
     };
 
     #[test]
@@ -688,6 +701,18 @@ mod tests {
     fn unnamed_windows_are_labelled_by_their_agent_not_the_active_pane() {
         assert_eq!(agent_window_name(true, "zsh", "smelt"), "smelt");
         assert_eq!(agent_window_name(false, "backend", "smelt"), "backend");
+    }
+
+    #[test]
+    fn recreated_directories_lose_the_deleted_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("worktree");
+        let reported = format!("{} (deleted)", dir.display());
+        // Still gone: the marker stays.
+        assert_eq!(live_path(&reported), reported);
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(live_path(&reported), dir.to_str().unwrap());
+        assert_eq!(live_path(dir.to_str().unwrap()), dir.to_str().unwrap());
     }
 
     #[test]

@@ -377,3 +377,43 @@ def test_waiting_session_is_unread_until_read(mux):
         lambda: not any(violet in line for line in ring_colors()),
         "reading turns the violet ring orange",
     )
+
+
+def test_recreated_worktree_rejoins_its_project(mux, repo):
+    worktree = add_worktree(mux, repo)
+    mux.add_agent("selected", cwd=worktree)
+    pane = mux.launch()
+    mux.wait_screen(
+        pane,
+        lambda frame: "project with spaces" in frame,
+        "session grouped under its project",
+    )
+
+    run(
+        "git",
+        "-C",
+        str(repo),
+        "worktree",
+        "remove",
+        "--force",
+        str(worktree),
+        env=mux.env,
+    )
+    mux.wait_screen(
+        pane, lambda frame: "(deleted)" in frame, "deleted worktree is marked"
+    )
+    run(
+        "git",
+        "-C",
+        str(repo),
+        "worktree",
+        "add",
+        str(worktree),
+        "feature",
+        env=mux.env,
+    )
+    mux.wait_screen(
+        pane,
+        lambda frame: "(deleted)" not in frame and "project with spaces" in frame,
+        "recreated worktree rejoins the project",
+    )
